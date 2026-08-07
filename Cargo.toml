@@ -1,0 +1,37 @@
+[package]
+name = "continuo"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["iadev09 <iadev09@claviron.org>"]
+description = "Dependency injection core for multi-service Rust applications — typed provider registry and Tokio lifecycle runtime: dependency-ordered boot, reload, runnable tasks, graceful drain, and finalization."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/iadev09/continuo"
+documentation = "https://docs.rs/continuo"
+readme = "README.md"
+keywords = ["tokio", "lifecycle", "registry", "di", "shutdown"]
+categories = ["asynchronous", "rust-patterns"]
+exclude = ["/Cargo.lock", "/justfile", "/rustfmt.toml", "/.idea/**", "/counter.txt"]
+
+[features]
+default = ["registry"]
+full = ["registry", "support", "events"]
+events = ["dep:dashmap"]
+registry = []
+support = []
+
+[dependencies]
+async-trait = "0.1"
+dashmap = { version = "6", optional = true }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tokio-util = "0.7"
+tracing = "0.1"
+
+[dev-dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal"] }
+
+[[example]]
+name = "counter"
+path = "examples/counter.rs"
+required-features = ["registry"]
