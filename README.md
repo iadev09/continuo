@@ -1,11 +1,11 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="continuo" width="480">
+  <img src="https://raw.githubusercontent.com/iadev09/continuo/main/assets/logo.svg" alt="continuo" width="480">
 </p>
 
 <p align="center">
   <a href="https://crates.io/crates/continuo"><img src="https://img.shields.io/crates/v/continuo.svg" alt="crates.io"></a>
   <a href="https://docs.rs/continuo"><img src="https://img.shields.io/docsrs/continuo" alt="docs.rs"></a>
-  <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="license"></a>
+  <a href="https://github.com/iadev09/continuo/blob/main/LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="license"></a>
 </p>
 
 > **The bass line for your services.**
@@ -60,7 +60,7 @@ registry.finalize_all(&state).await?;   // release named resources
 
 Three inserts — everything else follows from the lifecycle contract; `main`
 composes providers and walks the lifecycle, nothing more. The full working
-version is [`examples/counter.rs`](examples/counter.rs).
+version is [`examples/counter.rs`](https://github.com/iadev09/continuo/blob/main/examples/counter.rs).
 
 The core idea:
 
@@ -465,7 +465,7 @@ bus.emit(ConfigReloaded);
 ## Example
 
 One single-file example carries the whole story —
-[`examples/counter.rs`](examples/counter.rs):
+[`examples/counter.rs`](https://github.com/iadev09/continuo/blob/main/examples/counter.rs):
 
 ```sh
 cargo run --example counter
