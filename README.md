@@ -175,8 +175,8 @@ state
     .insert(Arc::new(DbService::new()))
     .insert(Arc::new(CacheService::new()));
 
-state.registry_ref().boot_all(&state).await?;
 state.registry_ref().validate_all(&state)?;
+state.registry_ref().boot_all(&state).await?;
 
 let db = state.registry_ref().resolve::<DbService>().expect("DbService registered");
 ```
