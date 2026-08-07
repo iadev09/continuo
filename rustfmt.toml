@@ -1,0 +1,8 @@
+# Stable rustfmt — plain `cargo fmt` on the current stable toolchain.
+# Only non-default, stable options; everything else follows rustfmt defaults.
+
+edition = "2024"
+max_width = 100
+use_small_heuristics = "Max"
+fn_params_layout = "Vertical"
+struct_lit_width = 80
