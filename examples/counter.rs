@@ -362,8 +362,8 @@ async fn main() -> Result<()> {
         .insert(Arc::new(HttpService::new(SocketAddr::from(([127, 0, 0, 1], 3000)))))
         .insert(Arc::new(SignalService));
 
-    registry.validate_all(&state)?;
     registry.boot_all(&state).await?;
+    registry.validate_all(&state)?;
 
     let mut runtime = Runtime::<AppState>::default();
     runtime.spawn_all(state.registry_ref(), state.clone());

@@ -1,15 +1,15 @@
 [package]
 name = "continuo"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["iadev09 <iadev09@claviron.org>"]
-description = "Dependency injection core for multi-service Rust applications — typed provider registry and Tokio lifecycle runtime: dependency-ordered boot, reload, runnable tasks, graceful drain, and finalization."
+description = "Runtime service composition for multi-service Rust applications: typed provider resolution, dependency-ordered lifecycle, reload, runnable tasks, graceful drain, and finalization."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/iadev09/continuo"
 documentation = "https://docs.rs/continuo"
 readme = "README.md"
-keywords = ["tokio", "lifecycle", "registry", "di", "shutdown"]
+keywords = ["dependency-injection", "dependency", "ioc", "lifecycle", "registry"]
 categories = ["asynchronous", "rust-patterns"]
 exclude = ["/Cargo.lock", "/justfile", "/rustfmt.toml", "/.idea/**", "/counter.txt"]
 

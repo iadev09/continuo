@@ -373,13 +373,17 @@ pub trait Finalizable<S>: Send + Sync + 'static {
 ///    * Spawning long-running tasks. Boot must return when state is
 ///      ready; the long task lives in `Runnable::run()`.
 ///
-/// 3. **`Runnable::run()`** — see that trait. The only place for
+/// 3. **`validate()`** — synchronous readiness/invariant check after
+///    boot and before runnable tasks start. Use this for cheap checks
+///    that need boot-published state to exist.
+///
+/// 4. **`Runnable::run()`** — see that trait. The only place for
 ///    long-lived loops; honors disabled-state by returning `Ok(())`
 ///    immediately. Graceful teardown of the work started here belongs
 ///    here too: observe the shutdown signal inside the run future,
 ///    drain, and return — do NOT split that into a separate hook.
 ///
-/// 4. **`Finalizable::finalize()`** — optional capability (see that
+/// 5. **`Finalizable::finalize()`** — optional capability (see that
 ///    trait), exposed via `as_finalizable()`. Best-effort release of
 ///    non-running resources after the runnable tasks have drained
 ///    (shm segments, lock files). Not a stop mechanism for runnables.
@@ -426,9 +430,11 @@ pub trait Provider<S>: Any + Send + Sync + 'static {
         Ok(())
     }
 
-    /// Synchronous preflight validation. Runs in the config-check / startup
-    /// validation phase before any `boot()` to fail fast on bad config
-    /// (missing files, conflicting settings) without touching the registry.
+    /// Synchronous readiness validation after `boot()` and before runnable
+    /// tasks are spawned.
+    ///
+    /// Use this for cheap checks over boot-published state, missing files, or
+    /// conflicting settings that should fail before long-running work starts.
     fn validate(
         &self,
         _state: &S,
@@ -467,6 +473,7 @@ pub trait Provider<S>: Any + Send + Sync + 'static {
 pub struct Registry<S> {
     providers: RwLock<HashMap<TypeId, Arc<dyn Provider<S>>>>,
     by_type: RwLock<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
+    dyn_by_type: RwLock<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
     registration_order: RwLock<Vec<TypeId>>,
     lifecycle_order: RwLock<Option<Vec<TypeId>>>,
 }
@@ -477,6 +484,7 @@ impl<S: 'static> Registry<S> {
         Self {
             providers: RwLock::new(HashMap::new()),
             by_type: RwLock::new(HashMap::new()),
+            dyn_by_type: RwLock::new(HashMap::new()),
             registration_order: RwLock::new(Vec::new()),
             lifecycle_order: RwLock::new(None),
         }
@@ -484,7 +492,7 @@ impl<S: 'static> Registry<S> {
 
     /// Register a provider into the registry.
     ///
-    /// This accepts `Arc<T>` where `T: Provider`. The service is stored as a
+    /// This accepts `Arc<P>` where `P: Provider`. The service is stored as a
     /// type-erased `Arc<dyn Provider>` but continues to point to the same underlying
     /// allocation (no new allocation is created).
     ///
@@ -498,20 +506,20 @@ impl<S: 'static> Registry<S> {
     ///     .insert(dns.clone())
     ///     .insert(ipc.clone());
     /// ```
-    pub fn insert<C>(
+    pub fn insert<P>(
         &self,
-        item: Arc<C>,
+        item: Arc<P>,
     ) -> &Self
     where
-        C: Provider<S> + 'static,
+        P: Provider<S> + 'static,
     {
-        let type_id = TypeId::of::<C>();
+        let type_id = TypeId::of::<P>();
         let any: Arc<dyn Any + Send + Sync> = item.clone();
         let mut by_type = self.by_type.write().expect("registry by_type lock poisoned");
         if by_type.contains_key(&type_id) {
             warn!(
                 "⚠️ duplicate provider type '{}' — skipping registration",
-                std::any::type_name::<C>()
+                std::any::type_name::<P>()
             );
             return self;
         }
@@ -523,6 +531,38 @@ impl<S: 'static> Registry<S> {
         self.registration_order.write().expect("registry order lock poisoned").push(type_id);
         *self.lifecycle_order.write().expect("registry lifecycle order lock poisoned") = None;
         self
+    }
+
+    /// Bind a registered concrete provider as a trait-object capability.
+    ///
+    /// This does not register a second lifecycle provider. It resolves the
+    /// existing concrete provider `P`, casts the same `Arc<P>` into `Arc<I>`,
+    /// and stores that trait-object handle under `TypeId::of::<I>()`.
+    ///
+    /// Returns an error if `P` has not been registered yet. If `I` already has
+    /// a binding, the new binding replaces it.
+    pub fn bind_dyn<I, P>(
+        &self,
+        cast: impl FnOnce(Arc<P>) -> Arc<I>,
+    ) -> Result<&Self>
+    where
+        I: ?Sized + Send + Sync + 'static,
+        P: Provider<S> + 'static,
+    {
+        let concrete = self.resolve::<P>().ok_or_else(|| {
+            Error::msg(format!(
+                "bind_dyn: provider type '{}' is not registered",
+                std::any::type_name::<P>()
+            ))
+        })?;
+
+        let interface_id = TypeId::of::<I>();
+        let mut dyn_by_type = self.dyn_by_type.write().expect("registry dyn_by_type lock poisoned");
+        let erased: Box<dyn Any + Send + Sync> = Box::new(cast(concrete));
+        if dyn_by_type.insert(interface_id, erased).is_some() {
+            warn!("replaced dyn binding for interface '{}'", std::any::type_name::<I>());
+        }
+        Ok(self)
     }
 
     /// Execute a closure with a concrete typed reference `&T` if the service is registered.
@@ -556,6 +596,19 @@ impl<S: 'static> Registry<S> {
             .get(&TypeId::of::<T>())?
             .clone();
         Arc::downcast::<T>(any).ok()
+    }
+
+    /// Resolve a trait-object capability bound with `bind_dyn`.
+    pub fn resolve_dyn<I>(&self) -> Option<Arc<I>>
+    where
+        I: ?Sized + Send + Sync + 'static,
+    {
+        self.dyn_by_type
+            .read()
+            .expect("registry dyn_by_type lock poisoned")
+            .get(&TypeId::of::<I>())?
+            .downcast_ref::<Arc<I>>()
+            .cloned()
     }
 
     /// Return a snapshot of registered providers.
@@ -883,6 +936,7 @@ mod tests {
     struct DbProvider;
     struct CacheProvider;
     struct ApiProvider;
+    struct MetricsProvider;
 
     #[async_trait]
     impl Provider<TestState> for DbProvider {
@@ -937,6 +991,25 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl Provider<TestState> for MetricsProvider {
+        fn name(&self) -> &'static str {
+            "metrics"
+        }
+
+        fn order(&self) -> ProviderOrder {
+            ProviderOrder::new().before::<ApiProvider>()
+        }
+
+        fn validate(
+            &self,
+            state: &TestState,
+        ) -> Result<()> {
+            state.seen.lock().expect("test log poisoned").push("metrics");
+            Ok(())
+        }
+    }
+
     #[test]
     fn lifecycle_order_uses_type_dependencies() {
         let state = TestState::default();
@@ -951,6 +1024,186 @@ mod tests {
 
         let seen = state.seen.lock().expect("test log poisoned").clone();
         assert_eq!(seen, vec!["db", "cache", "api"]);
+    }
+
+    #[test]
+    fn lifecycle_order_supports_before_edges_and_diagnostics() {
+        let state = TestState::default();
+        let registry = Registry::<TestState>::new();
+
+        registry
+            .insert(Arc::new(ApiProvider))
+            .insert(Arc::new(MetricsProvider))
+            .insert(Arc::new(CacheProvider))
+            .insert(Arc::new(DbProvider));
+
+        let names = registry.lifecycle_names().expect("plan should build");
+        assert_eq!(names, vec!["metrics", "db", "cache", "api"]);
+
+        registry.validate_all(&state).expect("validation should succeed");
+
+        let seen = state.seen.lock().expect("test log poisoned").clone();
+        assert_eq!(seen, vec!["metrics", "db", "cache", "api"]);
+    }
+
+    trait LogSink: Send + Sync {
+        fn line(&self) -> &'static str;
+    }
+
+    struct ConsoleLogger;
+    struct FileLogger;
+
+    impl LogSink for ConsoleLogger {
+        fn line(&self) -> &'static str {
+            "console"
+        }
+    }
+
+    impl LogSink for FileLogger {
+        fn line(&self) -> &'static str {
+            "file"
+        }
+    }
+
+    #[async_trait]
+    impl Provider<TestState> for ConsoleLogger {
+        fn name(&self) -> &'static str {
+            "console-logger"
+        }
+
+        async fn boot(
+            &self,
+            state: &TestState,
+        ) -> Result<()> {
+            state.seen.lock().expect("test log poisoned").push("console-logger");
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Provider<TestState> for FileLogger {
+        fn name(&self) -> &'static str {
+            "file-logger"
+        }
+
+        async fn boot(
+            &self,
+            state: &TestState,
+        ) -> Result<()> {
+            state.seen.lock().expect("test log poisoned").push("file-logger");
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_dyn_resolves_trait_object_and_allows_replacement() {
+        let state = TestState::default();
+        let registry = Registry::<TestState>::new();
+
+        registry.insert(Arc::new(ConsoleLogger));
+        registry
+            .bind_dyn::<dyn LogSink, ConsoleLogger>(|logger| logger)
+            .expect("dyn binding should succeed");
+
+        let sink = registry.resolve_dyn::<dyn LogSink>().expect("LogSink should be bound");
+        assert_eq!(sink.line(), "console");
+
+        registry.insert(Arc::new(FileLogger));
+        registry
+            .bind_dyn::<dyn LogSink, FileLogger>(|logger| logger)
+            .expect("dyn binding replacement should succeed");
+
+        let sink = registry.resolve_dyn::<dyn LogSink>().expect("LogSink should be rebound");
+        assert_eq!(sink.line(), "file");
+
+        registry.boot_all(&state).await.expect("boot should succeed");
+
+        let seen = state.seen.lock().expect("test log poisoned").clone();
+        assert_eq!(seen, vec!["console-logger", "file-logger"]);
+    }
+
+    struct BootRecorder;
+    struct BootDependency;
+
+    #[async_trait]
+    impl Provider<TestState> for BootRecorder {
+        fn name(&self) -> &'static str {
+            "boot-recorder"
+        }
+
+        fn order(&self) -> ProviderOrder {
+            ProviderOrder::new().after::<BootDependency>()
+        }
+
+        async fn boot(
+            &self,
+            state: &TestState,
+        ) -> Result<()> {
+            state.seen.lock().expect("test log poisoned").push("boot-recorder");
+            Ok(())
+        }
+
+        fn as_finalizable(&self) -> Option<&dyn Finalizable<TestState>> {
+            Some(self)
+        }
+    }
+
+    #[async_trait]
+    impl Finalizable<TestState> for BootRecorder {
+        async fn finalize(
+            &self,
+            state: &TestState,
+        ) -> Result<()> {
+            state.seen.lock().expect("test log poisoned").push("finalize-recorder");
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Provider<TestState> for BootDependency {
+        fn name(&self) -> &'static str {
+            "boot-dependency"
+        }
+
+        async fn boot(
+            &self,
+            state: &TestState,
+        ) -> Result<()> {
+            state.seen.lock().expect("test log poisoned").push("boot-dependency");
+            Ok(())
+        }
+
+        fn as_finalizable(&self) -> Option<&dyn Finalizable<TestState>> {
+            Some(self)
+        }
+    }
+
+    #[async_trait]
+    impl Finalizable<TestState> for BootDependency {
+        async fn finalize(
+            &self,
+            state: &TestState,
+        ) -> Result<()> {
+            state.seen.lock().expect("test log poisoned").push("finalize-dependency");
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn boot_and_finalize_share_lifecycle_plan() {
+        let state = TestState::default();
+        let registry = Registry::<TestState>::new();
+
+        registry.insert(Arc::new(BootRecorder)).insert(Arc::new(BootDependency));
+
+        registry.boot_all(&state).await.expect("boot should succeed");
+        registry.finalize_all(&state).await.expect("finalize should succeed");
+
+        let seen = state.seen.lock().expect("test log poisoned").clone();
+        assert_eq!(
+            seen,
+            vec!["boot-dependency", "boot-recorder", "finalize-recorder", "finalize-dependency",]
+        );
     }
 
     struct CycleA;

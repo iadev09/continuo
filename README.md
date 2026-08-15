@@ -8,69 +8,64 @@
   <a href="https://github.com/iadev09/continuo/blob/main/LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="license"></a>
 </p>
 
-> **The bass line for your services.**
+> **Runtime service composition for Rust**
 
-In baroque music, the *basso continuo* is the part that plays through the
-whole piece: soloists enter and leave, the continuo never stops. This crate
-is that part for your application — the typed registry and lifecycle that
-carries every service from the first note (`boot`) to the last (`finalize`).
+`continuo` is a typed runtime registry for Rust services.
 
-The dependency injection core for multi-service Rust applications —
-every framework ships one buried inside it; continuo is that core,
-shipped alone. Tokio-native lifecycle and service composition, no
-framework attached.
+Register providers once, resolve the same shared instances by Rust type, and
+let those instances join the application lifecycle when they need to.
 
-`continuo` gives your app one place to register services, boot them,
-reload them, run their background tasks, resolve them by Rust type, and shut
-them down gracefully:
+The provider graph stays explicit and stable. Runtime behavior can still change
+without recompiling: providers rebuild and publish their internal snapshots on
+reload, while callers keep resolving the same typed service.
 
-- register typed services once
-- boot / validate / reload / finalize them in deterministic dependency order
-- resolve them later by concrete Rust type
-- remove the need for ad-hoc runtime injection
+Use it when an application has several long-lived services and needs one small,
+framework-agnostic place to:
+
+- register providers once as typed shared instances
+- resolve the same instances later by concrete Rust type
+- boot, validate, reload, and finalize them in deterministic dependency order
 - spawn long-running async runnable providers
 - drain accepted work through graceful shutdown gates
-- publish typed in-process lifecycle events with the `events` feature
+- publish optional typed in-process lifecycle events
 
 This is the whole application:
 
 ```rust
 let state = AppState::new();
 
-// The registry — the score: who plays, in what order.
-// It owns the provider hooks: validate / boot / reload / finalize.
+// The registry stores typed providers and walks their lifecycle.
 let registry = state.registry_ref();
 registry
     .insert(Arc::new(CounterService::new()))
     .insert(Arc::new(HttpService::new(addr)))
     .insert(Arc::new(SignalService));   // even Ctrl+C is a service
 
-registry.validate_all(&state)?;
 registry.boot_all(&state).await?;       // dependency-ordered
+registry.validate_all(&state)?;
 
-// The runtime — the performance: the live runnable tasks.
+// The runtime owns the live Runnable tasks.
 let mut runtime = Runtime::<AppState>::default();
 runtime.spawn_all(registry, state.clone());
 runtime.wait_until_shutdown(&state).await?;
 runtime.drain().await?;                 // runnables end themselves
 
-// Back to the registry for the last note.
 registry.finalize_all(&state).await?;   // release named resources
 ```
 
-Three inserts — everything else follows from the lifecycle contract; `main`
-composes providers and walks the lifecycle, nothing more. The full working
-version is [`examples/counter.rs`](https://github.com/iadev09/continuo/blob/main/examples/counter.rs).
+After insertion, application code resolves providers by type and the runtime
+calls the hooks those providers expose. The full working version is
+[`examples/counter.rs`](https://github.com/iadev09/continuo/blob/main/examples/counter.rs).
 
 The core idea:
 
 ```text
-Registry<AppState>            — the score: hooks in dependency order
+Registry<AppState>            — typed instances plus lifecycle hooks
   ├─ CounterService -> Provider + Reloadable + Finalizable
   ├─ HttpService    -> Provider + Runnable
   └─ SignalService  -> Provider + Runnable
 
-Runtime<AppState>             — the performance: live runnable tasks
+Runtime<AppState>             — live Runnable tasks
   └─ spawns every provider that exposes Runnable
 ```
 
@@ -155,16 +150,26 @@ impl ReloadState for AppState {
 
 ## The Registry
 
-`Registry<S>` is the main piece. It stores `Arc<T>` values by `TypeId`, while
-also treating them as lifecycle providers.
+`Registry<S>` stores providers as shared `Arc<T>` values keyed by concrete Rust
+type. Anything with access to your state can resolve the same instance later:
 
-That means one object can be all of these at once:
+```rust
+let db = state.registry_ref().resolve::<DbService>().expect("DbService registered");
+```
 
-- a concrete service you can resolve later: `registry.resolve::<DbService>()`
-- a lifecycle participant: `boot`, `validate`
-- a hot-reload participant: `Reloadable`
-- a long-running background task: `Runnable`
-- an end-of-life resource releaser: `Finalizable`
+The same registered object can have two roles:
+
+- application code resolves it by concrete type
+- the runtime walks its lifecycle hooks: `validate`, `boot`, `reload`, `run`,
+  `finalize`
+
+That means a provider can be:
+
+- a shared service resolved by application code
+- a lifecycle participant with `boot()` / `validate()`
+- a reload participant with `Reloadable`
+- a long-running task with `Runnable`
+- a post-drain cleanup participant with `Finalizable`
 
 ```rust
 use std::sync::Arc;
@@ -175,49 +180,90 @@ state
     .insert(Arc::new(DbService::new()))
     .insert(Arc::new(CacheService::new()));
 
-state.registry_ref().validate_all(&state)?;
 state.registry_ref().boot_all(&state).await?;
-
-let db = state.registry_ref().resolve::<DbService>().expect("DbService registered");
+state.registry_ref().validate_all(&state)?;
 ```
 
-Register once. Boot, reload, run, and resolve by type.
+Register once. Resolve by type. Let the same object opt into only the lifecycle
+capabilities it actually needs.
 
-### The magic is boring: `Any` + `TypeId`
+### How Resolve Works
 
-There is no string table, no interface token, no reflection, and no
-macro behind the registry. The whole trick is two of the most
-unglamorous items in the standard library:
+Concrete resolve uses only `Any` and `TypeId` from the standard library:
 
 ```rust
 use std::any::{Any, TypeId};
 ```
 
-- **The key of a service is its type.** `insert(Arc<C>)` stores under
-  `TypeId::of::<C>()` — an identifier the compiler mints, globally
-  unique, impossible to typo, impossible to collide. There is no
-  naming convention because there are no names.
-- **One allocation, two views.** The same `Arc` is stored type-erased
-  twice: as `Arc<dyn Any + Send + Sync>` for typed recovery and as
-  `Arc<dyn Provider<S>>` for the lifecycle walk. No copies — both
-  views share the original allocation.
-- **`resolve::<T>()` is `Arc::downcast`, not reflection.** One integer
-  comparison. It can only ever return the exact type that was
-  inserted, or `None`. A mis-typed handle cannot exist, so the
-  "wrong thing under this key, cast explodes at a distance" class of
-  container bugs is deleted, not handled.
-- **Asking for a non-service type does not compile.** `resolve` is
-  bounded by `T: Provider<S>` — the request itself is type-checked.
+- `insert(Arc<P>)` stores the provider under `TypeId::of::<P>()`.
+- the same allocation is also stored as `Arc<dyn Provider<S>>` for lifecycle
+  traversal.
+- `resolve::<T>()` clones the stored `Arc<dyn Any + Send + Sync>` and
+  downcasts it back to `Arc<T>`.
+- `resolve::<T>()` requires `T: Provider<S>`, so non-provider types do not
+  compile as registry lookups.
 
-Dynamic containers usually buy their flexibility with ambiguity:
-string keys that drift, tokens that need registering, casts that fail
-far from their cause. Rust's famously strict, famously boring type
-system turns out to be the fun part — it *is* the service catalog,
-and `std::any` is all the runtime it needs.
+There are no string keys, service tokens, macros, or request-path container
+lookups in the concrete resolve path.
+
+### Trait Object Capabilities
+
+Concrete providers can also expose a trait-object capability:
+
+```rust
+use std::sync::Arc;
+use async_trait::async_trait;
+use continuo::Provider;
+
+trait Logger: Send + Sync {
+    fn info(&self, message: &str);
+}
+
+struct ConsoleLogger;
+
+impl Logger for ConsoleLogger {
+    fn info(&self, message: &str) {
+        println!("{message}");
+    }
+}
+
+#[async_trait]
+impl Provider<AppState> for ConsoleLogger {
+    fn name(&self) -> &'static str {
+        "console-logger"
+    }
+}
+
+registry.insert(Arc::new(ConsoleLogger));
+registry.bind_dyn::<dyn Logger, ConsoleLogger>(|logger| logger)?;
+
+let logger = registry.resolve_dyn::<dyn Logger>().expect("Logger bound");
+logger.info("ready");
+```
+
+`bind_dyn` does not add another lifecycle participant. It binds an already
+registered concrete provider as a capability, and `resolve_dyn::<dyn Logger>()`
+returns the same shared instance through that trait-object view.
+
+There is one active binding for a given trait object. Calling `bind_dyn` again
+for the same trait object replaces that binding; this is useful during
+bootstrap when configuration decides which registered provider should be the
+default capability.
+
+If an application needs runtime backend switching without recompiling, prefer a
+stable concrete provider that swaps its internal strategy during `reload()`:
+
+```rust
+// App code resolves DomainService; reload can swap GoDaddy for Namecheap
+// inside the service without changing the registry graph.
+let domains = registry.resolve::<DomainService>().expect("DomainService registered");
+```
 
 ## Providers
 
-A provider is any service that wants to join the application lifecycle.
+A provider is a plugin-shaped runtime participant registered as a shared typed
+instance. Application code can resolve it later by concrete Rust type, while
+the runtime can call its lifecycle hooks.
 
 ```rust
 use async_trait::async_trait;
@@ -243,7 +289,7 @@ impl Provider<AppState> for DbService {
         &self,
         state: &AppState
     ) -> Result<()> {
-        // Cheap preflight checks before boot.
+        // Cheap readiness checks after boot.
         Ok(())
     }
 }
@@ -253,12 +299,12 @@ impl Provider<AppState> for DbService {
 
 Lifecycle order is deterministic and type-aware. Providers can express concrete
 dependencies with `ProviderOrder::before::<T>()` / `ProviderOrder::after::<T>()`
-instead of relying on registration order or magic priority numbers.
+instead of relying on registration order or numeric priority conventions.
 
 The same lifecycle plan is used for:
 
-- `validate_all`
 - `boot_all`
+- `validate_all`
 - `reload_all`
 - `finalize_all`, in reverse order (only providers exposing `Finalizable`)
 
@@ -382,10 +428,10 @@ reloadable providers.
 
 ## Finalizable Providers
 
-Finalize is the last note: it releases non-running resources **after the
-runnable tasks have drained** — externally named things whose stale presence
-would break the next boot (shm segments, lock files). It is not a stop
-mechanism; runnables end their own futures inside `run()`.
+Finalize releases non-running resources **after the runnable tasks have
+drained**: externally named things whose stale presence would break the next
+boot, such as shm segments or lock files. It is not a stop mechanism; runnables
+end their own futures inside `run()`.
 
 ```rust
 use async_trait::async_trait;
@@ -464,8 +510,8 @@ bus.emit(ConfigReloaded);
 
 ## Example
 
-One single-file example carries the whole story —
-[`examples/counter.rs`](https://github.com/iadev09/continuo/blob/main/examples/counter.rs):
+[`examples/counter.rs`](https://github.com/iadev09/continuo/blob/main/examples/counter.rs)
+shows the full flow in one file:
 
 ```sh
 cargo run --example counter
@@ -475,22 +521,16 @@ kill -HUP <pid>                       # same reload, via signal
 # Ctrl+C — graceful drain, then finalize persists the count
 ```
 
-One log tells the whole story (two browsers open — ports 51422 and
-51423 each keep their own per-connection count; the application-scoped
-total is shared):
+The log shows boot, reload, graceful drain, and finalize:
 
 ```text
 counter booted: starting fresh from 0 (no counter.txt yet)
 signals: ready (pid 73942)
-signals: reload with `kill -HUP 73942` or GET /reload — resets the counter
-signals: stop with Ctrl+C or `kill -INT 73942` — drains, then finalizes
 http listening on http://127.0.0.1:3000/hit (Ctrl+C to stop)
 http: hit #1 (client port 51422 → its #1)
 http: hit #2 (client port 51423 → its #1)
 counter reloaded: reset to 0               ← SIGHUP or GET /reload
 http: /reload — providers reloaded
-http: hit #1 (client port 51423 → its #1)
-http: hit #2 (client port 51422 → its #1)
 http: hit #3 (client port 51423 → its #2)
 ^C
 signals: Ctrl+C — initiating shutdown
@@ -506,29 +546,27 @@ counter booted: starting from 3 (restored from counter.txt)
 http: hit #4 (client port 51425 → its #1)
 ```
 
-Three providers, every capability doing real work:
+Three providers are involved:
 
 - **`CounterService`** is **application-scoped**: one instance for the
-  process lifetime, shared by every request. `boot()` restores the count from `counter.txt`
-  with `tokio::fs`, `reload()` resets it to 0, and
-  `Finalizable::finalize()` persists the final value after the
-  runnables drained — the count survives restarts. It also keeps a
-  per-connection count (peer address via axum's `ConnectInfo`) so the
-  scope contrast is visible: connections diverge, the total is shared.
+  process lifetime, shared by every request. `boot()` restores the count,
+  `reload()` resets it, and `Finalizable::finalize()` persists the final value
+  after runnables drain.
 - **`HttpService`** boots after its dependency
   (`ProviderOrder::new().after::<CounterService>()`), resolves it from
-  the registry **once, while building the router**, and hands it to
-  handlers as an axum `Extension` — no per-request container lookups,
-  no lookups on the request path. The router state is the `AppState`
-  itself, so handlers like `/reload` can call `reload_all` straight
-  from a request. The server serves and drains inside
+  the registry once while building the router, and serves/drains inside
   `Runnable::run()`.
 - **`SignalService`** — even signal handling is a provider: Ctrl+C maps
-  to shutdown, SIGHUP to `reload_all`. `main` contains no naked
-  `tokio::spawn`; it only composes providers and walks the lifecycle.
+  to shutdown, SIGHUP to `reload_all`.
 
-axum is a dev-dependency only; the transport is an implementation
-detail.
+axum is a dev-dependency only; the transport is an implementation detail.
+
+## Why the name?
+
+In baroque music, the *basso continuo* is the part that plays through the
+whole piece while soloists enter and leave. `continuo` tries to be that steady
+part for application services: the registry stays available, while providers
+resolve, run, reload, and finalize around it.
 
 ## Dependencies
 
