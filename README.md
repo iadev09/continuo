@@ -187,6 +187,11 @@ state.registry_ref().validate_all(&state)?;
 Register once. Resolve by type. Let the same object opt into only the lifecycle
 capabilities it actually needs.
 
+`Reloadable`, `Runnable`, and `Finalizable` are provider capability traits:
+each has `Provider<S>` as a supertrait. Implementing one therefore requires the
+same concrete type to implement `Provider<S>`; the corresponding `as_*` hook
+then exposes that capability to registry lifecycle traversal.
+
 ### How Resolve Works
 
 Concrete resolve uses only `Any` and `TypeId` from the standard library:

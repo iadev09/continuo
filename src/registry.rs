@@ -260,7 +260,7 @@ pub trait ReloadState: Send + Sync + Sized + 'static {
 /// Reload must NOT change which providers are registered; it only
 /// refreshes state of an already-registered provider.
 #[async_trait]
-pub trait Reloadable<S>: Send + Sync + 'static {
+pub trait Reloadable<S>: Provider<S> {
     /// Optional reload priority.
     ///
     /// Lower values run earlier among otherwise-ready providers. `None`
@@ -291,7 +291,7 @@ pub trait Reloadable<S>: Send + Sync + 'static {
 /// long task. The provider stays registered for downstream capability
 /// lookups; it just doesn't run on this process.
 #[async_trait]
-pub trait Runnable<S>: Send + Sync + 'static {
+pub trait Runnable<S>: Provider<S> {
     /// Run the long-lived provider task spawned by the bootstrap/supervisor layer.
     ///
     /// NOTICE (convention):
@@ -322,7 +322,7 @@ pub trait Runnable<S>: Send + Sync + 'static {
 /// boot, such as shm segments or lock files. Implementations should be
 /// idempotent because the finalize path may be re-entered.
 #[async_trait]
-pub trait Finalizable<S>: Send + Sync + 'static {
+pub trait Finalizable<S>: Provider<S> {
     /// Releases non-running resources after runnables drain.
     async fn finalize(
         &self,
