@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::sync::{Notify, watch};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, warn};
+use tracing::debug;
 
 /// Sentinel value for AtomicU64 representing None (infinite grace period)
 const NANOS_NONE: u64 = u64::MAX;
@@ -42,6 +42,16 @@ pub enum Error {
     ShuttingDown, // GracefulShutdown(Duration),
     AcquireTimeout(Duration),
     AtCapacity,
+}
+
+/// Result of waiting for accepted work to leave a [`Gate`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "forced gate shutdown must be handled by the caller"]
+pub enum GateDrainOutcome {
+    /// Every permit was released without forcing shutdown.
+    Drained,
+    /// The grace period elapsed and the hard-shutdown signal was sent.
+    Forced { remaining: usize },
 }
 
 impl Gate {
@@ -150,12 +160,6 @@ impl Gate {
             // Calculate remaining timeout
             let elapsed = start.elapsed();
             if elapsed >= wait_timeout {
-                warn!(
-                    "Connection acquire timeout after {:?}. Current: {}/{}",
-                    wait_timeout,
-                    count,
-                    self.inner.max_count.unwrap_or(usize::MAX)
-                );
                 return Err(Error::AcquireTimeout(wait_timeout));
             }
 
@@ -174,12 +178,6 @@ impl Gate {
                     continue;
                 }
                 _ = sleep(remaining) => {
-                    warn!(
-                        "Connection acquire timeout after {:?}. Current: {}/{}",
-                        wait_timeout,
-                        count,
-                        self.inner.max_count.unwrap_or(usize::MAX)
-                    );
                     return Err(Error::AcquireTimeout(wait_timeout));
                 }
             }
@@ -209,12 +207,13 @@ impl Gate {
     }
 
     /// Wait until all permits are dropped, respecting the configured grace period.
-    /// If the grace period elapses, this triggers `force_shutdown()` and returns immediately.
+    /// If the grace period elapses, this triggers `force_shutdown()` and reports
+    /// the number of permits that remained when the hard signal was sent.
     /// Note: when returning via the forced path, `count()` may still be > 0 for a short time
     /// until connection tasks observe the hard signal and drop.
-    pub async fn wait_all_done(&self) {
+    pub async fn wait_all_done(&self) -> GateDrainOutcome {
         if self.inner.count.load(Ordering::SeqCst) == 0 {
-            return;
+            return GateDrainOutcome::Drained;
         }
 
         // Lock-free read of grace period
@@ -224,14 +223,19 @@ impl Gate {
             Some(duration) => tokio::select! {
                 biased;
                 _ = sleep(duration) => {
-                    error!("⛔ Graceful timeout exceeded after {:?}; forcing shutdown", duration);
+                    let remaining = self.count();
                     self.force_shutdown();
+                    GateDrainOutcome::Forced { remaining }
                 },
                 _ = self.inner.all_done.notified() => {
                     debug!("🍺 All connections finished before graceful timeout");
+                    GateDrainOutcome::Drained
                 },
             },
-            None => self.inner.all_done.notified().await,
+            None => {
+                self.inner.all_done.notified().await;
+                GateDrainOutcome::Drained
+            }
         }
     }
 }
@@ -240,7 +244,6 @@ pub struct Permit {
     gate: Gate,
 }
 
-#[allow(unused)]
 impl Permit {
     fn new(gate: Gate) -> Self {
         gate.inner.count.fetch_add(1, Ordering::SeqCst);
@@ -347,7 +350,7 @@ impl NotifyOnce {
 mod tests {
     use std::time::Duration;
 
-    use super::{Error, Gate};
+    use super::{Error, Gate, GateDrainOutcome};
 
     #[test]
     fn try_enter_counts_one_slot_per_permit() {
@@ -366,5 +369,21 @@ mod tests {
 
         drop(second);
         assert_eq!(gate.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_gate_reports_clean_drain() {
+        let gate = Gate::new(None, Duration::from_millis(10));
+
+        assert_eq!(gate.wait_all_done().await, GateDrainOutcome::Drained);
+    }
+
+    #[tokio::test]
+    async fn elapsed_grace_period_reports_forced_drain() {
+        let gate = Gate::new(None, Duration::from_millis(10));
+        let _permit = gate.try_enter().expect("permit should be admitted");
+        gate.graceful_shutdown(Some(Duration::from_millis(1)));
+
+        assert_eq!(gate.wait_all_done().await, GateDrainOutcome::Forced { remaining: 1 });
     }
 }

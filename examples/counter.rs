@@ -368,12 +368,21 @@ async fn main() -> Result<()> {
     let registry = state.registry_ref();
 
     registry
-        .insert(Arc::new(CounterService::new()))
-        .insert(Arc::new(HttpService::new(SocketAddr::from(([127, 0, 0, 1], 3000)))))
-        .insert(Arc::new(SignalService));
+        .insert(Arc::new(CounterService::new()))?
+        .insert(Arc::new(HttpService::new(SocketAddr::from(([127, 0, 0, 1], 3000)))))?
+        .insert(Arc::new(SignalService))?;
 
     registry.boot_all(&state).await?;
-    registry.validate_all(&state)?;
+    let validation = registry.validate_all(&state)?;
+    for failure in validation.failures() {
+        eprintln!("validation failed for {}: {}", failure.provider(), failure.error());
+    }
+    if !validation.is_valid() {
+        return Err(Error::msg(format!(
+            "{} provider validation(s) failed",
+            validation.failed_count()
+        )));
+    }
 
     let mut runtime = Runtime::<AppState>::default();
     runtime.spawn_all(state.registry_ref(), state.clone());
@@ -381,7 +390,10 @@ async fn main() -> Result<()> {
     runtime.drain().await?;
 
     // Runnables are done — release what must not leak into the next boot.
-    registry.finalize_all(&state).await?;
+    let finalized = registry.finalize_all(&state).await?;
+    for failure in finalized.failures() {
+        eprintln!("finalize failed for {}: {}", failure.provider(), failure.error());
+    }
 
     println!("🏁 all services finished gracefully");
     Ok(())
