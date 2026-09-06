@@ -258,7 +258,14 @@ async fn hit(
 /// commands — any handler can invoke the same `reload_all` directly.
 async fn reload(State(app): State<AppState>) -> Redirect {
     match app.registry_ref().reload_all(&app).await {
-        Ok(()) => println!("http: /reload — providers reloaded"),
+        Ok(outcome) if outcome.is_complete() => {
+            println!("http: /reload — {} provider(s) reloaded", outcome.reloaded_count())
+        }
+        Ok(outcome) => println!(
+            "http: /reload — {} provider(s) reloaded, {} failed",
+            outcome.reloaded_count(),
+            outcome.failed_count()
+        ),
         Err(e) => println!("http: /reload failed: {e}"),
     }
     Redirect::to("/hit")
@@ -306,7 +313,10 @@ impl Runnable<AppState> for SignalService {
                 }
                 _ = hangup.recv() => {
                     println!("signals: SIGHUP — reloading providers");
-                    state.registry_ref().reload_all(&state).await?;
+                    let outcome = state.registry_ref().reload_all(&state).await?;
+                    if !outcome.is_complete() {
+                        println!("signals: reload completed with {} provider failure(s)", outcome.failed_count());
+                    }
                 }
                 _ = token.cancelled() => return Ok(()),
             }

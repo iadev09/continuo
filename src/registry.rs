@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use tracing::{Instrument, error, info, warn};
+use tracing::{Instrument, error, warn};
 
 // =====================================================================
 // Error model
@@ -138,9 +138,7 @@ impl Error {
             other => other,
         }
     }
-    /// Used by `reload_one` (targeted, fail-fast). `reload_all` is broadcast
-    /// and intentionally fail-soft — a single provider's failure should not
-    /// cancel the rest, so that path just logs a warning.
+    /// Attach provider identity to an anonymous reload error.
     fn into_reload(
         self,
         name: &'static str,
@@ -181,6 +179,62 @@ impl Error {
         }
         impl std::error::Error for MsgErr {}
         Error::Recoverable { name: "", source: Box::new(MsgErr(s.into())) }
+    }
+}
+
+/// One provider failure retained by a broadcast reload.
+#[derive(Debug)]
+pub struct ReloadFailure {
+    provider: &'static str,
+    error: Error,
+}
+
+impl ReloadFailure {
+    pub fn provider(&self) -> &'static str {
+        self.provider
+    }
+
+    pub fn error(&self) -> &Error {
+        &self.error
+    }
+
+    pub fn into_error(self) -> Error {
+        self.error
+    }
+}
+
+/// Result of a completed best-effort reload broadcast.
+///
+/// The outer [`Result`] returned by [`Registry::reload_all`] remains reserved
+/// for failures that prevent the broadcast itself, such as state reload or
+/// lifecycle-plan errors. Individual provider failures are retained here so
+/// callers choose their own logging, metrics, or transport representation.
+#[derive(Debug, Default)]
+#[must_use = "provider reload failures are reported through ReloadOutcome"]
+pub struct ReloadOutcome {
+    reloaded_count: usize,
+    failures: Vec<ReloadFailure>,
+}
+
+impl ReloadOutcome {
+    pub fn is_complete(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    pub fn reloaded_count(&self) -> usize {
+        self.reloaded_count
+    }
+
+    pub fn failed_count(&self) -> usize {
+        self.failures.len()
+    }
+
+    pub fn failures(&self) -> &[ReloadFailure] {
+        &self.failures
+    }
+
+    pub fn into_failures(self) -> Vec<ReloadFailure> {
+        self.failures
     }
 }
 
@@ -786,20 +840,8 @@ impl<S: 'static> Registry<S> {
             )));
         };
 
-        info!("♻️  reloading service '{}'", name);
-
-        match reloadable.reload(state).await {
-            Ok(()) => {
-                info!("♻️  {} reloaded", name);
-                Ok(())
-            }
-            Err(e) => {
-                warn!("❌ reload of {} failed: {e}", name);
-                // Resolve the static name from the provider before consuming it.
-                let static_name = provider.name();
-                Err(e.into_reload(static_name))
-            }
-        }
+        let provider_name = provider.name();
+        reloadable.reload(state).await.map_err(|error| error.into_reload(provider_name))
     }
 }
 
@@ -810,23 +852,24 @@ where
     pub async fn reload_all(
         &self,
         state: &S,
-    ) -> Result<()> {
+    ) -> Result<ReloadOutcome> {
         state.reload().await?;
 
-        info!("✅ state reloaded");
+        let mut outcome = ReloadOutcome::default();
 
         for provider in self.lifecycle_plan()? {
             let name = provider.name();
             if let Some(reloadable) = provider.as_reloadable() {
-                if let Err(e) = reloadable.reload(state).await {
-                    warn!("❌ reload of {} failed: {e}", name);
-                } else {
-                    info!("♻️  {} reloaded", name);
+                match reloadable.reload(state).await {
+                    Ok(()) => outcome.reloaded_count += 1,
+                    Err(error) => outcome
+                        .failures
+                        .push(ReloadFailure { provider: name, error: error.into_reload(name) }),
                 }
             }
         }
 
-        Ok(())
+        Ok(outcome)
     }
 }
 
@@ -931,6 +974,13 @@ mod tests {
     #[derive(Clone, Default)]
     struct TestState {
         seen: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait]
+    impl ReloadState for TestState {
+        async fn reload(&self) -> Result<()> {
+            Ok(())
+        }
     }
 
     struct DbProvider;
@@ -1240,5 +1290,67 @@ mod tests {
 
         let err = registry.validate_all(&state).expect_err("cycle must be rejected");
         assert!(err.to_string().contains("provider lifecycle order cycle detected"));
+    }
+
+    struct Reloads;
+    struct FailsReload;
+
+    #[async_trait]
+    impl Provider<TestState> for Reloads {
+        fn name(&self) -> &'static str {
+            "reloads"
+        }
+
+        fn as_reloadable(&self) -> Option<&dyn Reloadable<TestState>> {
+            Some(self)
+        }
+    }
+
+    #[async_trait]
+    impl Reloadable<TestState> for Reloads {
+        async fn reload(
+            &self,
+            _: &TestState,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Provider<TestState> for FailsReload {
+        fn name(&self) -> &'static str {
+            "fails-reload"
+        }
+
+        fn as_reloadable(&self) -> Option<&dyn Reloadable<TestState>> {
+            Some(self)
+        }
+    }
+
+    #[async_trait]
+    impl Reloadable<TestState> for FailsReload {
+        async fn reload(
+            &self,
+            _: &TestState,
+        ) -> Result<()> {
+            Err(Error::msg("reload rejected"))
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_all_retains_provider_failures_and_continues() {
+        let state = TestState::default();
+        let registry = Registry::<TestState>::new();
+        registry.insert(Arc::new(FailsReload)).insert(Arc::new(Reloads));
+
+        let outcome = registry.reload_all(&state).await.expect("broadcast should complete");
+
+        assert!(!outcome.is_complete());
+        assert_eq!(outcome.reloaded_count(), 1);
+        assert_eq!(outcome.failed_count(), 1);
+        let failure = &outcome.failures()[0];
+        assert_eq!(failure.provider(), "fails-reload");
+        assert!(matches!(failure.error(), Error::Reload { name: "fails-reload", .. }));
+        assert_eq!(failure.error().to_string(), "reload of 'fails-reload' failed: reload rejected");
     }
 }

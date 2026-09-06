@@ -429,7 +429,11 @@ Use `registry.reload_one("db", &state).await` for targeted reloads or
 
 `reload_all` first calls `ReloadState::reload()` on your state, then walks the
 same lifecycle order used by `boot_all` and calls `Reloadable::reload()` on
-reloadable providers.
+reloadable providers. It is a best-effort broadcast: one provider failure does
+not prevent later providers from reloading. The returned `ReloadOutcome`
+contains the successful provider count and each `ReloadFailure` with its
+provider name and original typed error. The outer `Result` is reserved for a
+state reload or lifecycle-plan failure that prevents the broadcast itself.
 
 ## Finalizable Providers
 

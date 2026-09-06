@@ -30,8 +30,8 @@ pub use gate::{Gate, Permit};
 #[cfg(feature = "support")]
 pub use guard::{Guard, GuardGroup};
 pub use registry::{
-    BoxError, Error, Finalizable, Provider, ProviderOrder, Registry, ReloadState, Reloadable,
-    Result, Runnable,
+    BoxError, Error, Finalizable, Provider, ProviderOrder, Registry, ReloadFailure, ReloadOutcome,
+    ReloadState, Reloadable, Result, Runnable,
 };
 pub use runtime::Runtime;
 pub use state::SharedState;
