@@ -37,12 +37,13 @@ let state = AppState::new();
 // The registry stores typed providers and walks their lifecycle.
 let registry = state.registry_ref();
 registry
-    .insert(Arc::new(CounterService::new()))
-    .insert(Arc::new(HttpService::new(addr)))
-    .insert(Arc::new(SignalService));   // even Ctrl+C is a service
+    .insert(Arc::new(CounterService::new()))?
+    .insert(Arc::new(HttpService::new(addr)))?
+    .insert(Arc::new(SignalService))?;  // even Ctrl+C is a service
 
 registry.boot_all(&state).await?;       // dependency-ordered
-registry.validate_all(&state)?;
+let validation = registry.validate_all(&state)?;
+// The application decides how to report validation.failures().
 
 // The runtime owns the live Runnable tasks.
 let mut runtime = Runtime::<AppState>::default();
@@ -50,7 +51,8 @@ runtime.spawn_all(registry, state.clone());
 runtime.wait_until_shutdown(&state).await?;
 runtime.drain().await?;                 // runnables end themselves
 
-registry.finalize_all(&state).await?;   // release named resources
+let finalized = registry.finalize_all(&state).await?;
+// The application decides how to report finalized.failures().
 ```
 
 After insertion, application code resolves providers by type and the runtime
@@ -177,11 +179,11 @@ use std::sync::Arc;
 let state = AppState::new();
 state
     .registry_ref()
-    .insert(Arc::new(DbService::new()))
-    .insert(Arc::new(CacheService::new()));
+    .insert(Arc::new(DbService::new()))?
+    .insert(Arc::new(CacheService::new()))?;
 
 state.registry_ref().boot_all(&state).await?;
-state.registry_ref().validate_all(&state)?;
+let validation = state.registry_ref().validate_all(&state)?;
 ```
 
 Register once. Resolve by type. Let the same object opt into only the lifecycle
@@ -239,7 +241,7 @@ impl Provider<AppState> for ConsoleLogger {
     }
 }
 
-registry.insert(Arc::new(ConsoleLogger));
+registry.insert(Arc::new(ConsoleLogger))?;
 registry.bind_dyn::<dyn Logger, ConsoleLogger>(|logger| logger)?;
 
 let logger = registry.resolve_dyn::<dyn Logger>().expect("Logger bound");
@@ -335,8 +337,8 @@ Registration order can now stay ergonomic:
 ```rust
 use std::sync::Arc;
 
-state.registry_ref().insert(Arc::new(CacheService));
-state.registry_ref().insert(Arc::new(DbService));
+state.registry_ref().insert(Arc::new(CacheService))?;
+state.registry_ref().insert(Arc::new(DbService))?;
 
 let names = state.registry_ref().lifecycle_names()?;
 println!("Lifecycle order: {}", names.join(" -> "));
@@ -349,6 +351,11 @@ state.registry_ref().boot_all(&state).await?;
 `boot_priority()` and `Reloadable::priority()` are still available as coarse
 tie-breakers among otherwise-ready providers. Prefer `ProviderOrder` for real
 dependencies. `run_priority()` controls only runtime task spawn order.
+
+`validate_all()` checks the complete lifecycle plan even when one provider is
+invalid. `ValidationOutcome` retains the successful count and every
+`ValidationFailure`; the application owns reporting and the decision to abort
+startup.
 
 ## Runnable Providers
 
@@ -465,8 +472,9 @@ impl Provider<AppState> for DbService {
 ```
 
 `registry.finalize_all(&state).await` walks the lifecycle plan in reverse and
-calls `finalize()` on every provider that exposes the capability. Failures are
-logged and do not stop the remaining finalizers.
+calls `finalize()` on every provider that exposes the capability. One failure
+does not stop the remaining finalizers. `FinalizeOutcome` retains the successful
+provider count and every `FinalizeFailure`; the caller owns logging and policy.
 
 ## Gates
 
@@ -487,13 +495,15 @@ It can:
 
 ```rust
 use std::time::Duration;
-use continuo::Gate;
+use continuo::{Gate, GateDrainOutcome};
 
 let gate = Gate::new(Some(1024), Duration::from_millis(100));
 let permit = gate.enter().await?;
 
 gate.graceful_shutdown(Some(Duration::from_secs(30)));
-gate.wait_all_done().await;
+if let GateDrainOutcome::Forced { remaining } = gate.wait_all_done().await {
+    eprintln!("forced shutdown with {remaining} permit(s) still active");
+}
 # Ok::<(), continuo::gate::Error>(())
 ```
 

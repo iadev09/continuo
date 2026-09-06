@@ -85,7 +85,6 @@ where
                         // runnable that wants log+continue must explicitly
                         // opt in via `Error::run_continue`.
                         Ok(Err(e)) => {
-                            error!("a runnable failed: {}", e);
                             return Err(e);
                         }
                         Err(join_err) => {
@@ -121,7 +120,6 @@ impl<S> Runtime<S> {
                     error!(provider = %name, "runnable failed during drain (continuing): {}", source);
                 }
                 Ok(Err(e)) => {
-                    error!("a runnable failed during drain: {}", e);
                     return Err(e);
                 }
                 Err(join_err) => {

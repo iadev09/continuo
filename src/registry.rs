@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use tracing::{Instrument, error, warn};
+use tracing::Instrument;
 
 // =====================================================================
 // Error model
@@ -30,6 +30,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug)]
 pub enum Error {
+    DuplicateProvider {
+        type_name: &'static str,
+    },
     Boot {
         name: &'static str,
         source: BoxError,
@@ -39,6 +42,10 @@ pub enum Error {
         source: BoxError,
     },
     Reload {
+        name: &'static str,
+        source: BoxError,
+    },
+    Finalize {
         name: &'static str,
         source: BoxError,
     },
@@ -65,6 +72,9 @@ impl std::fmt::Display for Error {
         f: &mut std::fmt::Formatter<'_>,
     ) -> std::fmt::Result {
         match self {
+            Error::DuplicateProvider { type_name } => {
+                write!(f, "provider type '{type_name}' is already registered")
+            }
             Error::Boot { name, source } => {
                 write!(f, "provider '{name}' failed during boot: {source}")
             }
@@ -73,6 +83,9 @@ impl std::fmt::Display for Error {
             }
             Error::Reload { name, source } => {
                 write!(f, "reload of '{name}' failed: {source}")
+            }
+            Error::Finalize { name, source } => {
+                write!(f, "finalize of '{name}' failed: {source}")
             }
             Error::Run { name, source } => {
                 write!(f, "runnable '{name}' failed: {source}")
@@ -148,6 +161,15 @@ impl Error {
             other => other,
         }
     }
+    fn into_finalize(
+        self,
+        name: &'static str,
+    ) -> Self {
+        match self {
+            Error::Other(source) => Error::Finalize { name, source },
+            other => other,
+        }
+    }
     fn into_run(
         self,
         name: &'static str,
@@ -179,6 +201,61 @@ impl Error {
         }
         impl std::error::Error for MsgErr {}
         Error::Recoverable { name: "", source: Box::new(MsgErr(s.into())) }
+    }
+}
+
+/// One provider failure retained by a full validation pass.
+#[derive(Debug)]
+pub struct ValidationFailure {
+    provider: &'static str,
+    error: Error,
+}
+
+impl ValidationFailure {
+    pub fn provider(&self) -> &'static str {
+        self.provider
+    }
+
+    pub fn error(&self) -> &Error {
+        &self.error
+    }
+
+    pub fn into_error(self) -> Error {
+        self.error
+    }
+}
+
+/// Result of validating every provider in lifecycle order.
+///
+/// The outer [`Result`] returned by [`Registry::validate_all`] is reserved for
+/// lifecycle-plan failures. Individual provider failures are retained here so
+/// callers can report the complete invalid configuration in one pass.
+#[derive(Debug, Default)]
+#[must_use = "provider validation failures are reported through ValidationOutcome"]
+pub struct ValidationOutcome {
+    validated_count: usize,
+    failures: Vec<ValidationFailure>,
+}
+
+impl ValidationOutcome {
+    pub fn is_valid(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    pub fn validated_count(&self) -> usize {
+        self.validated_count
+    }
+
+    pub fn failed_count(&self) -> usize {
+        self.failures.len()
+    }
+
+    pub fn failures(&self) -> &[ValidationFailure] {
+        &self.failures
+    }
+
+    pub fn into_failures(self) -> Vec<ValidationFailure> {
+        self.failures
     }
 }
 
@@ -234,6 +311,57 @@ impl ReloadOutcome {
     }
 
     pub fn into_failures(self) -> Vec<ReloadFailure> {
+        self.failures
+    }
+}
+
+/// One provider failure retained by best-effort finalization.
+#[derive(Debug)]
+pub struct FinalizeFailure {
+    provider: &'static str,
+    error: Error,
+}
+
+impl FinalizeFailure {
+    pub fn provider(&self) -> &'static str {
+        self.provider
+    }
+
+    pub fn error(&self) -> &Error {
+        &self.error
+    }
+
+    pub fn into_error(self) -> Error {
+        self.error
+    }
+}
+
+/// Result of a completed best-effort finalization pass.
+#[derive(Debug, Default)]
+#[must_use = "provider finalization failures are reported through FinalizeOutcome"]
+pub struct FinalizeOutcome {
+    finalized_count: usize,
+    failures: Vec<FinalizeFailure>,
+}
+
+impl FinalizeOutcome {
+    pub fn is_complete(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    pub fn finalized_count(&self) -> usize {
+        self.finalized_count
+    }
+
+    pub fn failed_count(&self) -> usize {
+        self.failures.len()
+    }
+
+    pub fn failures(&self) -> &[FinalizeFailure] {
+        &self.failures
+    }
+
+    pub fn into_failures(self) -> Vec<FinalizeFailure> {
         self.failures
     }
 }
@@ -551,19 +679,19 @@ impl<S: 'static> Registry<S> {
     /// allocation (no new allocation is created).
     ///
     /// If another service with the same concrete type is already registered,
-    /// the new registration is skipped and a warning is logged.
+    /// registration is rejected.
     ///
-    /// Returns `&Self` to allow fluent chaining:
+    /// Returns `&Self` to allow fallible fluent chaining:
     ///
     /// ```ignore
     /// registry
-    ///     .insert(dns.clone())
-    ///     .insert(ipc.clone());
+    ///     .insert(dns.clone())?
+    ///     .insert(ipc.clone())?;
     /// ```
     pub fn insert<P>(
         &self,
         item: Arc<P>,
-    ) -> &Self
+    ) -> Result<&Self>
     where
         P: Provider<S> + 'static,
     {
@@ -571,11 +699,7 @@ impl<S: 'static> Registry<S> {
         let any: Arc<dyn Any + Send + Sync> = item.clone();
         let mut by_type = self.by_type.write().expect("registry by_type lock poisoned");
         if by_type.contains_key(&type_id) {
-            warn!(
-                "⚠️ duplicate provider type '{}' — skipping registration",
-                std::any::type_name::<P>()
-            );
-            return self;
+            return Err(Error::DuplicateProvider { type_name: std::any::type_name::<P>() });
         }
         by_type.insert(type_id, any);
         drop(by_type);
@@ -584,7 +708,7 @@ impl<S: 'static> Registry<S> {
         self.providers.write().expect("registry providers lock poisoned").insert(type_id, it);
         self.registration_order.write().expect("registry order lock poisoned").push(type_id);
         *self.lifecycle_order.write().expect("registry lifecycle order lock poisoned") = None;
-        self
+        Ok(self)
     }
 
     /// Bind a registered concrete provider as a trait-object capability.
@@ -614,7 +738,10 @@ impl<S: 'static> Registry<S> {
         let mut dyn_by_type = self.dyn_by_type.write().expect("registry dyn_by_type lock poisoned");
         let erased: Box<dyn Any + Send + Sync> = Box::new(cast(concrete));
         if dyn_by_type.insert(interface_id, erased).is_some() {
-            warn!("replaced dyn binding for interface '{}'", std::any::type_name::<I>());
+            tracing::debug!(
+                interface = std::any::type_name::<I>(),
+                "replaced dynamic capability binding"
+            );
         }
         Ok(self)
     }
@@ -666,7 +793,6 @@ impl<S: 'static> Registry<S> {
     }
 
     /// Return a snapshot of registered providers.
-    #[allow(unused)]
     pub fn providers(&self) -> Vec<Arc<dyn Provider<S>>> {
         self.providers.read().expect("registry providers lock poisoned").values().cloned().collect()
     }
@@ -726,7 +852,6 @@ impl<S: 'static> Registry<S> {
     }
 
     /// Return the list of provider display names (for diagnostics only).
-    #[allow(unused)]
     pub fn list_names(&self) -> Vec<&'static str> {
         self.providers().iter().map(|c| c.name()).collect()
     }
@@ -771,16 +896,27 @@ impl<S: 'static> Registry<S> {
         spawned
     }
 
-    /// Run `validate` hook for all registered providers.
+    /// Run `validate` for every provider in lifecycle order.
+    ///
+    /// Lifecycle-plan failures remain outer errors. A provider validation
+    /// failure does not prevent later providers from being checked; every
+    /// provider failure is retained in the outcome.
     pub fn validate_all(
         &self,
         state: &S,
-    ) -> Result<()> {
+    ) -> Result<ValidationOutcome> {
+        let mut outcome = ValidationOutcome::default();
+
         for provider in self.lifecycle_plan()? {
             let name = provider.name();
-            provider.validate(state).map_err(|e| e.into_validate(name))?;
+            match provider.validate(state) {
+                Ok(()) => outcome.validated_count += 1,
+                Err(error) => outcome
+                    .failures
+                    .push(ValidationFailure { provider: name, error: error.into_validate(name) }),
+            }
         }
-        Ok(())
+        Ok(outcome)
     }
 
     pub async fn boot_all(
@@ -789,35 +925,36 @@ impl<S: 'static> Registry<S> {
     ) -> Result<()> {
         for provider in self.lifecycle_plan()? {
             let name = provider.name();
-            // debug!("🚀 booting provider '{}'", name);
             if let Err(e) = provider.boot(state).await {
-                error!("❌ boot provider '{}' failed: {}", name, e);
                 return Err(e.into_boot(name));
             }
-            // debug!("✅ provider '{}' booted", name);
         }
         Ok(())
     }
 
     /// Run `Finalizable::finalize` for every provider that exposes the
     /// capability, in reverse lifecycle order. Called by the bootstrap
-    /// layer after the runnable tasks have drained; failures are logged
-    /// and do not stop the remaining finalizers.
+    /// layer after the runnable tasks have drained. One failure does not stop
+    /// later finalizers; every failure is retained in the outcome.
     pub async fn finalize_all(
         &self,
         state: &S,
-    ) -> Result<()> {
+    ) -> Result<FinalizeOutcome> {
         let mut providers = self.lifecycle_plan()?;
         providers.reverse();
+        let mut outcome = FinalizeOutcome::default();
 
         for provider in providers {
             let Some(finalizable) = provider.as_finalizable() else { continue };
             let name = provider.name();
-            if let Err(e) = finalizable.finalize(state).await {
-                warn!("finalize of provider '{}' failed: {}", name, e);
+            match finalizable.finalize(state).await {
+                Ok(()) => outcome.finalized_count += 1,
+                Err(error) => outcome
+                    .failures
+                    .push(FinalizeFailure { provider: name, error: error.into_finalize(name) }),
             }
         }
-        Ok(())
+        Ok(outcome)
     }
 
     pub async fn reload_one(
@@ -987,6 +1124,7 @@ mod tests {
     struct CacheProvider;
     struct ApiProvider;
     struct MetricsProvider;
+    struct FailsValidation;
 
     #[async_trait]
     impl Provider<TestState> for DbProvider {
@@ -1060,6 +1198,20 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl Provider<TestState> for FailsValidation {
+        fn name(&self) -> &'static str {
+            "fails-validation"
+        }
+
+        fn validate(
+            &self,
+            _: &TestState,
+        ) -> Result<()> {
+            Err(Error::msg("validation rejected"))
+        }
+    }
+
     #[test]
     fn lifecycle_order_uses_type_dependencies() {
         let state = TestState::default();
@@ -1067,13 +1219,38 @@ mod tests {
 
         registry
             .insert(Arc::new(ApiProvider))
+            .expect("api registration should succeed")
             .insert(Arc::new(CacheProvider))
-            .insert(Arc::new(DbProvider));
+            .expect("cache registration should succeed")
+            .insert(Arc::new(DbProvider))
+            .expect("database registration should succeed");
 
-        registry.validate_all(&state).expect("validation should succeed");
+        let outcome = registry.validate_all(&state).expect("validation should run");
+        assert!(outcome.is_valid());
+        assert_eq!(outcome.validated_count(), 3);
 
         let seen = state.seen.lock().expect("test log poisoned").clone();
         assert_eq!(seen, vec!["db", "cache", "api"]);
+    }
+
+    #[test]
+    fn duplicate_provider_registration_is_rejected_without_replacement() {
+        let registry = Registry::<TestState>::new();
+        let original = Arc::new(ApiProvider);
+
+        registry.insert(original.clone()).expect("first registration should succeed");
+        let error = match registry.insert(Arc::new(ApiProvider)) {
+            Err(error) => error,
+            Ok(_) => panic!("duplicate registration must be rejected"),
+        };
+
+        assert!(matches!(
+            error,
+            Error::DuplicateProvider { type_name }
+                if type_name == std::any::type_name::<ApiProvider>()
+        ));
+        let resolved = registry.resolve::<ApiProvider>().expect("original provider should remain");
+        assert!(Arc::ptr_eq(&resolved, &original));
     }
 
     #[test]
@@ -1083,17 +1260,48 @@ mod tests {
 
         registry
             .insert(Arc::new(ApiProvider))
+            .expect("api registration should succeed")
             .insert(Arc::new(MetricsProvider))
+            .expect("metrics registration should succeed")
             .insert(Arc::new(CacheProvider))
-            .insert(Arc::new(DbProvider));
+            .expect("cache registration should succeed")
+            .insert(Arc::new(DbProvider))
+            .expect("database registration should succeed");
 
         let names = registry.lifecycle_names().expect("plan should build");
         assert_eq!(names, vec!["metrics", "db", "cache", "api"]);
 
-        registry.validate_all(&state).expect("validation should succeed");
+        let outcome = registry.validate_all(&state).expect("validation should run");
+        assert!(outcome.is_valid());
+        assert_eq!(outcome.validated_count(), 4);
 
         let seen = state.seen.lock().expect("test log poisoned").clone();
         assert_eq!(seen, vec!["metrics", "db", "cache", "api"]);
+    }
+
+    #[test]
+    fn validate_all_retains_provider_failures_and_continues() {
+        let state = TestState::default();
+        let registry = Registry::<TestState>::new();
+        registry
+            .insert(Arc::new(FailsValidation))
+            .expect("failing validator should register")
+            .insert(Arc::new(DbProvider))
+            .expect("successful validator should register");
+
+        let outcome = registry.validate_all(&state).expect("validation should complete");
+
+        assert!(!outcome.is_valid());
+        assert_eq!(outcome.validated_count(), 1);
+        assert_eq!(outcome.failed_count(), 1);
+        let failure = &outcome.failures()[0];
+        assert_eq!(failure.provider(), "fails-validation");
+        assert!(matches!(failure.error(), Error::Validate { name: "fails-validation", .. }));
+        assert_eq!(
+            failure.error().to_string(),
+            "provider 'fails-validation' failed during validate: validation rejected"
+        );
+        assert_eq!(state.seen.lock().expect("test log poisoned").as_slice(), &["db"]);
     }
 
     trait LogSink: Send + Sync {
@@ -1150,7 +1358,7 @@ mod tests {
         let state = TestState::default();
         let registry = Registry::<TestState>::new();
 
-        registry.insert(Arc::new(ConsoleLogger));
+        registry.insert(Arc::new(ConsoleLogger)).expect("console logger should register");
         registry
             .bind_dyn::<dyn LogSink, ConsoleLogger>(|logger| logger)
             .expect("dyn binding should succeed");
@@ -1158,7 +1366,7 @@ mod tests {
         let sink = registry.resolve_dyn::<dyn LogSink>().expect("LogSink should be bound");
         assert_eq!(sink.line(), "console");
 
-        registry.insert(Arc::new(FileLogger));
+        registry.insert(Arc::new(FileLogger)).expect("file logger should register");
         registry
             .bind_dyn::<dyn LogSink, FileLogger>(|logger| logger)
             .expect("dyn binding replacement should succeed");
@@ -1244,10 +1452,16 @@ mod tests {
         let state = TestState::default();
         let registry = Registry::<TestState>::new();
 
-        registry.insert(Arc::new(BootRecorder)).insert(Arc::new(BootDependency));
+        registry
+            .insert(Arc::new(BootRecorder))
+            .expect("boot recorder should register")
+            .insert(Arc::new(BootDependency))
+            .expect("boot dependency should register");
 
         registry.boot_all(&state).await.expect("boot should succeed");
-        registry.finalize_all(&state).await.expect("finalize should succeed");
+        let outcome = registry.finalize_all(&state).await.expect("finalize should succeed");
+        assert!(outcome.is_complete());
+        assert_eq!(outcome.finalized_count(), 2);
 
         let seen = state.seen.lock().expect("test log poisoned").clone();
         assert_eq!(
@@ -1286,7 +1500,11 @@ mod tests {
         let state = TestState::default();
         let registry = Registry::<TestState>::new();
 
-        registry.insert(Arc::new(CycleA)).insert(Arc::new(CycleB));
+        registry
+            .insert(Arc::new(CycleA))
+            .expect("cycle A should register")
+            .insert(Arc::new(CycleB))
+            .expect("cycle B should register");
 
         let err = registry.validate_all(&state).expect_err("cycle must be rejected");
         assert!(err.to_string().contains("provider lifecycle order cycle detected"));
@@ -1294,6 +1512,50 @@ mod tests {
 
     struct Reloads;
     struct FailsReload;
+    struct Finalizes;
+    struct FailsFinalize;
+
+    #[async_trait]
+    impl Provider<TestState> for Finalizes {
+        fn name(&self) -> &'static str {
+            "finalizes"
+        }
+
+        fn as_finalizable(&self) -> Option<&dyn Finalizable<TestState>> {
+            Some(self)
+        }
+    }
+
+    #[async_trait]
+    impl Finalizable<TestState> for Finalizes {
+        async fn finalize(
+            &self,
+            _: &TestState,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Provider<TestState> for FailsFinalize {
+        fn name(&self) -> &'static str {
+            "fails-finalize"
+        }
+
+        fn as_finalizable(&self) -> Option<&dyn Finalizable<TestState>> {
+            Some(self)
+        }
+    }
+
+    #[async_trait]
+    impl Finalizable<TestState> for FailsFinalize {
+        async fn finalize(
+            &self,
+            _: &TestState,
+        ) -> Result<()> {
+            Err(Error::msg("finalize rejected"))
+        }
+    }
 
     #[async_trait]
     impl Provider<TestState> for Reloads {
@@ -1341,7 +1603,11 @@ mod tests {
     async fn reload_all_retains_provider_failures_and_continues() {
         let state = TestState::default();
         let registry = Registry::<TestState>::new();
-        registry.insert(Arc::new(FailsReload)).insert(Arc::new(Reloads));
+        registry
+            .insert(Arc::new(FailsReload))
+            .expect("failing reloader should register")
+            .insert(Arc::new(Reloads))
+            .expect("successful reloader should register");
 
         let outcome = registry.reload_all(&state).await.expect("broadcast should complete");
 
@@ -1352,5 +1618,29 @@ mod tests {
         assert_eq!(failure.provider(), "fails-reload");
         assert!(matches!(failure.error(), Error::Reload { name: "fails-reload", .. }));
         assert_eq!(failure.error().to_string(), "reload of 'fails-reload' failed: reload rejected");
+    }
+
+    #[tokio::test]
+    async fn finalize_all_retains_provider_failures_and_continues() {
+        let state = TestState::default();
+        let registry = Registry::<TestState>::new();
+        registry
+            .insert(Arc::new(Finalizes))
+            .expect("successful finalizer should register")
+            .insert(Arc::new(FailsFinalize))
+            .expect("failing finalizer should register");
+
+        let outcome = registry.finalize_all(&state).await.expect("finalization should complete");
+
+        assert!(!outcome.is_complete());
+        assert_eq!(outcome.finalized_count(), 1);
+        assert_eq!(outcome.failed_count(), 1);
+        let failure = &outcome.failures()[0];
+        assert_eq!(failure.provider(), "fails-finalize");
+        assert!(matches!(failure.error(), Error::Finalize { name: "fails-finalize", .. }));
+        assert_eq!(
+            failure.error().to_string(),
+            "finalize of 'fails-finalize' failed: finalize rejected"
+        );
     }
 }

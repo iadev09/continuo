@@ -26,12 +26,13 @@ pub mod state;
 #[cfg(feature = "events")]
 pub use events::{LifecycleBus, LifecycleEvent, ShutdownInitiated};
 #[cfg(feature = "support")]
-pub use gate::{Gate, Permit};
+pub use gate::{Gate, GateDrainOutcome, Permit};
 #[cfg(feature = "support")]
 pub use guard::{Guard, GuardGroup};
 pub use registry::{
-    BoxError, Error, Finalizable, Provider, ProviderOrder, Registry, ReloadFailure, ReloadOutcome,
-    ReloadState, Reloadable, Result, Runnable,
+    BoxError, Error, Finalizable, FinalizeFailure, FinalizeOutcome, Provider, ProviderOrder,
+    Registry, ReloadFailure, ReloadOutcome, ReloadState, Reloadable, Result, Runnable,
+    ValidationFailure, ValidationOutcome,
 };
 pub use runtime::Runtime;
 pub use state::SharedState;
