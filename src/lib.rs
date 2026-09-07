@@ -21,6 +21,7 @@ pub mod gate;
 pub mod guard;
 pub mod registry;
 mod runtime;
+mod service;
 pub mod state;
 
 #[cfg(feature = "events")]
@@ -35,4 +36,7 @@ pub use registry::{
     ValidationFailure, ValidationOutcome,
 };
 pub use runtime::Runtime;
+pub use service::{
+    RunContext, ServiceManager, ServiceManagerError, ServiceSnapshot, ServiceStatus,
+};
 pub use state::SharedState;

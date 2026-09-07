@@ -11,7 +11,7 @@ documentation = "https://docs.rs/continuo"
 readme = "README.md"
 keywords = ["dependency-injection", "dependency", "ioc", "lifecycle", "registry"]
 categories = ["asynchronous", "rust-patterns"]
-exclude = ["/Cargo.lock", "/justfile", "/rustfmt.toml", "/.idea/**", "/counter.txt"]
+exclude = ["/Cargo.lock", "/justfile", "/rustfmt.toml", "/.idea/**"]
 
 [features]
 default = ["registry"]
@@ -33,5 +33,5 @@ tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "
 
 [[example]]
 name = "counter"
-path = "examples/counter.rs"
+path = "examples/harness/counter.rs"
 required-features = ["registry"]
