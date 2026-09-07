@@ -370,7 +370,8 @@ Graceful teardown belongs inside the same future. Observe the supplied
 `RunContext`, drain your in-flight work, and return. Its cancellation token is
 scoped to one live generation and is a child of the process shutdown token, so
 targeted service stop and whole-process shutdown share one honest teardown
-path.
+path. Focused provider harnesses may construct the same shape with
+`RunContext::new(token)`; application boot should let `Runtime` own it.
 
 ```rust
 use std::sync::Arc;
@@ -411,6 +412,11 @@ runtime.wait_until_shutdown(&state).await?;
 runtime.drain().await?;
 # Ok::<(), continuo::Error>(())
 ```
+
+If process shutdown arrives during provider boot, `spawn_all` still submits
+each initial generation once with an already-cancelled context. This lets
+runnables perform their no-new-work and final-drain path. Later manager-driven
+starts remain rejected after process shutdown begins.
 
 ### Managing Runnable Services
 

@@ -124,7 +124,11 @@ where
                     stop_waiters: Vec::new(),
                 },
             );
-            self.start_generation(name)?;
+            // Boot may have been interrupted after providers registered work
+            // but before runnable submission. Submit the initial generation
+            // even with an already-cancelled parent so each runnable can
+            // perform its own no-new-work/final-drain path.
+            self.start_generation(name, true)?;
         }
 
         Ok(self.services.len())
@@ -133,13 +137,14 @@ where
     fn start_generation(
         &mut self,
         name: &'static str,
+        allow_cancelled_parent: bool,
     ) -> Result<ServiceSnapshot> {
         let state = self
             .state
             .as_ref()
             .cloned()
             .ok_or_else(|| Error::msg("service runtime is not initialized"))?;
-        if self.shutting_down || state.is_shutting_down() {
+        if self.shutting_down || (!allow_cancelled_parent && state.is_shutting_down()) {
             return Err(Error::msg("service runtime is shutting down"));
         }
 
@@ -208,7 +213,7 @@ where
                         let _ = reply.send(Err(ServiceManagerError::Busy { name, status }));
                     }
                     ServiceStatus::Stopped | ServiceStatus::Failed => {
-                        let result = self.start_generation(static_name).map_err(|error| {
+                        let result = self.start_generation(static_name, false).map_err(|error| {
                             ServiceManagerError::OperationFailed {
                                 name,
                                 message: error.to_string(),
@@ -630,5 +635,21 @@ mod tests {
         result.expect("runtime shutdown");
         runtime.drain().await.expect("runtime drain");
         wait_for(&counter, 3, 3).await;
+    }
+
+    #[tokio::test]
+    async fn interrupted_boot_submits_one_cancelled_initial_generation() {
+        let state = TestState::new();
+        let counter = Arc::new(ManagedCounter::new());
+        state.registry_ref().insert(counter.clone()).expect("counter registration");
+        state.0.shutdown.cancel();
+
+        let mut runtime = Runtime::<TestState>::default();
+        assert_eq!(runtime.spawn_all(state.registry_ref(), state.clone()).unwrap(), 1);
+        runtime.drain().await.unwrap();
+
+        assert_eq!(counter.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(counter.stops.load(Ordering::SeqCst), 1);
+        assert!(!counter.active.load(Ordering::SeqCst));
     }
 }

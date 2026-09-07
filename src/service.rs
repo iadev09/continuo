@@ -20,7 +20,13 @@ pub struct RunContext {
 }
 
 impl RunContext {
-    pub(crate) fn new(cancellation: CancellationToken) -> Self {
+    /// Build a generation context around an existing cancellation token.
+    ///
+    /// [`crate::Runtime`] normally constructs this from a child of the
+    /// process shutdown token. The public constructor is useful to focused
+    /// provider harnesses that drive one [`crate::Runnable`] directly while
+    /// preserving the same cancellation contract.
+    pub fn new(cancellation: CancellationToken) -> Self {
         Self { cancellation }
     }
 
