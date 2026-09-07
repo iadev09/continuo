@@ -58,7 +58,7 @@ let finalized = registry.finalize_all(&state).await?;
 
 After insertion, application code resolves providers by type and the runtime
 calls the hooks those providers expose. The full working version is
-[`examples/harness/counter.rs`](https://github.com/iadev09/continuo/blob/main/examples/harness/counter.rs).
+[`examples/counter/main.rs`](https://github.com/iadev09/continuo/blob/main/examples/counter/main.rs).
 
 The core idea:
 
@@ -567,7 +567,7 @@ bus.emit(ConfigReloaded);
 
 ## Example
 
-[`examples/harness/counter.rs`](https://github.com/iadev09/continuo/blob/main/examples/harness/counter.rs)
+[`examples/counter/main.rs`](https://github.com/iadev09/continuo/blob/main/examples/counter/main.rs)
 shows the full flow in one file:
 
 ```sh
