@@ -7,26 +7,24 @@
 //!
 //! # Why typed registration instead of a fixed enum
 //!
-//! A closed `enum LifecycleEvent { … }` forces every new event into
+//! A closed event enum forces every new event into
 //! one central definition — every crate that wants a new variant has
-//! to come back and edit `claviron-runtime`. With a `LifecycleEvent`
-//! trait, any crate (`claviron-tls`, `claviron-php-embed`, …) can
+//! to come back and edit the runtime crate. With an [`Event`] trait,
+//! any consumer can
 //! introduce its own event type locally and emit it through the bus.
-//! **Coupling tends to zero**, the same goal as Orbit's typed
-//! publish/subscribe model.
+//! Event producers and consumers remain decoupled by their shared event type.
 //!
 //! # Scope
 //!
 //! Process-local. Each process (master, worker, standalone) has its
-//! own bus. Cross-process / cross-fleet events belong to a future
-//! Orbit event bus, which mirrors this shape but rides over a shared
-//! transport.
+//! own bus. Cross-process and fleet delivery belong to an adapter over a
+//! shared transport, outside this primitive.
 //!
 //! # Atomicity
 //!
-//! `LifecycleBus` is the **atomic primitive** for in-process pubsub —
-//! analogous to `AtomicU64` in the storage tier ladder. Higher layers
-//! (Orbit, etc.) build on this same shape but with broader reach.
+//! `ProcessEventBus` is the **atomic primitive** for process-scoped pubsub —
+//! analogous to `AtomicU64` in the storage tier ladder. Higher layers can
+//! retain this typed shape while providing broader delivery.
 //!
 //! # Usage
 //!
@@ -34,7 +32,7 @@
 //! // Define an event type anywhere
 //! #[derive(Clone, Debug)]
 //! pub struct CertReloaded { pub server_id: i32 }
-//! impl claviron_runtime::events::LifecycleEvent for CertReloaded {}
+//! impl continuo::events::Event for CertReloaded {}
 //!
 //! // Emit
 //! state.events().emit(CertReloaded { server_id: 5 });
@@ -62,7 +60,7 @@ const DEFAULT_CAPACITY: usize = 64;
 /// `Clone` is required because `broadcast` channels deliver the same
 /// value to every subscriber. `Send + Sync + 'static` enables storage
 /// in the type-erased registry.
-pub trait LifecycleEvent: Clone + Send + Sync + 'static {}
+pub trait Event: Clone + Send + Sync + 'static {}
 
 /// Typed, on-demand event channel registry.
 ///
@@ -70,12 +68,12 @@ pub trait LifecycleEvent: Clone + Send + Sync + 'static {}
 /// `broadcast::Sender`s. Embed in `AppState` and expose via
 /// `state.events()`.
 #[derive(Clone)]
-pub struct LifecycleBus {
+pub struct ProcessEventBus {
     channels: Arc<DashMap<TypeId, Box<dyn Any + Send + Sync>>>,
     capacity: usize,
 }
 
-impl LifecycleBus {
+impl ProcessEventBus {
     /// Create a bus with the default per-type capacity.
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_CAPACITY)
@@ -91,12 +89,12 @@ impl LifecycleBus {
     /// If no channel for `E` exists yet (no subscriber has registered),
     /// the call is a no-op — fire-and-forget semantics. Once a
     /// subscriber appears, future emits of `E` are delivered.
-    pub fn emit<E: LifecycleEvent>(
+    pub fn emit<E: Event>(
         &self,
         event: E,
     ) {
         let key = TypeId::of::<E>();
-        tracing::debug!(event_type = std::any::type_name::<E>(), "🔔 lifecycle event emit");
+        tracing::debug!(event_type = std::any::type_name::<E>(), "process event emitted");
 
         if let Some(entry) = self.channels.get(&key)
             && let Some(sender) = entry.downcast_ref::<broadcast::Sender<E>>()
@@ -111,7 +109,7 @@ impl LifecycleBus {
     /// The channel for `E` is created on demand on first call. Each
     /// receiver sees only events emitted AFTER it subscribed —
     /// no replay of historical events.
-    pub fn subscribe<E: LifecycleEvent>(&self) -> broadcast::Receiver<E> {
+    pub fn subscribe<E: Event>(&self) -> broadcast::Receiver<E> {
         let key = TypeId::of::<E>();
 
         if let Some(entry) = self.channels.get(&key)
@@ -140,7 +138,7 @@ impl LifecycleBus {
     }
 }
 
-impl Default for LifecycleBus {
+impl Default for ProcessEventBus {
     fn default() -> Self {
         Self::new()
     }
@@ -149,18 +147,13 @@ impl Default for LifecycleBus {
 // =====================================================================
 // Built-in events
 //
-// `claviron-runtime` only ships event types that IT emits. Crates that
-// emit their own events (e.g. `claviron-supervisor` for worker drain
-// signals) define them in their own module and use this bus for
-// transport. This keeps the registry pattern clean — the runtime is
-// opinion-less about what types exist.
+// Continuo only ships the shutdown marker used by runtimes that want a
+// push-style notification alongside their cancellation token. Consumers define
+// their own event types in their own domain modules.
 // =====================================================================
 
-/// Process-wide: `state.initiate_shutdown()` was called and the
-/// shutdown token was flipped. Providers that watch
-/// `state.is_shutting_down()` see this as the start of their own
-/// wind-down. Subscribing to this event is the push-style equivalent
-/// of polling the flag.
+/// Process-wide marker for runtimes that publish shutdown initiation alongside
+/// cancellation of their shutdown token.
 #[derive(Clone, Debug)]
 pub struct ShutdownInitiated;
-impl LifecycleEvent for ShutdownInitiated {}
+impl Event for ShutdownInitiated {}

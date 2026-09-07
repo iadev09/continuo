@@ -85,7 +85,7 @@ full = ["registry", "support", "events"]
 
 - `registry` adds `registry_ref()` to `SharedState` for states that carry
   `Registry<Self>`. The `Registry` type itself is always available.
-- `events` enables `LifecycleBus`, adds `events()` to `SharedState`, and
+- `events` enables `ProcessEventBus`, adds `events()` to `SharedState`, and
   enables the `dashmap` dependency.
 - `support` enables `Gate`, `Permit`, `GuardGroup`, and `Guard`.
 
@@ -99,7 +99,7 @@ The crate does not own your app state. Your state only needs to implement
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use continuo::LifecycleBus;
+use continuo::ProcessEventBus;
 use continuo::{Registry, ReloadState, Result, SharedState};
 
 #[derive(Clone)]
@@ -108,7 +108,7 @@ pub struct AppState(Arc<Inner>);
 struct Inner {
     shutdown: CancellationToken,
     registry: Registry<AppState>,
-    events: LifecycleBus,
+    events: ProcessEventBus,
 }
 
 impl Default for AppState {
@@ -116,7 +116,7 @@ impl Default for AppState {
         Self(Arc::new(Inner {
             shutdown: CancellationToken::new(),
             registry: Registry::default(),
-            events: LifecycleBus::new(),
+            events: ProcessEventBus::new(),
         }))
     }
 }
@@ -140,7 +140,7 @@ impl SharedState for AppState {
         &self.0.registry
     }
 
-    fn events(&self) -> &LifecycleBus {
+    fn events(&self) -> &ProcessEventBus {
         &self.0.events
     }
 }
@@ -547,19 +547,20 @@ if let GateDrainOutcome::Forced { remaining } = gate.wait_all_done().await {
 `GuardGroup` is a smaller RAII in-flight counter for places where you only
 need “count active work and wait until zero” without admission control.
 
-## Lifecycle Events
+## Process Events
 
-The `events` feature enables `LifecycleBus`, a typed process-local event bus.
+The `events` feature enables `ProcessEventBus`, a typed process-scoped event bus.
 Use it when services need a loose in-process signal without depending on each
 other directly.
 
 ```rust
-use continuo::LifecycleBus;
+use continuo::{Event, ProcessEventBus};
 
 #[derive(Clone, Debug)]
 struct ConfigReloaded;
+impl Event for ConfigReloaded {}
 
-let bus = LifecycleBus::new();
+let bus = ProcessEventBus::new();
 let mut rx = bus.subscribe::<ConfigReloaded>();
 bus.emit(ConfigReloaded);
 ```
