@@ -472,13 +472,14 @@ pub trait Reloadable<S>: Provider<S> {
 ///
 #[async_trait]
 pub trait Runnable<S>: Provider<S> {
-    /// Declare the service's initial activation policy after provider boot.
+    /// Declare the service's current activation policy.
     ///
     /// The default is [`crate::ServiceStartPolicy::Automatic`] because
     /// exposing `Runnable` is already the provider's explicit opt-in to
     /// runtime ownership. Providers may inspect their booted configuration
     /// and the process state here without making the registry configuration
-    /// aware.
+    /// aware. The runtime re-evaluates this synchronous method when observing
+    /// the service and before starting a generation.
     fn start_policy(
         &self,
         _state: &S,

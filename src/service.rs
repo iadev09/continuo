@@ -11,9 +11,11 @@ const COMMAND_CAPACITY: usize = 64;
 
 /// Initial activation policy for one registered runnable service.
 ///
-/// The runtime samples this policy after provider boot has completed. It is
-/// independent from [`ServiceStatus`]: a manually started service is both
-/// `Manual` and `Running`.
+/// The runtime samples this policy after provider boot and re-evaluates it for
+/// observation and explicit starts, so a provider config reload changes the
+/// effective policy without duplicating it in the manager. It is independent
+/// from [`ServiceStatus`]: a manually started service is both `Manual` and
+/// `Running`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ServiceStartPolicy {
     /// Start an initial generation when the runtime is initialized.
