@@ -439,7 +439,7 @@ manager.restart("counter").await?;   // strictly stop, then start
 manager.reload("counter").await?;    // same generation, targeted Reloadable
 ```
 
-Each runnable may declare the initial policy that the runtime samples after
+Each runnable may declare the policy that the runtime first samples after
 provider boot. Exposing `Runnable` defaults to `Automatic`, preserving the
 usual always-on service behavior without a second opt-in:
 
@@ -458,7 +458,9 @@ fn start_policy(&self, state: &AppState) -> ServiceStartPolicy {
 `Automatic` starts an initial generation, `Manual` remains stopped but accepts
 an explicit `start`, and `Unavailable` remains stopped and rejects explicit
 `start` or `restart`. The policy is observable separately from
-`ServiceStatus`; manually started services remain `Manual` while running.
+`ServiceStatus`; manually started services remain `Manual` while running. The
+runtime re-evaluates the provider-owned policy for snapshots and explicit
+starts, so config reloads take effect without a second policy store.
 
 `ServiceSnapshot::reload_revision()` advances when a targeted reload attempt
 completes, whether it succeeds or fails. `last_reload_error()` retains the
