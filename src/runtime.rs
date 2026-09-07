@@ -8,7 +8,8 @@ use tracing::{Instrument, debug, error};
 
 use crate::registry::{Error, Provider, Registry, Result, Runnable};
 use crate::service::{
-    RunContext, ServiceCommand, ServiceManager, ServiceManagerError, ServiceSnapshot, ServiceStatus,
+    RunContext, ServiceCommand, ServiceManager, ServiceManagerError, ServiceSnapshot,
+    ServiceStartPolicy, ServiceStatus,
 };
 use crate::state::SharedState;
 
@@ -40,16 +41,18 @@ impl<S: 'static> ServiceEntry<S> {
     fn snapshot(
         &self,
         name: &'static str,
+        state: &S,
     ) -> ServiceSnapshot {
-        ServiceSnapshot::new(
+        ServiceSnapshot {
             name,
-            self.status,
-            self.provider.as_reloadable().is_some(),
-            self.generation,
-            self.last_error.clone(),
-            self.reload_revision,
-            self.last_reload_error.clone(),
-        )
+            status: self.status,
+            start_policy: self.runnable.start_policy(state),
+            reloadable: self.provider.as_reloadable().is_some(),
+            generation: self.generation,
+            last_error: self.last_error.clone(),
+            reload_revision: self.reload_revision,
+            last_reload_error: self.last_reload_error.clone(),
+        }
     }
 }
 
@@ -122,6 +125,9 @@ where
         self.state = Some(state);
         for entry in runnables {
             let name = entry.name;
+            let start_policy = entry
+                .runnable
+                .start_policy(self.state.as_ref().expect("runtime state was initialized above"));
             self.services.insert(
                 name,
                 ServiceEntry {
@@ -136,11 +142,13 @@ where
                     stop_waiters: Vec::new(),
                 },
             );
-            // Boot may have been interrupted after providers registered work
-            // but before runnable submission. Submit the initial generation
-            // even with an already-cancelled parent so each runnable can
-            // perform its own no-new-work/final-drain path.
-            self.start_generation(name, true)?;
+            if start_policy == ServiceStartPolicy::Automatic {
+                // Boot may have been interrupted after providers registered work
+                // but before runnable submission. Submit the initial generation
+                // even with an already-cancelled parent so each runnable can
+                // perform its own no-new-work/final-drain path.
+                self.start_generation(name, true)?;
+            }
         }
 
         Ok(self.services.len())
@@ -160,6 +168,18 @@ where
             return Err(Error::msg("service runtime is shutting down"));
         }
 
+        let start_policy = self
+            .services
+            .get(name)
+            .ok_or_else(|| Error::msg(format!("runnable service '{name}' is not registered")))?
+            .runnable
+            .start_policy(&state);
+        if start_policy == ServiceStartPolicy::Unavailable {
+            return Err(Error::msg(format!(
+                "runnable service '{name}' is unavailable on this runtime"
+            )));
+        }
+
         let service = self
             .services
             .get_mut(name)
@@ -175,6 +195,7 @@ where
         let runnable = service.runnable.clone();
         let cancellation = state.shutdown_token().child_token();
         service.cancellation = Some(cancellation.clone());
+        let snapshot = service.snapshot(name, &state);
 
         let abort = self.join_set.spawn(
             async move {
@@ -186,12 +207,16 @@ where
         );
         self.task_identities.insert(abort.id(), TaskIdentity { name, generation });
 
-        Ok(service.snapshot(name))
+        Ok(snapshot)
     }
 
     fn snapshots(&self) -> Vec<ServiceSnapshot> {
-        let mut snapshots =
-            self.services.iter().map(|(name, service)| service.snapshot(name)).collect::<Vec<_>>();
+        let state = self.state.as_ref().expect("runtime state is initialized before observation");
+        let mut snapshots = self
+            .services
+            .iter()
+            .map(|(name, service)| service.snapshot(name, state))
+            .collect::<Vec<_>>();
         snapshots.sort_by_key(|snapshot| snapshot.name());
         snapshots
     }
@@ -217,9 +242,17 @@ where
                 };
 
                 let status = self.services[static_name].status;
+                let state = self.state.as_ref().expect("runtime state is initialized");
+                if self.services[static_name].runnable.start_policy(state)
+                    == ServiceStartPolicy::Unavailable
+                {
+                    let _ = reply.send(Err(ServiceManagerError::Unavailable(name)));
+                    return;
+                }
                 match status {
                     ServiceStatus::Running => {
-                        let _ = reply.send(Ok(self.services[static_name].snapshot(static_name)));
+                        let _ =
+                            reply.send(Ok(self.services[static_name].snapshot(static_name, state)));
                     }
                     ServiceStatus::Stopping => {
                         let _ = reply.send(Err(ServiceManagerError::Busy { name, status }));
@@ -254,7 +287,8 @@ where
                     }
                     ServiceStatus::Stopping => service.stop_waiters.push(reply),
                     ServiceStatus::Stopped | ServiceStatus::Failed => {
-                        let _ = reply.send(Ok(service.snapshot(static_name)));
+                        let state = self.state.as_ref().expect("runtime state is initialized");
+                        let _ = reply.send(Ok(service.snapshot(static_name, state)));
                     }
                 }
             }
@@ -303,7 +337,7 @@ where
                 let result = match reload {
                     Ok(()) => {
                         service.last_reload_error = None;
-                        Ok(service.snapshot(static_name))
+                        Ok(service.snapshot(static_name, &state))
                     }
                     Err(message) => {
                         service.last_reload_error = Some(message.clone());
@@ -351,6 +385,7 @@ where
         &mut self,
         exit: ServiceExit,
     ) -> Result<()> {
+        let state = self.state.as_ref().expect("runtime state is initialized");
         let Some(service) = self.services.get_mut(exit.name) else {
             return Err(Error::msg(format!(
                 "completed runnable service '{}' is not registered",
@@ -369,7 +404,7 @@ where
             Ok(()) => {
                 service.status = ServiceStatus::Stopped;
                 service.last_error = None;
-                let snapshot = service.snapshot(exit.name);
+                let snapshot = service.snapshot(exit.name, state);
                 for waiter in service.stop_waiters.drain(..) {
                     let _ = waiter.send(Ok(snapshot.clone()));
                 }
@@ -506,13 +541,14 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::RwLock;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
 
     use async_trait::async_trait;
 
     use super::*;
-    use crate::{Reloadable, RunContext};
+    use crate::{Reloadable, RunContext, ServiceStartPolicy};
 
     #[derive(Clone)]
     struct TestState(Arc<TestStateInner>);
@@ -707,5 +743,148 @@ mod tests {
         assert_eq!(counter.starts.load(Ordering::SeqCst), 1);
         assert_eq!(counter.stops.load(Ordering::SeqCst), 1);
         assert!(!counter.active.load(Ordering::SeqCst));
+    }
+
+    struct PolicyService {
+        name: &'static str,
+        policy: RwLock<ServiceStartPolicy>,
+        starts: AtomicU64,
+    }
+
+    impl PolicyService {
+        fn new(
+            name: &'static str,
+            policy: ServiceStartPolicy,
+        ) -> Self {
+            Self { name, policy: RwLock::new(policy), starts: AtomicU64::new(0) }
+        }
+
+        fn set_policy(
+            &self,
+            policy: ServiceStartPolicy,
+        ) {
+            *self.policy.write().expect("policy lock") = policy;
+        }
+    }
+
+    #[async_trait]
+    impl Provider<TestState> for PolicyService {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn as_runnable(self: Arc<Self>) -> Option<Arc<dyn Runnable<TestState>>> {
+            Some(self)
+        }
+    }
+
+    #[async_trait]
+    impl Runnable<TestState> for PolicyService {
+        fn start_policy(
+            &self,
+            _state: &TestState,
+        ) -> ServiceStartPolicy {
+            *self.policy.read().expect("policy lock")
+        }
+
+        async fn run(
+            self: Arc<Self>,
+            _state: TestState,
+            context: RunContext,
+        ) -> Result<()> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            context.cancelled().await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn start_policy_controls_initial_and_explicit_generations() {
+        {
+            let state = TestState::new();
+            let manual = Arc::new(PolicyService::new("manual", ServiceStartPolicy::Manual));
+            let mut runtime = Runtime::<TestState>::default();
+            let manager = runtime.manager();
+
+            state
+                .registry_ref()
+                .insert(manager.clone())
+                .expect("manager registration")
+                .insert(manual.clone())
+                .expect("manual registration");
+            assert_eq!(runtime.spawn_all(state.registry_ref(), state.clone()).unwrap(), 1);
+            assert!(runtime.join_set.is_empty());
+            assert_eq!(manual.starts.load(Ordering::SeqCst), 0);
+
+            let runtime_state = state.clone();
+            let runtime_task = tokio::spawn(async move {
+                let result = runtime.wait_until_shutdown(&runtime_state).await;
+                (runtime, result)
+            });
+
+            let snapshots = manager.list().await.expect("list manual service");
+            assert_eq!(snapshots.len(), 1);
+            assert_eq!(snapshots[0].status(), ServiceStatus::Stopped);
+            assert_eq!(snapshots[0].start_policy(), ServiceStartPolicy::Manual);
+
+            manual.set_policy(ServiceStartPolicy::Unavailable);
+            assert!(matches!(
+                manager.start("manual").await,
+                Err(ServiceManagerError::Unavailable(name)) if name == "manual"
+            ));
+            manual.set_policy(ServiceStartPolicy::Manual);
+            manager.start("manual").await.expect("manual service starts explicitly");
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while manual.starts.load(Ordering::SeqCst) != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("manual service did not start");
+
+            state.initiate_shutdown();
+            let (mut runtime, result) = runtime_task.await.expect("runtime task join");
+            result.expect("runtime shutdown");
+            runtime.drain().await.expect("runtime drain");
+        }
+
+        {
+            let state = TestState::new();
+            let unavailable =
+                Arc::new(PolicyService::new("unavailable", ServiceStartPolicy::Unavailable));
+            let mut runtime = Runtime::<TestState>::default();
+            let manager = runtime.manager();
+
+            state
+                .registry_ref()
+                .insert(manager.clone())
+                .expect("manager registration")
+                .insert(unavailable.clone())
+                .expect("unavailable registration");
+            assert_eq!(runtime.spawn_all(state.registry_ref(), state.clone()).unwrap(), 1);
+            assert!(runtime.join_set.is_empty());
+            assert_eq!(unavailable.starts.load(Ordering::SeqCst), 0);
+
+            let runtime_state = state.clone();
+            let runtime_task = tokio::spawn(async move {
+                let result = runtime.wait_until_shutdown(&runtime_state).await;
+                (runtime, result)
+            });
+
+            let snapshots = manager.list().await.expect("list unavailable service");
+            assert_eq!(snapshots.len(), 1);
+            assert_eq!(snapshots[0].status(), ServiceStatus::Stopped);
+            assert_eq!(snapshots[0].start_policy(), ServiceStartPolicy::Unavailable);
+            assert!(matches!(
+                manager.start("unavailable").await,
+                Err(ServiceManagerError::Unavailable(name)) if name == "unavailable"
+            ));
+            assert_eq!(unavailable.starts.load(Ordering::SeqCst), 0);
+
+            state.initiate_shutdown();
+            let (mut runtime, result) = runtime_task.await.expect("runtime task join");
+            result.expect("runtime shutdown");
+            runtime.drain().await.expect("runtime drain");
+        }
     }
 }

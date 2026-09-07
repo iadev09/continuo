@@ -37,6 +37,7 @@ pub use registry::{
 };
 pub use runtime::Runtime;
 pub use service::{
-    RunContext, ServiceManager, ServiceManagerError, ServiceSnapshot, ServiceStatus,
+    RunContext, ServiceManager, ServiceManagerError, ServiceSnapshot, ServiceStartPolicy,
+    ServiceStatus,
 };
 pub use state::SharedState;

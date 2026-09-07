@@ -70,7 +70,7 @@ Registry<AppState>            — typed instances plus lifecycle hooks
   └─ SignalService  -> Provider + Runnable
 
 Runtime<AppState>             — sole owner of live Runnable generations
-  ├─ starts every provider that exposes Runnable
+  ├─ applies each Runnable's initial ServiceStartPolicy
   └─ applies ServiceManager start / stop / restart commands
 ```
 
@@ -438,6 +438,27 @@ manager.start("counter").await?;      // creates the next generation
 manager.restart("counter").await?;   // strictly stop, then start
 manager.reload("counter").await?;    // same generation, targeted Reloadable
 ```
+
+Each runnable may declare the initial policy that the runtime samples after
+provider boot. Exposing `Runnable` defaults to `Automatic`, preserving the
+usual always-on service behavior without a second opt-in:
+
+```rust
+use continuo::ServiceStartPolicy;
+
+fn start_policy(&self, state: &AppState) -> ServiceStartPolicy {
+    if self.available_on(state) {
+        ServiceStartPolicy::Automatic
+    } else {
+        ServiceStartPolicy::Unavailable
+    }
+}
+```
+
+`Automatic` starts an initial generation, `Manual` remains stopped but accepts
+an explicit `start`, and `Unavailable` remains stopped and rejects explicit
+`start` or `restart`. The policy is observable separately from
+`ServiceStatus`; manually started services remain `Manual` while running.
 
 `ServiceSnapshot::reload_revision()` advances when a targeted reload attempt
 completes, whether it succeeds or fails. `last_reload_error()` retains the
