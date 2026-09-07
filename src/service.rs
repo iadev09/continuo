@@ -75,18 +75,32 @@ impl fmt::Display for ServiceStatus {
 pub struct ServiceSnapshot {
     name: &'static str,
     status: ServiceStatus,
+    reloadable: bool,
     generation: u64,
     last_error: Option<String>,
+    reload_revision: u64,
+    last_reload_error: Option<String>,
 }
 
 impl ServiceSnapshot {
     pub(crate) fn new(
         name: &'static str,
         status: ServiceStatus,
+        reloadable: bool,
         generation: u64,
         last_error: Option<String>,
+        reload_revision: u64,
+        last_reload_error: Option<String>,
     ) -> Self {
-        Self { name, status, generation, last_error }
+        Self {
+            name,
+            status,
+            reloadable,
+            generation,
+            last_error,
+            reload_revision,
+            last_reload_error,
+        }
     }
 
     pub fn name(&self) -> &'static str {
@@ -97,6 +111,10 @@ impl ServiceSnapshot {
         self.status
     }
 
+    pub fn is_reloadable(&self) -> bool {
+        self.reloadable
+    }
+
     /// Monotonically increasing local start generation.
     pub fn generation(&self) -> u64 {
         self.generation
@@ -104,6 +122,17 @@ impl ServiceSnapshot {
 
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    /// Monotonically increasing revision of completed targeted reload calls.
+    /// Both successful and failed attempts advance the revision; inspect
+    /// [`Self::last_reload_error`] for the latest outcome.
+    pub fn reload_revision(&self) -> u64 {
+        self.reload_revision
+    }
+
+    pub fn last_reload_error(&self) -> Option<&str> {
+        self.last_reload_error.as_deref()
     }
 }
 

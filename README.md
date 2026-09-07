@@ -439,6 +439,11 @@ manager.restart("counter").await?;   // strictly stop, then start
 manager.reload("counter").await?;    // same generation, targeted Reloadable
 ```
 
+`ServiceSnapshot::reload_revision()` advances when a targeted reload attempt
+completes, whether it succeeds or fails. `last_reload_error()` retains the
+failure text for observers that cannot receive the direct command result, while
+the live generation and runnable failure remain separate fields.
+
 The manager carries commands, not lifecycle state. `Runtime` remains the sole
 owner of futures, generation counters, cancellation tokens, and status. A
 successful `start` means the generation was accepted and spawned; readiness of
