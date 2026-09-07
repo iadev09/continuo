@@ -3,7 +3,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use tracing::Instrument;
 
 // =====================================================================
 // Error model
@@ -152,7 +151,7 @@ impl Error {
         }
     }
     /// Attach provider identity to an anonymous reload error.
-    fn into_reload(
+    pub(crate) fn into_reload(
         self,
         name: &'static str,
     ) -> Self {
@@ -170,7 +169,7 @@ impl Error {
             other => other,
         }
     }
-    fn into_run(
+    pub(crate) fn into_run(
         self,
         name: &'static str,
     ) -> Self {
@@ -466,6 +465,11 @@ pub trait Reloadable<S>: Provider<S> {
 /// (accept loops, listeners, periodic tickers). It must NOT appear in
 /// `register()` or `Provider::boot()`.
 ///
+/// The supplied [`crate::RunContext`] belongs to one live service generation.
+/// Observe its cancellation instead of only the process shutdown token: the
+/// runtime uses the same path for targeted stop/restart and whole-process
+/// shutdown.
+///
 /// Config-driven gating: if the provider is disabled at runtime (e.g.
 /// an `enabled: false` config flag, or a single-instance service whose
 /// pinned `worker_id` doesn't match this worker), this method MUST
@@ -474,7 +478,7 @@ pub trait Reloadable<S>: Provider<S> {
 /// lookups; it just doesn't run on this process.
 #[async_trait]
 pub trait Runnable<S>: Provider<S> {
-    /// Run the long-lived provider task spawned by the bootstrap/supervisor layer.
+    /// Run one runtime-owned generation of this long-lived provider.
     ///
     /// NOTICE (convention):
     /// If this future returns `Err`, implementation should log contextual
@@ -488,13 +492,14 @@ pub trait Runnable<S>: Provider<S> {
     async fn run(
         self: Arc<Self>,
         state: S,
+        context: crate::RunContext,
     ) -> Result<()>;
 }
 
 /// Capability trait for providers that must release non-running
 /// resources at the end of the process lifecycle.
 ///
-/// `finalize()` runs after the shutdown signal has fired and after the
+/// `finalize()` runs after process shutdown has started and after the
 /// runnable tasks have drained — runnables end their own futures (and
 /// any protocol-level graceful drain) inside `Runnable::run()`;
 /// `finalize()` is NOT the place to stop them.
@@ -562,7 +567,7 @@ pub trait Finalizable<S>: Provider<S> {
 /// 4. **`Runnable::run()`** — see that trait. The only place for
 ///    long-lived loops; honors disabled-state by returning `Ok(())`
 ///    immediately. Graceful teardown of the work started here belongs
-///    here too: observe the shutdown signal inside the run future,
+///    here too: observe the supplied `RunContext` inside the run future,
 ///    drain, and return — do NOT split that into a separate hook.
 ///
 /// 5. **`Finalizable::finalize()`** — optional capability (see that
@@ -658,6 +663,12 @@ pub struct Registry<S> {
     dyn_by_type: RwLock<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
     registration_order: RwLock<Vec<TypeId>>,
     lifecycle_order: RwLock<Option<Vec<TypeId>>>,
+}
+
+pub(crate) struct RunnableEntry<S> {
+    pub(crate) name: &'static str,
+    pub(crate) provider: Arc<dyn Provider<S>>,
+    pub(crate) runnable: Arc<dyn Runnable<S>>,
 }
 
 impl<S: 'static> Registry<S> {
@@ -864,36 +875,18 @@ impl<S: 'static> Registry<S> {
         Ok(self.lifecycle_plan()?.iter().map(|provider| provider.name()).collect())
     }
 
-    /// Spawn all runnable providers into the given JoinSet.
-    ///
-    /// Returns the number of tasks spawned.
-    pub fn run_all(
-        &self,
-        state: S,
-        join_set: &mut tokio::task::JoinSet<Result<()>>,
-    ) -> usize
-    where
-        S: Clone + Send + 'static,
-    {
-        let mut spawned = 0usize;
+    pub(crate) fn runnable_entries(&self) -> Vec<RunnableEntry<S>> {
         let mut providers = self.providers();
         providers.sort_by_key(|provider| {
             (provider.run_priority().unwrap_or(priority::NORMAL), provider.name())
         });
 
+        let mut runnables = Vec::new();
         for provider in providers {
             let Some(runnable) = provider.clone().as_runnable() else { continue };
-
-            let name = provider.name();
-            let state = state.clone();
-            join_set.spawn(
-                async move { runnable.run(state).await.map_err(|e| e.into_run(name)) }
-                    .instrument(tracing::debug_span!("provider", provider = %name)),
-            );
-            spawned += 1;
+            runnables.push(RunnableEntry { name: provider.name(), provider, runnable });
         }
-
-        spawned
+        runnables
     }
 
     /// Run `validate` for every provider in lifecycle order.

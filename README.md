@@ -33,10 +33,12 @@ This is the whole application:
 
 ```rust
 let state = AppState::new();
+let mut runtime = Runtime::<AppState>::default();
 
 // The registry stores typed providers and walks their lifecycle.
 let registry = state.registry_ref();
 registry
+    .insert(runtime.manager())?             // same runtime control handle
     .insert(Arc::new(CounterService::new()))?
     .insert(Arc::new(HttpService::new(addr)))?
     .insert(Arc::new(SignalService))?;  // even Ctrl+C is a service
@@ -45,9 +47,8 @@ registry.boot_all(&state).await?;       // dependency-ordered
 let validation = registry.validate_all(&state)?;
 // The application decides how to report validation.failures().
 
-// The runtime owns the live Runnable tasks.
-let mut runtime = Runtime::<AppState>::default();
-runtime.spawn_all(registry, state.clone());
+// The runtime owns the live Runnable generations.
+runtime.spawn_all(registry, state.clone())?;
 runtime.wait_until_shutdown(&state).await?;
 runtime.drain().await?;                 // runnables end themselves
 
@@ -57,18 +58,20 @@ let finalized = registry.finalize_all(&state).await?;
 
 After insertion, application code resolves providers by type and the runtime
 calls the hooks those providers expose. The full working version is
-[`examples/counter.rs`](https://github.com/iadev09/continuo/blob/main/examples/counter.rs).
+[`examples/harness/counter.rs`](https://github.com/iadev09/continuo/blob/main/examples/harness/counter.rs).
 
 The core idea:
 
 ```text
 Registry<AppState>            — typed instances plus lifecycle hooks
-  ├─ CounterService -> Provider + Reloadable + Finalizable
+  ├─ ServiceManager -> Provider (control capability; no shadow state)
+  ├─ CounterService -> Provider + Reloadable + Runnable
   ├─ HttpService    -> Provider + Runnable
   └─ SignalService  -> Provider + Runnable
 
-Runtime<AppState>             — live Runnable tasks
-  └─ spawns every provider that exposes Runnable
+Runtime<AppState>             — sole owner of live Runnable generations
+  ├─ starts every provider that exposes Runnable
+  └─ applies ServiceManager start / stop / restart commands
 ```
 
 ## Features
@@ -363,22 +366,25 @@ Long-running loops live in `Runnable::run()`, not in `boot()`.
 `Runnable::run()` is an async trait method and receives `self: Arc<Self>`, so
 providers can be spawned without returning a boxed task future.
 
-Graceful teardown belongs inside the same future: observe the shutdown
-signal, drain your in-flight work, and return — do not split the stop path
-into a separate hook.
+Graceful teardown belongs inside the same future. Observe the supplied
+`RunContext`, drain your in-flight work, and return. Its cancellation token is
+scoped to one live generation and is a child of the process shutdown token, so
+targeted service stop and whole-process shutdown share one honest teardown
+path.
 
 ```rust
 use std::sync::Arc;
 use async_trait::async_trait;
-use continuo::{Provider, Result, Runnable};
+use continuo::{Provider, Result, RunContext, Runnable};
 
 #[async_trait]
 impl Runnable<AppState> for CacheService {
     async fn run(
         self: Arc<Self>,
-        state: AppState
+        state: AppState,
+        context: RunContext,
     ) -> Result<()> {
-        state.on_shutdown().await;
+        context.cancelled().await;
         Ok(())
     }
 }
@@ -397,13 +403,44 @@ use continuo::{Runtime, SharedState};
 
 let state = AppState::new();
 let mut runtime = Runtime::<AppState>::default();
+state.registry_ref().insert(runtime.manager())?;
 
-runtime.spawn_all(state.registry_ref(), state.clone());
+runtime.spawn_all(state.registry_ref(), state.clone())?;
 state.initiate_shutdown();
 runtime.wait_until_shutdown(&state).await?;
 runtime.drain().await?;
 # Ok::<(), continuo::Error>(())
 ```
+
+### Managing Runnable Services
+
+`Runtime::manager()` returns the cloneable `ServiceManager` handle backed by
+that exact runtime. Register the same `Arc` as a provider before boot; HTTP,
+gRPC, CLI adapters, or other providers can then resolve it as an ordinary
+typed capability.
+
+```rust
+let mut runtime = Runtime::<AppState>::default();
+state.registry_ref().insert(runtime.manager())?;
+
+runtime.spawn_all(state.registry_ref(), state.clone())?;
+
+let manager = state.registry_ref().resolve::<ServiceManager>().unwrap();
+let services = manager.list().await?;
+manager.stop("counter").await?;       // waits until run() actually returns
+manager.start("counter").await?;      // creates the next generation
+manager.restart("counter").await?;   // strictly stop, then start
+manager.reload("counter").await?;    // same generation, targeted Reloadable
+```
+
+The manager carries commands, not lifecycle state. `Runtime` remains the sole
+owner of futures, generation counters, cancellation tokens, and status. A
+successful `start` means the generation was accepted and spawned; readiness of
+an application protocol remains the service's own concern.
+
+This API deliberately does not add scheduling, concurrency, placement,
+backoff, or configuration. Those belong to workload/task orchestration, not
+the structural lifecycle of code-registered services.
 
 ## Reloadable Providers
 
@@ -529,48 +566,46 @@ bus.emit(ConfigReloaded);
 
 ## Example
 
-[`examples/counter.rs`](https://github.com/iadev09/continuo/blob/main/examples/counter.rs)
+[`examples/harness/counter.rs`](https://github.com/iadev09/continuo/blob/main/examples/harness/counter.rs)
 shows the full flow in one file:
 
 ```sh
 cargo run --example counter
 curl http://127.0.0.1:3000/hit        # repeat — the count grows
+curl http://127.0.0.1:3000/services   # list live runnable generations
+curl -X POST http://127.0.0.1:3000/services/counter/stop
+curl -X POST http://127.0.0.1:3000/services/counter/start
+curl -X POST http://127.0.0.1:3000/services/counter/restart
+curl -X POST http://127.0.0.1:3000/services/counter/reload
 curl -L http://127.0.0.1:3000/reload  # reload over HTTP — resets to 0
 kill -HUP <pid>                       # same reload, via signal
-# Ctrl+C — graceful drain, then finalize persists the count
+# Ctrl+C — graceful drain
 ```
 
-The log shows boot, reload, graceful drain, and finalize:
+The counter is a managed runnable. Every start, including restart, creates a
+new generation and resets its state:
 
 ```text
-counter booted: starting fresh from 0 (no counter.txt yet)
-signals: ready (pid 73942)
-http listening on http://127.0.0.1:3000/hit (Ctrl+C to stop)
-http: hit #1 (client port 51422 → its #1)
-http: hit #2 (client port 51423 → its #1)
-counter reloaded: reset to 0               ← SIGHUP or GET /reload
-http: /reload — providers reloaded
-http: hit #3 (client port 51423 → its #2)
+counter started: reset to 0
+http listening on http://127.0.0.1:3000/hit
+http: hit #1 (client port 51422 -> its #1)
+counter stopped
+counter started: reset to 0
+http: hit #1 (client port 51423 -> its #1)
 ^C
-signals: Ctrl+C — initiating shutdown
+signals: initiating process shutdown
 http drained and stopped
-counter finalize: persisted final value = 3 -> counter.txt
-🏁 all services finished gracefully
+counter stopped
+all services finished gracefully
 ```
 
-Run it again — the count survives the process:
-
-```text
-counter booted: starting from 3 (restored from counter.txt)
-http: hit #4 (client port 51425 → its #1)
-```
-
-Three providers are involved:
+Four providers are involved:
 
 - **`CounterService`** is **application-scoped**: one instance for the
-  process lifetime, shared by every request. `boot()` restores the count,
-  `reload()` resets it, and `Finalizable::finalize()` persists the final value
-  after runnables drain.
+  process lifetime, shared by every request. Its managed `Runnable` generation
+  decides whether it is active and resets the count whenever it starts.
+- **`ServiceManager`** is the registered handle for the runtime-owned service
+  state. The HTTP control router resolves it like any other provider.
 - **`HttpService`** boots after its dependency
   (`ProviderOrder::new().after::<CounterService>()`), resolves it from
   the registry once while building the router, and serves/drains inside

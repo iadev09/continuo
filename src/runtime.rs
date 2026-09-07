@@ -1,43 +1,85 @@
-use std::marker::PhantomData;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use tokio::task::JoinSet;
-use tracing::{debug, error};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::{Id, JoinError, JoinSet};
+use tokio_util::sync::CancellationToken;
+use tracing::{Instrument, debug, error};
 
-use crate::registry::Registry;
+use crate::registry::{Error, Provider, Registry, Result, Runnable};
+use crate::service::{
+    RunContext, ServiceCommand, ServiceManager, ServiceManagerError, ServiceSnapshot, ServiceStatus,
+};
 use crate::state::SharedState;
 
-/// The application runtime: runs the registered services through their
-/// lifetime, on top of the async runtime.
+struct ServiceExit {
+    name: &'static str,
+    generation: u64,
+    result: Result<()>,
+}
+
+#[derive(Clone, Copy)]
+struct TaskIdentity {
+    name: &'static str,
+    generation: u64,
+}
+
+struct ServiceEntry<S> {
+    provider: Arc<dyn Provider<S>>,
+    runnable: Arc<dyn Runnable<S>>,
+    status: ServiceStatus,
+    generation: u64,
+    cancellation: Option<CancellationToken>,
+    last_error: Option<String>,
+    stop_waiters: Vec<oneshot::Sender<Result<ServiceSnapshot, ServiceManagerError>>>,
+}
+
+impl<S> ServiceEntry<S> {
+    fn snapshot(
+        &self,
+        name: &'static str,
+    ) -> ServiceSnapshot {
+        ServiceSnapshot::new(name, self.status, self.generation, self.last_error.clone())
+    }
+}
+
+/// Owns the live generations of every registered runnable service.
 ///
-/// Not an executor — tokio schedules the futures; `Runtime<S>` decides
-/// which provider tasks exist, waits on them, and drains them at
-/// shutdown. Same word as tokio's, one abstraction level up: tokio runs
-/// futures, this runs your application.
-///
-/// This keeps JoinSet orchestration out of bootstrap and ensures shutdown
-/// is observed immediately via the shared shutdown token.
+/// Tokio schedules the futures; `Runtime<S>` decides which service generation
+/// exists. Its [`ServiceManager`] handle is a registered application capability
+/// that sends commands back to this sole owner.
 pub struct Runtime<S> {
-    join_set: JoinSet<crate::registry::Result<()>>,
-    _state: PhantomData<fn() -> S>,
+    join_set: JoinSet<ServiceExit>,
+    task_identities: HashMap<Id, TaskIdentity>,
+    services: HashMap<&'static str, ServiceEntry<S>>,
+    state: Option<S>,
+    manager: Arc<ServiceManager>,
+    commands: mpsc::Receiver<ServiceCommand>,
+    shutting_down: bool,
 }
 
 impl<S> Default for Runtime<S> {
     fn default() -> Self {
-        Self { join_set: JoinSet::new(), _state: PhantomData }
+        let (manager, commands) = ServiceManager::channel();
+        Self {
+            join_set: JoinSet::new(),
+            task_identities: HashMap::new(),
+            services: HashMap::new(),
+            state: None,
+            manager,
+            commands,
+            shutting_down: false,
+        }
     }
 }
 
-impl<S> Runtime<S>
-where
-    S: Clone + Send + 'static,
-{
-    /// Spawn all runnable providers from registry.
-    pub fn spawn_all(
-        &mut self,
-        registry: &Registry<S>,
-        state: S,
-    ) -> usize {
-        registry.run_all(state, &mut self.join_set)
+impl<S> Runtime<S> {
+    /// Return the control capability backed by this runtime.
+    ///
+    /// Register this same `Arc` as a provider before boot so transports and
+    /// other services can resolve it without owning runtime state.
+    pub fn manager(&self) -> Arc<ServiceManager> {
+        self.manager.clone()
     }
 }
 
@@ -45,89 +87,548 @@ impl<S> Runtime<S>
 where
     S: SharedState,
 {
-    /// Run until shutdown is initiated or a critical runnable failure occurs.
+    /// Register and start all runnable providers.
     ///
-    /// Returns:
-    /// - `Ok(())` when the shutdown token is cancelled or all runnables finished.
-    /// - `Err(_)` on critical startup/join failures.
+    /// Runnable names must be unique because they are the stable management
+    /// identity. The runtime may only be initialized once.
+    pub fn spawn_all(
+        &mut self,
+        registry: &Registry<S>,
+        state: S,
+    ) -> Result<usize> {
+        if self.state.is_some() {
+            return Err(Error::msg("runtime runnable set is already initialized"));
+        }
+
+        let runnables = registry.runnable_entries();
+        let mut names = HashSet::with_capacity(runnables.len());
+        for entry in &runnables {
+            if !names.insert(entry.name) {
+                let name = entry.name;
+                return Err(Error::msg(format!("duplicate runnable service name '{name}'")));
+            }
+        }
+
+        self.state = Some(state);
+        for entry in runnables {
+            let name = entry.name;
+            self.services.insert(
+                name,
+                ServiceEntry {
+                    provider: entry.provider,
+                    runnable: entry.runnable,
+                    status: ServiceStatus::Stopped,
+                    generation: 0,
+                    cancellation: None,
+                    last_error: None,
+                    stop_waiters: Vec::new(),
+                },
+            );
+            self.start_generation(name)?;
+        }
+
+        Ok(self.services.len())
+    }
+
+    fn start_generation(
+        &mut self,
+        name: &'static str,
+    ) -> Result<ServiceSnapshot> {
+        let state = self
+            .state
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| Error::msg("service runtime is not initialized"))?;
+        if self.shutting_down || state.is_shutting_down() {
+            return Err(Error::msg("service runtime is shutting down"));
+        }
+
+        let service = self
+            .services
+            .get_mut(name)
+            .ok_or_else(|| Error::msg(format!("runnable service '{name}' is not registered")))?;
+        service.generation = service
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| Error::msg(format!("service '{name}' generation overflow")))?;
+        service.status = ServiceStatus::Running;
+        service.last_error = None;
+
+        let generation = service.generation;
+        let runnable = service.runnable.clone();
+        let cancellation = state.shutdown_token().child_token();
+        service.cancellation = Some(cancellation.clone());
+
+        let abort = self.join_set.spawn(
+            async move {
+                let context = RunContext::new(cancellation);
+                let result = runnable.run(state, context).await.map_err(|e| e.into_run(name));
+                ServiceExit { name, generation, result }
+            }
+            .instrument(tracing::debug_span!("provider", provider = %name, generation)),
+        );
+        self.task_identities.insert(abort.id(), TaskIdentity { name, generation });
+
+        Ok(service.snapshot(name))
+    }
+
+    fn snapshots(&self) -> Vec<ServiceSnapshot> {
+        let mut snapshots =
+            self.services.iter().map(|(name, service)| service.snapshot(name)).collect::<Vec<_>>();
+        snapshots.sort_by_key(|snapshot| snapshot.name());
+        snapshots
+    }
+
+    async fn handle_command(
+        &mut self,
+        command: ServiceCommand,
+    ) {
+        if self.shutting_down {
+            Self::reject_command(command, ServiceManagerError::ShuttingDown);
+            return;
+        }
+
+        match command {
+            ServiceCommand::List { reply } => {
+                let _ = reply.send(Ok(self.snapshots()));
+            }
+            ServiceCommand::Start { name, reply } => {
+                let Some(static_name) = self.services.get_key_value(name.as_str()).map(|(n, _)| *n)
+                else {
+                    let _ = reply.send(Err(ServiceManagerError::NotFound(name)));
+                    return;
+                };
+
+                let status = self.services[static_name].status;
+                match status {
+                    ServiceStatus::Running => {
+                        let _ = reply.send(Ok(self.services[static_name].snapshot(static_name)));
+                    }
+                    ServiceStatus::Stopping => {
+                        let _ = reply.send(Err(ServiceManagerError::Busy { name, status }));
+                    }
+                    ServiceStatus::Stopped | ServiceStatus::Failed => {
+                        let result = self.start_generation(static_name).map_err(|error| {
+                            ServiceManagerError::OperationFailed {
+                                name,
+                                message: error.to_string(),
+                            }
+                        });
+                        let _ = reply.send(result);
+                    }
+                }
+            }
+            ServiceCommand::Stop { name, reply } => {
+                let Some(static_name) = self.services.get_key_value(name.as_str()).map(|(n, _)| *n)
+                else {
+                    let _ = reply.send(Err(ServiceManagerError::NotFound(name)));
+                    return;
+                };
+
+                let service =
+                    self.services.get_mut(static_name).expect("service key just resolved");
+                match service.status {
+                    ServiceStatus::Running => {
+                        service.status = ServiceStatus::Stopping;
+                        service.stop_waiters.push(reply);
+                        if let Some(cancellation) = &service.cancellation {
+                            cancellation.cancel();
+                        }
+                    }
+                    ServiceStatus::Stopping => service.stop_waiters.push(reply),
+                    ServiceStatus::Stopped | ServiceStatus::Failed => {
+                        let _ = reply.send(Ok(service.snapshot(static_name)));
+                    }
+                }
+            }
+            ServiceCommand::Reload { name, reply } => {
+                let Some(static_name) = self.services.get_key_value(name.as_str()).map(|(n, _)| *n)
+                else {
+                    let _ = reply.send(Err(ServiceManagerError::NotFound(name)));
+                    return;
+                };
+
+                let status = self.services[static_name].status;
+                if status == ServiceStatus::Stopping {
+                    let _ = reply.send(Err(ServiceManagerError::Busy { name, status }));
+                    return;
+                }
+
+                let Some(state) = self.state.as_ref().cloned() else {
+                    let _ = reply.send(Err(ServiceManagerError::RuntimeUnavailable));
+                    return;
+                };
+                let provider = self.services[static_name].provider.clone();
+                let Some(reloadable) = provider.as_reloadable() else {
+                    let _ = reply.send(Err(ServiceManagerError::NotReloadable(name)));
+                    return;
+                };
+                let result = reloadable.reload(&state).await.map_err(|error| {
+                    ServiceManagerError::OperationFailed {
+                        name,
+                        message: error.into_reload(static_name).to_string(),
+                    }
+                });
+                let result = result.map(|()| self.services[static_name].snapshot(static_name));
+                let _ = reply.send(result);
+            }
+        }
+    }
+
+    fn reject_command(
+        command: ServiceCommand,
+        error: ServiceManagerError,
+    ) {
+        match command {
+            ServiceCommand::List { reply } => {
+                let _ = reply.send(Err(error));
+            }
+            ServiceCommand::Start { reply, .. }
+            | ServiceCommand::Stop { reply, .. }
+            | ServiceCommand::Reload { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
+
+    fn begin_shutdown(&mut self) {
+        self.shutting_down = true;
+        self.commands.close();
+        while let Ok(command) = self.commands.try_recv() {
+            Self::reject_command(command, ServiceManagerError::ShuttingDown);
+        }
+        for service in self.services.values_mut() {
+            if service.status == ServiceStatus::Running {
+                service.status = ServiceStatus::Stopping;
+            }
+            if let Some(cancellation) = &service.cancellation {
+                cancellation.cancel();
+            }
+        }
+    }
+
+    fn complete_service(
+        &mut self,
+        exit: ServiceExit,
+    ) -> Result<()> {
+        let Some(service) = self.services.get_mut(exit.name) else {
+            return Err(Error::msg(format!(
+                "completed runnable service '{}' is not registered",
+                exit.name
+            )));
+        };
+        if service.generation != exit.generation {
+            return Err(Error::msg(format!(
+                "service '{}' completed stale generation {} while generation {} is current",
+                exit.name, exit.generation, service.generation
+            )));
+        }
+
+        service.cancellation = None;
+        match exit.result {
+            Ok(()) => {
+                service.status = ServiceStatus::Stopped;
+                service.last_error = None;
+                let snapshot = service.snapshot(exit.name);
+                for waiter in service.stop_waiters.drain(..) {
+                    let _ = waiter.send(Ok(snapshot.clone()));
+                }
+                debug!(provider = exit.name, generation = exit.generation, "runnable stopped");
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                service.status = ServiceStatus::Failed;
+                service.last_error = Some(message.clone());
+                for waiter in service.stop_waiters.drain(..) {
+                    let _ = waiter.send(Err(ServiceManagerError::OperationFailed {
+                        name: exit.name.to_owned(),
+                        message: message.clone(),
+                    }));
+                }
+
+                match error {
+                    Error::Recoverable { name, source } => {
+                        error!(provider = %name, "runnable failed (runtime continuing): {}", source);
+                        Ok(())
+                    }
+                    fatal => Err(fatal),
+                }
+            }
+        }
+    }
+
+    fn complete_join(
+        &mut self,
+        joined: std::result::Result<(Id, ServiceExit), JoinError>,
+    ) -> Result<()> {
+        match joined {
+            Ok((id, exit)) => {
+                self.task_identities.remove(&id);
+                self.complete_service(exit)
+            }
+            Err(join_error) => {
+                if let Some(identity) = self.task_identities.remove(&join_error.id())
+                    && let Some(service) = self.services.get_mut(identity.name)
+                    && service.generation == identity.generation
+                {
+                    let message = join_error.to_string();
+                    service.status = ServiceStatus::Failed;
+                    service.last_error = Some(message.clone());
+                    for waiter in service.stop_waiters.drain(..) {
+                        let _ = waiter.send(Err(ServiceManagerError::OperationFailed {
+                            name: identity.name.to_owned(),
+                            message: message.clone(),
+                        }));
+                    }
+                }
+                Err(join_error.into())
+            }
+        }
+    }
+
+    /// Run until process shutdown is initiated or a critical runnable failure
+    /// occurs. An empty runnable set remains alive so stopped services can be
+    /// started again through the manager.
     pub async fn wait_until_shutdown(
         &mut self,
         state: &S,
-    ) -> crate::registry::Result<()> {
+    ) -> Result<()> {
         let shutdown = state.shutdown_token();
 
         loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    debug!("runtime observed shutdown signal; leaving runnable wait loop");
-                    return Ok(());
-                }
-                res = self.join_set.join_next() => {
-                    let Some(res) = res else {
-                        // No runnable tasks left.
-                        debug!("runtime join set is empty");
+            if self.join_set.is_empty() {
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        self.begin_shutdown();
+                        debug!("runtime observed shutdown signal");
                         return Ok(());
-                    };
-
-                    match res {
-                        Ok(Ok(())) => {
-                            debug!("a runnable finished cleanly");
+                    }
+                    command = self.commands.recv() => {
+                        match command {
+                            Some(command) => self.handle_command(command).await,
+                            None => return Err(Error::msg("service manager command channel closed")),
                         }
-                        // Recoverable failures (best-effort tasks)
-                        // dependency shouldn't tear the worker down): the
-                        // runnable opted in by returning
-                        // `Error::run_continue(...)`. Log and keep serving.
-                        Ok(Err(crate::registry::Error::Recoverable { name, source })) => {
-                            error!(provider = %name, "runnable failed (worker continuing): {}", source);
+                    }
+                }
+            } else {
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        self.begin_shutdown();
+                        debug!("runtime observed shutdown signal");
+                        return Ok(());
+                    }
+                    command = self.commands.recv() => {
+                        match command {
+                            Some(command) => self.handle_command(command).await,
+                            None => return Err(Error::msg("service manager command channel closed")),
                         }
-                        // Default policy is fatal: bring the worker down so
-                        // the supervisor can respawn deterministically. Any
-                        // runnable that wants log+continue must explicitly
-                        // opt in via `Error::run_continue`.
-                        Ok(Err(e)) => {
-                            return Err(e);
-                        }
-                        Err(join_err) => {
-                            return Err(join_err.into());
-                        }
+                    }
+                    joined = self.join_set.join_next_with_id() => {
+                        let Some(joined) = joined else { continue };
+                        self.complete_join(joined)?;
                     }
                 }
             }
         }
     }
-}
 
-impl<S> Runtime<S> {
     /// Abort and drain all remaining runnable tasks.
     pub async fn abort_and_drain(&mut self) {
+        self.begin_shutdown();
         self.join_set.abort_all();
-        while self.join_set.join_next().await.is_some() {}
+        while let Some(joined) = self.join_set.join_next_with_id().await {
+            match joined {
+                Ok((id, _)) => {
+                    self.task_identities.remove(&id);
+                }
+                Err(error) => {
+                    self.task_identities.remove(&error.id());
+                }
+            }
+        }
         debug!("runtime aborted and drained remaining runnable tasks");
     }
 
     /// Wait for all remaining runnable tasks to finish on their own.
     ///
-    /// Shutdown-aware listeners do their protocol-level graceful drain inside
-    /// their runnable future. The bootstrap layer must give those futures a
-    /// chance to complete before falling back to `abort_and_drain`.
-    pub async fn drain(&mut self) -> crate::registry::Result<()> {
-        while let Some(res) = self.join_set.join_next().await {
-            match res {
-                Ok(Ok(())) => {
-                    debug!("a runnable finished cleanly during drain");
-                }
-                Ok(Err(crate::registry::Error::Recoverable { name, source })) => {
-                    error!(provider = %name, "runnable failed during drain (continuing): {}", source);
-                }
-                Ok(Err(e)) => {
-                    return Err(e);
-                }
-                Err(join_err) => {
-                    return Err(join_err.into());
-                }
-            }
+    /// The global shutdown token has already cancelled every generation.
+    /// Each runnable owns its protocol-level graceful drain inside its future;
+    /// this layer imposes no implicit deadline.
+    pub async fn drain(&mut self) -> Result<()> {
+        while let Some(joined) = self.join_set.join_next_with_id().await {
+            self.complete_join(joined)?;
         }
         debug!("runtime drained remaining runnable tasks");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::{Reloadable, RunContext};
+
+    #[derive(Clone)]
+    struct TestState(Arc<TestStateInner>);
+
+    struct TestStateInner {
+        shutdown: CancellationToken,
+        registry: Registry<TestState>,
+        #[cfg(feature = "events")]
+        events: crate::LifecycleBus,
+    }
+
+    impl TestState {
+        fn new() -> Self {
+            Self(Arc::new(TestStateInner {
+                shutdown: CancellationToken::new(),
+                registry: Registry::new(),
+                #[cfg(feature = "events")]
+                events: crate::LifecycleBus::new(),
+            }))
+        }
+    }
+
+    impl SharedState for TestState {
+        fn shutdown_token(&self) -> CancellationToken {
+            self.0.shutdown.clone()
+        }
+
+        fn registry_ref(&self) -> &Registry<Self> {
+            &self.0.registry
+        }
+
+        #[cfg(feature = "events")]
+        fn events(&self) -> &crate::LifecycleBus {
+            &self.0.events
+        }
+    }
+
+    struct ManagedCounter {
+        active: AtomicBool,
+        starts: AtomicU64,
+        stops: AtomicU64,
+        reloads: AtomicU64,
+    }
+
+    impl ManagedCounter {
+        fn new() -> Self {
+            Self {
+                active: AtomicBool::new(false),
+                starts: AtomicU64::new(0),
+                stops: AtomicU64::new(0),
+                reloads: AtomicU64::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider<TestState> for ManagedCounter {
+        fn name(&self) -> &'static str {
+            "counter"
+        }
+
+        fn as_runnable(self: Arc<Self>) -> Option<Arc<dyn Runnable<TestState>>> {
+            Some(self)
+        }
+
+        fn as_reloadable(&self) -> Option<&dyn Reloadable<TestState>> {
+            Some(self)
+        }
+    }
+
+    #[async_trait]
+    impl Reloadable<TestState> for ManagedCounter {
+        async fn reload(
+            &self,
+            _state: &TestState,
+        ) -> Result<()> {
+            self.reloads.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Runnable<TestState> for ManagedCounter {
+        async fn run(
+            self: Arc<Self>,
+            _state: TestState,
+            context: RunContext,
+        ) -> Result<()> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            self.active.store(true, Ordering::SeqCst);
+            context.cancelled().await;
+            self.active.store(false, Ordering::SeqCst);
+            self.stops.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    async fn wait_for(
+        counter: &ManagedCounter,
+        starts: u64,
+        stops: u64,
+    ) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while counter.starts.load(Ordering::SeqCst) != starts
+                || counter.stops.load(Ordering::SeqCst) != stops
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("managed counter did not reach expected generation");
+    }
+
+    #[tokio::test]
+    async fn manager_owns_stop_start_and_restart_generations() {
+        let state = TestState::new();
+        let counter = Arc::new(ManagedCounter::new());
+        let mut runtime = Runtime::<TestState>::default();
+        let manager = runtime.manager();
+
+        state
+            .registry_ref()
+            .insert(manager.clone())
+            .expect("manager registration")
+            .insert(counter.clone())
+            .expect("counter registration");
+        runtime.spawn_all(state.registry_ref(), state.clone()).expect("runtime initialization");
+
+        let runtime_state = state.clone();
+        let runtime_task = tokio::spawn(async move {
+            let result = runtime.wait_until_shutdown(&runtime_state).await;
+            (runtime, result)
+        });
+
+        wait_for(&counter, 1, 0).await;
+        let stopped = manager.stop("counter").await.expect("stop counter");
+        assert_eq!(stopped.status(), ServiceStatus::Stopped);
+        assert!(!counter.active.load(Ordering::SeqCst));
+
+        let started = manager.start("counter").await.expect("start counter");
+        assert_eq!(started.generation(), 2);
+        wait_for(&counter, 2, 1).await;
+
+        let restarted = manager.restart("counter").await.expect("restart counter");
+        assert_eq!(restarted.generation(), 3);
+        wait_for(&counter, 3, 2).await;
+
+        let reloaded = manager.reload("counter").await.expect("reload counter");
+        assert_eq!(reloaded.status(), ServiceStatus::Running);
+        assert_eq!(reloaded.generation(), 3);
+        assert_eq!(counter.reloads.load(Ordering::SeqCst), 1);
+
+        state.initiate_shutdown();
+        let (mut runtime, result) = runtime_task.await.expect("runtime task join");
+        result.expect("runtime shutdown");
+        runtime.drain().await.expect("runtime drain");
+        wait_for(&counter, 3, 3).await;
     }
 }
