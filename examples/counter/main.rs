@@ -246,12 +246,19 @@ fn counter_controls() -> &'static str {
 fn format_snapshot(service: &ServiceSnapshot) -> String {
     let error =
         service.last_error().map(|message| format!(" | last error={message}")).unwrap_or_default();
+    let reload_error = service
+        .last_reload_error()
+        .map(|message| format!(" | last reload error={message}"))
+        .unwrap_or_default();
     format!(
-        "{} | {} | generation={}{}",
+        "{} | {} | reloadable={} | generation={} | reload-revision={}{}{}",
         service.name(),
         service.status(),
+        service.is_reloadable(),
         service.generation(),
-        error
+        service.reload_revision(),
+        error,
+        reload_error
     )
 }
 

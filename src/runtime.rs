@@ -31,15 +31,25 @@ struct ServiceEntry<S> {
     generation: u64,
     cancellation: Option<CancellationToken>,
     last_error: Option<String>,
+    reload_revision: u64,
+    last_reload_error: Option<String>,
     stop_waiters: Vec<oneshot::Sender<Result<ServiceSnapshot, ServiceManagerError>>>,
 }
 
-impl<S> ServiceEntry<S> {
+impl<S: 'static> ServiceEntry<S> {
     fn snapshot(
         &self,
         name: &'static str,
     ) -> ServiceSnapshot {
-        ServiceSnapshot::new(name, self.status, self.generation, self.last_error.clone())
+        ServiceSnapshot::new(
+            name,
+            self.status,
+            self.provider.as_reloadable().is_some(),
+            self.generation,
+            self.last_error.clone(),
+            self.reload_revision,
+            self.last_reload_error.clone(),
+        )
     }
 }
 
@@ -121,6 +131,8 @@ where
                     generation: 0,
                     cancellation: None,
                     last_error: None,
+                    reload_revision: 0,
+                    last_reload_error: None,
                     stop_waiters: Vec::new(),
                 },
             );
@@ -268,13 +280,36 @@ where
                     let _ = reply.send(Err(ServiceManagerError::NotReloadable(name)));
                     return;
                 };
-                let result = reloadable.reload(&state).await.map_err(|error| {
-                    ServiceManagerError::OperationFailed {
-                        name,
-                        message: error.into_reload(static_name).to_string(),
+                let next_revision = match self.services[static_name].reload_revision.checked_add(1)
+                {
+                    Some(revision) => revision,
+                    None => {
+                        let _ = reply.send(Err(ServiceManagerError::OperationFailed {
+                            name,
+                            message: "reload revision overflow".to_owned(),
+                        }));
+                        return;
                     }
-                });
-                let result = result.map(|()| self.services[static_name].snapshot(static_name));
+                };
+                let reload = reloadable
+                    .reload(&state)
+                    .await
+                    .map_err(|error| error.into_reload(static_name).to_string());
+                let service = self
+                    .services
+                    .get_mut(static_name)
+                    .expect("service key remains registered during reload");
+                service.reload_revision = next_revision;
+                let result = match reload {
+                    Ok(()) => {
+                        service.last_reload_error = None;
+                        Ok(service.snapshot(static_name))
+                    }
+                    Err(message) => {
+                        service.last_reload_error = Some(message.clone());
+                        Err(ServiceManagerError::OperationFailed { name, message })
+                    }
+                };
                 let _ = reply.send(result);
             }
         }
@@ -520,6 +555,7 @@ mod tests {
         starts: AtomicU64,
         stops: AtomicU64,
         reloads: AtomicU64,
+        fail_reload: AtomicBool,
     }
 
     impl ManagedCounter {
@@ -529,6 +565,7 @@ mod tests {
                 starts: AtomicU64::new(0),
                 stops: AtomicU64::new(0),
                 reloads: AtomicU64::new(0),
+                fail_reload: AtomicBool::new(false),
             }
         }
     }
@@ -555,6 +592,9 @@ mod tests {
             _state: &TestState,
         ) -> Result<()> {
             self.reloads.fetch_add(1, Ordering::SeqCst);
+            if self.fail_reload.swap(false, Ordering::SeqCst) {
+                return Err(Error::msg("configured reload failure"));
+            }
             Ok(())
         }
     }
@@ -628,7 +668,23 @@ mod tests {
         let reloaded = manager.reload("counter").await.expect("reload counter");
         assert_eq!(reloaded.status(), ServiceStatus::Running);
         assert_eq!(reloaded.generation(), 3);
+        assert_eq!(reloaded.reload_revision(), 1);
+        assert_eq!(reloaded.last_reload_error(), None);
         assert_eq!(counter.reloads.load(Ordering::SeqCst), 1);
+
+        counter.fail_reload.store(true, Ordering::SeqCst);
+        assert!(manager.reload("counter").await.is_err());
+        let snapshots = manager.list().await.expect("list services after failed reload");
+        let failed_reload = snapshots
+            .iter()
+            .find(|snapshot| snapshot.name() == "counter")
+            .expect("counter snapshot");
+        assert_eq!(failed_reload.status(), ServiceStatus::Running);
+        assert_eq!(failed_reload.reload_revision(), 2);
+        assert_eq!(
+            failed_reload.last_reload_error(),
+            Some("reload of 'counter' failed: configured reload failure")
+        );
 
         state.initiate_shutdown();
         let (mut runtime, result) = runtime_task.await.expect("runtime task join");
