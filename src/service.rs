@@ -9,6 +9,41 @@ use crate::Provider;
 
 const COMMAND_CAPACITY: usize = 64;
 
+/// Initial activation policy for one registered runnable service.
+///
+/// The runtime samples this policy after provider boot has completed. It is
+/// independent from [`ServiceStatus`]: a manually started service is both
+/// `Manual` and `Running`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ServiceStartPolicy {
+    /// Start an initial generation when the runtime is initialized.
+    #[default]
+    Automatic,
+    /// Keep the service stopped initially, while allowing an explicit start.
+    Manual,
+    /// Keep the service stopped and reject explicit start or restart requests.
+    Unavailable,
+}
+
+impl ServiceStartPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Manual => "manual",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+impl fmt::Display for ServiceStartPolicy {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Cancellation scope for one live generation of a [`crate::Runnable`].
 ///
 /// The process shutdown token is its parent. A service therefore observes the
@@ -73,42 +108,27 @@ impl fmt::Display for ServiceStatus {
 /// Point-in-time view of a runnable service owned by the runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceSnapshot {
-    name: &'static str,
-    status: ServiceStatus,
-    reloadable: bool,
-    generation: u64,
-    last_error: Option<String>,
-    reload_revision: u64,
-    last_reload_error: Option<String>,
+    pub(crate) name: &'static str,
+    pub(crate) status: ServiceStatus,
+    pub(crate) start_policy: ServiceStartPolicy,
+    pub(crate) reloadable: bool,
+    pub(crate) generation: u64,
+    pub(crate) last_error: Option<String>,
+    pub(crate) reload_revision: u64,
+    pub(crate) last_reload_error: Option<String>,
 }
 
 impl ServiceSnapshot {
-    pub(crate) fn new(
-        name: &'static str,
-        status: ServiceStatus,
-        reloadable: bool,
-        generation: u64,
-        last_error: Option<String>,
-        reload_revision: u64,
-        last_reload_error: Option<String>,
-    ) -> Self {
-        Self {
-            name,
-            status,
-            reloadable,
-            generation,
-            last_error,
-            reload_revision,
-            last_reload_error,
-        }
-    }
-
     pub fn name(&self) -> &'static str {
         self.name
     }
 
     pub fn status(&self) -> ServiceStatus {
         self.status
+    }
+
+    pub fn start_policy(&self) -> ServiceStartPolicy {
+        self.start_policy
     }
 
     pub fn is_reloadable(&self) -> bool {
@@ -140,6 +160,7 @@ impl ServiceSnapshot {
 pub enum ServiceManagerError {
     RuntimeUnavailable,
     NotFound(String),
+    Unavailable(String),
     NotReloadable(String),
     Busy { name: String, status: ServiceStatus },
     ShuttingDown,
@@ -154,6 +175,9 @@ impl fmt::Display for ServiceManagerError {
         match self {
             Self::RuntimeUnavailable => f.write_str("service runtime is unavailable"),
             Self::NotFound(name) => write!(f, "runnable service '{name}' is not registered"),
+            Self::Unavailable(name) => {
+                write!(f, "runnable service '{name}' is unavailable on this runtime")
+            }
             Self::NotReloadable(name) => {
                 write!(f, "runnable service '{name}' is not reloadable")
             }

@@ -470,14 +470,22 @@ pub trait Reloadable<S>: Provider<S> {
 /// runtime uses the same path for targeted stop/restart and whole-process
 /// shutdown.
 ///
-/// Config-driven gating: if the provider is disabled at runtime (e.g.
-/// an `enabled: false` config flag, or a single-instance service whose
-/// pinned `worker_id` doesn't match this worker), this method MUST
-/// short-circuit and return `Ok(())` immediately instead of starting the
-/// long task. The provider stays registered for downstream capability
-/// lookups; it just doesn't run on this process.
 #[async_trait]
 pub trait Runnable<S>: Provider<S> {
+    /// Declare the service's initial activation policy after provider boot.
+    ///
+    /// The default is [`crate::ServiceStartPolicy::Automatic`] because
+    /// exposing `Runnable` is already the provider's explicit opt-in to
+    /// runtime ownership. Providers may inspect their booted configuration
+    /// and the process state here without making the registry configuration
+    /// aware.
+    fn start_policy(
+        &self,
+        _state: &S,
+    ) -> crate::ServiceStartPolicy {
+        crate::ServiceStartPolicy::Automatic
+    }
+
     /// Run one runtime-owned generation of this long-lived provider.
     ///
     /// NOTICE (convention):
