@@ -21,7 +21,7 @@ use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::{get, post};
 use axum::{Extension, Router};
 #[cfg(feature = "events")]
-use continuo::LifecycleBus;
+use continuo::ProcessEventBus;
 use continuo::{
     Error, Provider, ProviderOrder, Registry, ReloadState, Reloadable, Result, RunContext,
     Runnable, Runtime, ServiceManager, ServiceSnapshot, SharedState,
@@ -35,7 +35,7 @@ struct Inner {
     shutdown: CancellationToken,
     registry: Registry<AppState>,
     #[cfg(feature = "events")]
-    events: LifecycleBus,
+    events: ProcessEventBus,
 }
 
 impl AppState {
@@ -44,7 +44,7 @@ impl AppState {
             shutdown: CancellationToken::new(),
             registry: Registry::default(),
             #[cfg(feature = "events")]
-            events: LifecycleBus::new(),
+            events: ProcessEventBus::new(),
         }))
     }
 }
@@ -59,7 +59,7 @@ impl SharedState for AppState {
     }
 
     #[cfg(feature = "events")]
-    fn events(&self) -> &LifecycleBus {
+    fn events(&self) -> &ProcessEventBus {
         &self.0.events
     }
 }

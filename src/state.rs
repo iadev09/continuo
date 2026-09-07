@@ -1,7 +1,7 @@
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "events")]
-use crate::LifecycleBus;
+use crate::ProcessEventBus;
 #[cfg(feature = "registry")]
 use crate::Registry;
 
@@ -18,7 +18,7 @@ use crate::Registry;
 /// ```text
 /// use std::sync::Arc;
 /// use tokio_util::sync::CancellationToken;
-/// use continuo::{LifecycleBus, Registry, SharedState};
+/// use continuo::{ProcessEventBus, Registry, SharedState};
 ///
 /// #[derive(Clone)]
 /// pub struct AppState(Arc<Inner>);
@@ -26,7 +26,7 @@ use crate::Registry;
 /// struct Inner {
 ///     shutdown_token: CancellationToken,
 ///     registry: Registry<AppState>,
-///     events: LifecycleBus,
+///     events: ProcessEventBus,
 /// }
 ///
 /// impl SharedState for AppState {
@@ -38,7 +38,7 @@ use crate::Registry;
 ///         &self.0.registry
 ///     }
 ///
-///     fn events(&self) -> &LifecycleBus {
+///     fn events(&self) -> &ProcessEventBus {
 ///         &self.0.events
 ///     }
 /// }
@@ -58,5 +58,5 @@ pub trait SharedState: Clone + Send + Sync + 'static {
     fn registry_ref(&self) -> &Registry<Self>;
 
     #[cfg(feature = "events")]
-    fn events(&self) -> &LifecycleBus;
+    fn events(&self) -> &ProcessEventBus;
 }

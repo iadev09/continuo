@@ -25,7 +25,7 @@ mod service;
 pub mod state;
 
 #[cfg(feature = "events")]
-pub use events::{LifecycleBus, LifecycleEvent, ShutdownInitiated};
+pub use events::{Event, ProcessEventBus, ShutdownInitiated};
 #[cfg(feature = "support")]
 pub use gate::{Gate, GateDrainOutcome, Permit};
 #[cfg(feature = "support")]

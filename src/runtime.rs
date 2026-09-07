@@ -481,7 +481,7 @@ mod tests {
         shutdown: CancellationToken,
         registry: Registry<TestState>,
         #[cfg(feature = "events")]
-        events: crate::LifecycleBus,
+        events: crate::ProcessEventBus,
     }
 
     impl TestState {
@@ -490,7 +490,7 @@ mod tests {
                 shutdown: CancellationToken::new(),
                 registry: Registry::new(),
                 #[cfg(feature = "events")]
-                events: crate::LifecycleBus::new(),
+                events: crate::ProcessEventBus::new(),
             }))
         }
     }
@@ -505,7 +505,7 @@ mod tests {
         }
 
         #[cfg(feature = "events")]
-        fn events(&self) -> &crate::LifecycleBus {
+        fn events(&self) -> &crate::ProcessEventBus {
             &self.0.events
         }
     }
