@@ -548,7 +548,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::{Reloadable, RunContext, ServiceStartPolicy};
+    use crate::{HasRegistry, Reloadable, RunContext, ServiceStartPolicy};
 
     #[derive(Clone)]
     struct TestState(Arc<TestStateInner>);
@@ -575,12 +575,16 @@ mod tests {
         fn shutdown_token(&self) -> CancellationToken {
             self.0.shutdown.clone()
         }
+    }
 
+    impl HasRegistry for TestState {
         fn registry_ref(&self) -> &Registry<Self> {
             &self.0.registry
         }
+    }
 
-        #[cfg(feature = "events")]
+    #[cfg(feature = "events")]
+    impl crate::HasEvents for TestState {
         fn events(&self) -> &crate::ProcessEventBus {
             &self.0.events
         }

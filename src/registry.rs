@@ -28,6 +28,7 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     DuplicateProvider {
         type_name: &'static str,
@@ -97,11 +98,21 @@ impl std::fmt::Display for Error {
     }
 }
 
-// NOTE: `Error` intentionally does NOT implement `std::error::Error`.
-// The blanket `From<E: Error>` below requires that `Error` itself not
-// satisfy that bound (otherwise it would conflict with the core
-// `From<T> for T` blanket). Consumers that need to chain `source()` can
-// match on the variant and walk `BoxError` directly.
+// `Error` deliberately does NOT implement `std::error::Error`, and cannot while
+// the blanket `From<E: Error>` below exists: the two overlap through core's
+// reflexive `From<T> for T` the moment `Error: std::error::Error` holds. It is
+// a real trade and worth naming rather than discovering.
+//
+// The blanket is what makes `?` work on an io, serde or driver error inside a
+// lifecycle hook, which is most of what implementors write; removing it would
+// put an explicit conversion on every one of those call sites. Keeping it costs
+// interop — no `source()` chain, no `Box<dyn Error>`, nothing `anyhow` or
+// `eyre` will take, and not returnable from `main`.
+//
+// `into_std` below is the way out where interop is what you need: it hands back
+// a `std::error::Error` that keeps this error's `Display` and exposes the
+// `BoxError` a variant was carrying as its `source()`, so the chain survives
+// the crossing.
 
 impl<E> From<E> for Error
 where
@@ -109,6 +120,58 @@ where
 {
     fn from(e: E) -> Self {
         Error::Other(Box::new(e))
+    }
+}
+
+impl Error {
+    /// Converts into a `std::error::Error` for handing to something that
+    /// requires one — `anyhow`, `eyre`, `Box<dyn Error>`, `fn main`.
+    ///
+    /// This type cannot implement that trait itself; see the note above the
+    /// blanket `From` impl for why. The returned error keeps this one's
+    /// `Display` and reports the boxed cause a lifecycle variant was carrying
+    /// as its `source()`, so a chain that arrived here survives leaving.
+    pub fn into_std(self) -> StdError {
+        StdError(self)
+    }
+}
+
+/// [`Error`] as a `std::error::Error`, from [`Error::into_std`].
+#[derive(Debug)]
+pub struct StdError(Error);
+
+impl StdError {
+    /// The error this was made from.
+    pub fn into_inner(self) -> Error {
+        self.0
+    }
+}
+
+impl std::fmt::Display for StdError {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for StdError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.0 {
+            Error::Boot { source, .. }
+            | Error::Validate { source, .. }
+            | Error::Reload { source, .. }
+            | Error::Finalize { source, .. }
+            | Error::Other(source) => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl From<Error> for StdError {
+    fn from(error: Error) -> Self {
+        error.into_std()
     }
 }
 

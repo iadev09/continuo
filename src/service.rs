@@ -159,6 +159,7 @@ impl ServiceSnapshot {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ServiceManagerError {
     RuntimeUnavailable,
     NotFound(String),
