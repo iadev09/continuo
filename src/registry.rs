@@ -25,6 +25,9 @@ use async_trait::async_trait;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+/// A provider with the `TypeId` it is registered under.
+type KeyedProvider<S> = (TypeId, Arc<dyn Provider<S>>);
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug)]
@@ -516,6 +519,13 @@ pub trait Reloadable<S>: Provider<S> {
 
     /// Perform a synchronous reload using the current shared state.
     /// Implementations may spawn async work internally if needed.
+    ///
+    /// Do not call back into [`ServiceManager`] from here. A reload driven by
+    /// the manager runs inside the runtime loop's own await, so a command sent
+    /// from this method waits for a reply the loop cannot produce until this
+    /// method returns. See [`ServiceManager`] for the whole of that rule.
+    ///
+    /// [`ServiceManager`]: crate::ServiceManager
     async fn reload(
         &self,
         state: &S,
@@ -913,7 +923,7 @@ impl<S: 'static> Registry<S> {
             return Ok(self.providers_from_type_ids(&type_ids));
         }
 
-        let ordered = order_provider_entries(self.provider_entries_snapshot())?;
+        let ordered = order_provider_entries(self.provider_entries_snapshot(), lifecycle_priority)?;
         let type_ids = ordered.iter().map(|entry| entry.type_id).collect::<Vec<_>>();
         let providers = ordered.iter().map(|entry| entry.provider.clone()).collect::<Vec<_>>();
         #[cfg(debug_assertions)]
@@ -924,6 +934,20 @@ impl<S: 'static> Registry<S> {
         *self.lifecycle_order.write().expect("registry lifecycle order lock poisoned") =
             Some(type_ids);
         Ok(providers)
+    }
+
+    /// The lifecycle plan with each provider's `TypeId` alongside it, for the
+    /// one caller that has to know which providers it has already handled.
+    fn lifecycle_entries(&self) -> Result<Vec<KeyedProvider<S>>> {
+        let plan = self.lifecycle_plan()?;
+        let type_ids = self
+            .lifecycle_order
+            .read()
+            .expect("registry lifecycle order lock poisoned")
+            .clone()
+            .unwrap_or_default();
+
+        Ok(type_ids.into_iter().zip(plan).collect())
     }
 
     fn providers_from_type_ids(
@@ -947,18 +971,25 @@ impl<S: 'static> Registry<S> {
         Ok(self.lifecycle_plan()?.iter().map(|provider| provider.name()).collect())
     }
 
-    pub(crate) fn runnable_entries(&self) -> Vec<RunnableEntry<S>> {
-        let mut providers = self.providers();
-        providers.sort_by_key(|provider| {
-            (provider.run_priority().unwrap_or(priority::NORMAL), provider.name())
-        });
+    /// Runnables in the order they should be started.
+    ///
+    /// Topological like boot, not a sort by magic number. This used to iterate
+    /// `HashMap::values()` and sort by `(run_priority, name)`, so `ProviderOrder`
+    /// meant something for boot and nothing for run, and a runnable that had to
+    /// start after another had no way to say so. It is the same ordering pass
+    /// boot uses, with `run_priority` choosing among the providers that are
+    /// genuinely independent.
+    pub(crate) fn runnable_entries(&self) -> Result<Vec<RunnableEntry<S>>> {
+        let ordered = order_provider_entries(self.provider_entries_snapshot(), run_priority)?;
 
         let mut runnables = Vec::new();
-        for provider in providers {
+        for entry in ordered {
+            let provider = entry.provider;
             let Some(runnable) = provider.clone().as_runnable() else { continue };
             runnables.push(RunnableEntry { name: provider.name(), provider, runnable });
         }
-        runnables
+
+        Ok(runnables)
     }
 
     /// Run `validate` for every provider in lifecycle order.
@@ -988,13 +1019,37 @@ impl<S: 'static> Registry<S> {
         &self,
         state: &S,
     ) -> Result<()> {
-        for provider in self.lifecycle_plan()? {
-            let name = provider.name();
-            if let Err(e) = provider.boot(state).await {
-                return Err(e.into_boot(name));
+        let mut booted: HashSet<TypeId> = HashSet::new();
+
+        // The plan is recomputed each pass rather than materialised once.
+        // `insert` takes `&self`, so a provider's `boot` can register another
+        // one — and a plan taken before the pass would never contain it. Such a
+        // provider used to be validated and finalized but never booted, with
+        // nothing said about it.
+        //
+        // A late arrival is booted on the next pass, which is after providers
+        // that a fresh plan would have ordered behind it. That is the honest
+        // limit of registering during boot, and it is still an order better
+        // than never booting at all.
+        loop {
+            let mut progressed = false;
+
+            for (type_id, provider) in self.lifecycle_entries()? {
+                if !booted.insert(type_id) {
+                    continue;
+                }
+                progressed = true;
+
+                let name = provider.name();
+                if let Err(e) = provider.boot(state).await {
+                    return Err(e.into_boot(name));
+                }
+            }
+
+            if !progressed {
+                return Ok(());
             }
         }
-        Ok(())
     }
 
     /// Run `Finalizable::finalize` for every provider that exposes the
@@ -1087,14 +1142,21 @@ impl<S> Clone for ProviderEntry<S> {
     }
 }
 
+/// Topologically orders providers, choosing among the ones that are ready by
+/// `priority_of`.
+///
+/// The priority is the tie-break, never an override: `before`/`after` are
+/// constraints and a magic number cannot move a provider past one. Which
+/// priority is used is the caller's — boot asks for the boot one, run for the
+/// run one — so both phases mean the same thing by `ProviderOrder`.
 fn order_provider_entries<S: 'static>(
-    entries: Vec<ProviderEntry<S>>
+    entries: Vec<ProviderEntry<S>>,
+    priority_of: impl Fn(&Arc<dyn Provider<S>>) -> u8,
 ) -> Result<Vec<ProviderEntry<S>>> {
     let len = entries.len();
     let positions: HashMap<TypeId, usize> =
         entries.iter().enumerate().map(|(idx, entry)| (entry.type_id, idx)).collect();
-    let priorities: Vec<u8> =
-        entries.iter().map(|entry| lifecycle_priority(&entry.provider)).collect();
+    let priorities: Vec<u8> = entries.iter().map(|entry| priority_of(&entry.provider)).collect();
     let mut outgoing: Vec<HashSet<usize>> = (0..len).map(|_| HashSet::new()).collect();
     let mut indegree = vec![0usize; len];
 
@@ -1152,6 +1214,10 @@ fn order_provider_entries<S: 'static>(
     }
 
     Ok(ordered.into_iter().map(|idx| entries[idx].clone()).collect())
+}
+
+fn run_priority<S: 'static>(provider: &Arc<dyn Provider<S>>) -> u8 {
+    provider.run_priority().unwrap_or(priority::NORMAL)
 }
 
 fn lifecycle_priority<S: 'static>(provider: &Arc<dyn Provider<S>>) -> u8 {
