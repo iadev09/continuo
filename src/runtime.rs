@@ -230,6 +230,16 @@ where
             return;
         }
 
+        // Every arm below reaches for the state, which only exists after
+        // `spawn_all`. A command that arrives before it used to panic the
+        // runtime task on an `expect` — an operator command racing startup
+        // taking the process down. `RuntimeUnavailable` is the answer the enum
+        // already has for exactly this.
+        if self.state.is_none() {
+            Self::reject_command(command, ServiceManagerError::RuntimeUnavailable);
+            return;
+        }
+
         match command {
             ServiceCommand::List { reply } => {
                 let _ = reply.send(Ok(self.snapshots()));
