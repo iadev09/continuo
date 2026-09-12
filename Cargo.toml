@@ -2,7 +2,8 @@
 name = "continuo"
 version = "0.5.1"
 edition = "2024"
-rust-version = "1.85"
+# Let-chains, used ungated in runtime.rs, gate.rs and events.rs.
+rust-version = "1.88"
 authors = ["iadev09 <iadev09@claviron.org>"]
 description = "Runtime service composition for multi-service Rust applications: typed provider resolution, dependency-ordered lifecycle, reload, runnable tasks, graceful drain, and finalization."
 license = "MIT OR Apache-2.0"
@@ -19,6 +20,11 @@ full = ["registry", "support", "events"]
 events = ["dep:dashmap"]
 registry = []
 support = []
+
+[package.metadata.docs.rs]
+# `gate`, `guard` and `events` are behind features; without this docs.rs
+# renders the registry and nothing else.
+all-features = true
 
 [dependencies]
 async-trait = "0.1"

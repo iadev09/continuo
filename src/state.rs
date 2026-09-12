@@ -33,11 +33,15 @@ use crate::Registry;
 ///     fn shutdown_token(&self) -> CancellationToken {
 ///         self.0.shutdown_token.clone()
 ///     }
+/// }
 ///
+/// impl HasRegistry for AppState {
 ///     fn registry_ref(&self) -> &Registry<Self> {
 ///         &self.0.registry
 ///     }
+/// }
 ///
+/// impl HasEvents for AppState {
 ///     fn events(&self) -> &ProcessEventBus {
 ///         &self.0.events
 ///     }
@@ -53,10 +57,25 @@ pub trait SharedState: Clone + Send + Sync + 'static {
     fn is_shutting_down(&self) -> bool {
         self.shutdown_token().is_cancelled()
     }
+}
 
-    #[cfg(feature = "registry")]
+/// A state that owns a [`Registry`].
+///
+/// A trait of its own rather than a `#[cfg]`-gated method on [`SharedState`].
+/// Cargo features are additive and unify across the whole graph, so a gated
+/// *method* means any crate anywhere enabling `registry` adds a required method
+/// to a trait other crates have already implemented, and their builds break at
+/// a distance for a feature they never asked for. A gated *trait* adds a
+/// capability instead: enabling the feature offers something new and takes
+/// nothing away.
+#[cfg(feature = "registry")]
+pub trait HasRegistry: SharedState {
     fn registry_ref(&self) -> &Registry<Self>;
+}
 
-    #[cfg(feature = "events")]
+/// A state that owns a [`ProcessEventBus`]. Separate from [`SharedState`] for
+/// the same reason as [`HasRegistry`].
+#[cfg(feature = "events")]
+pub trait HasEvents: SharedState {
     fn events(&self) -> &ProcessEventBus;
 }

@@ -23,8 +23,8 @@ use axum::{Extension, Router};
 #[cfg(feature = "events")]
 use continuo::ProcessEventBus;
 use continuo::{
-    Error, Provider, ProviderOrder, Registry, ReloadState, Reloadable, Result, RunContext,
-    Runnable, Runtime, ServiceManager, ServiceSnapshot, SharedState,
+    Error, HasEvents, HasRegistry, Provider, ProviderOrder, Registry, ReloadState, Reloadable,
+    Result, RunContext, Runnable, Runtime, ServiceManager, ServiceSnapshot, SharedState,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -53,12 +53,16 @@ impl SharedState for AppState {
     fn shutdown_token(&self) -> CancellationToken {
         self.0.shutdown.clone()
     }
+}
 
+impl HasRegistry for AppState {
     fn registry_ref(&self) -> &Registry<Self> {
         &self.0.registry
     }
+}
 
-    #[cfg(feature = "events")]
+#[cfg(feature = "events")]
+impl HasEvents for AppState {
     fn events(&self) -> &ProcessEventBus {
         &self.0.events
     }

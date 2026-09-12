@@ -32,7 +32,7 @@ pub use gate::{Gate, GateDrainOutcome, Permit};
 pub use guard::{Guard, GuardGroup};
 pub use registry::{
     BoxError, Error, Finalizable, FinalizeFailure, FinalizeOutcome, Provider, ProviderOrder,
-    Registry, ReloadFailure, ReloadOutcome, ReloadState, Reloadable, Result, Runnable,
+    Registry, ReloadFailure, ReloadOutcome, ReloadState, Reloadable, Result, Runnable, StdError,
     ValidationFailure, ValidationOutcome,
 };
 pub use runtime::Runtime;
@@ -40,4 +40,8 @@ pub use service::{
     RunContext, ServiceManager, ServiceManagerError, ServiceSnapshot, ServiceStartPolicy,
     ServiceStatus,
 };
+#[cfg(feature = "events")]
+pub use state::HasEvents;
+#[cfg(feature = "registry")]
+pub use state::HasRegistry;
 pub use state::SharedState;

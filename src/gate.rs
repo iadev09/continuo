@@ -37,12 +37,34 @@ struct Inner {
     max_count: Option<usize>,
 }
 
-#[derive(Debug)]
+/// Why a [`Gate`] refused a permit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum Error {
-    ShuttingDown, // GracefulShutdown(Duration),
+    /// Graceful shutdown has been requested; the gate takes no new work.
+    ShuttingDown,
+    /// The gate was at capacity for the whole acquire timeout.
     AcquireTimeout(Duration),
+    /// The gate was at capacity and the caller asked not to wait.
     AtCapacity,
 }
+
+impl std::fmt::Display for Error {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        match self {
+            Self::ShuttingDown => f.write_str("gate is shutting down"),
+            Self::AcquireTimeout(timeout) => {
+                write!(f, "gate was at capacity for {timeout:?}")
+            }
+            Self::AtCapacity => f.write_str("gate is at capacity"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
 
 /// Result of waiting for accepted work to leave a [`Gate`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
