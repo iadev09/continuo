@@ -1106,6 +1106,26 @@ impl<S> Registry<S>
 where
     S: ReloadState + 'static,
 {
+    /// Reload every reloadable provider, in lifecycle order.
+    ///
+    /// # Not atomic, and not cancel-safe
+    ///
+    /// Providers own their own state and the trait has no two-phase commit, so
+    /// there is nothing to roll back to: a provider that fails leaves the ones
+    /// before it already reloaded, and the [`ReloadOutcome`] is how a caller
+    /// learns which. That much is reported.
+    ///
+    /// Cancellation is not. Drop this future part-way — a `select!` against a
+    /// shutdown signal is the usual way — and the configuration is half new
+    /// with *no* outcome at all, because a dropped future returns nothing. A
+    /// caller that then reports the cycle as complete is reporting something
+    /// that did not happen.
+    ///
+    /// If a reload has to be interruptible, call it to completion and check the
+    /// shutdown signal between cycles, or drive providers one at a time with
+    /// [`reload_one`] and stop where you choose.
+    ///
+    /// [`reload_one`]: Self::reload_one
     pub async fn reload_all(
         &self,
         state: &S,
