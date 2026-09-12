@@ -113,7 +113,7 @@ where
             return Err(Error::msg("runtime runnable set is already initialized"));
         }
 
-        let runnables = registry.runnable_entries();
+        let runnables = registry.runnable_entries()?;
         let mut names = HashSet::with_capacity(runnables.len());
         for entry in &runnables {
             if !names.insert(entry.name) {
@@ -465,7 +465,29 @@ where
     /// Run until process shutdown is initiated or a critical runnable failure
     /// occurs. An empty runnable set remains alive so stopped services can be
     /// started again through the manager.
+    ///
+    /// A fatal failure begins this runtime's own shutdown before the error is
+    /// returned: the remaining runnables are cancelled and the manager stops
+    /// accepting commands. It does *not* cancel the process shutdown token —
+    /// what the process does about a failed runtime is the embedder's decision,
+    /// and it is holding the error.
     pub async fn wait_until_shutdown(
+        &mut self,
+        state: &S,
+    ) -> Result<()> {
+        let outcome = self.run_until_shutdown(state).await;
+        if outcome.is_err() {
+            // Returning without this left the siblings running and the manager
+            // open, which is the opposite of what `Error::Run` documents — "the
+            // runtime tears the worker down". Claviron's bootstrap happened to
+            // shut down on the error; nothing made that the contract.
+            self.begin_shutdown();
+        }
+
+        outcome
+    }
+
+    async fn run_until_shutdown(
         &mut self,
         state: &S,
     ) -> Result<()> {

@@ -211,6 +211,18 @@ pub(crate) enum ServiceCommand {
 ///
 /// This provider contains no duplicate lifecycle state. Commands cross a
 /// bounded channel and are applied by the runtime that owns the live futures.
+///
+/// # Do not call back into this from a lifecycle hook
+///
+/// Commands are applied by the runtime's own loop, one at a time, and the loop
+/// is *inside* the await while a command runs. So a `Reloadable::reload` that
+/// calls `reload`, `start`, `stop` or `list` on a manager — or a runnable that
+/// stops itself from its own `run` — waits for a reply from a loop that is
+/// waiting for it. Neither side moves.
+///
+/// A slow hook has the milder version of the same property: while it runs, the
+/// loop is not observing shutdown or answering anyone else. Lifecycle hooks
+/// should do their own work and return.
 pub struct ServiceManager {
     commands: mpsc::Sender<ServiceCommand>,
 }
