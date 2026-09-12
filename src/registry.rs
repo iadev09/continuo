@@ -774,6 +774,25 @@ impl<S: 'static> Registry<S> {
     /// If another service with the same concrete type is already registered,
     /// registration is rejected.
     ///
+    /// # Resolving during registration
+    ///
+    /// Registration runs in insertion order, and nothing orders it — that is
+    /// what `boot_all` and [`ProviderOrder`] are for. So a `register` function
+    /// that resolves another provider is reading a registry that may or may not
+    /// contain it yet, and the result is decided by the order two lines happen
+    /// to appear in somebody's bootstrap.
+    ///
+    /// The rule is not "never resolve". It is: **do not resolve a provider you
+    /// have not ensured.** Calling that provider's own idempotent `register`
+    /// first and then resolving is fine and order-independent; so is resolving
+    /// your own type to avoid a duplicate insert. What is not fine is
+    /// `if let Some(x) = resolve::<X>() { … }` with no else, because the
+    /// difference between "X is not part of this deployment" and "X has not
+    /// been registered yet" is invisible, and the second one is silent.
+    ///
+    /// Anything that genuinely depends on another provider's *state* belongs in
+    /// `boot`, where the ordering system has already run.
+    ///
     /// Returns `&Self` to allow fallible fluent chaining:
     ///
     /// ```ignore
