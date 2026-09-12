@@ -31,12 +31,25 @@ impl GuardGroup {
         self.0.count.load(Ordering::Acquire)
     }
 
+    /// Resolves once every outstanding [`Guard`] has been dropped.
     pub async fn wait_empty(&self) {
         loop {
+            // Registered before the count is read, not after. The other order
+            // loses the wakeup: between observing a non-zero count and
+            // registering, the last guard can drop and its `notify_waiters`
+            // reaches nobody, so this parks for good on a group that is already
+            // empty. Creating the future is not enough — `Notified` registers
+            // when it is first polled, so `enable` is what makes it happen
+            // here, ahead of the read.
+            let notified = self.0.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             if self.count() == 0 {
                 return;
             }
-            self.0.notify.notified().await;
+
+            notified.await;
         }
     }
 }
