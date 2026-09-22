@@ -1060,9 +1060,17 @@ impl<S: 'static> Registry<S> {
                 progressed = true;
 
                 let name = provider.name();
+                // Boot is a sequence of silent blocking steps, and when one
+                // of them takes seconds the log shows a gap with nothing in
+                // it — the next line to print gets the blame. Saying which
+                // provider is being waited on, and what it cost, is what
+                // turns that gap into an answer.
+                tracing::debug!("⏳ booting {name}");
+                let started = std::time::Instant::now();
                 if let Err(e) = provider.boot(state).await {
                     return Err(e.into_boot(name));
                 }
+                tracing::debug!("✅ {name} booted in {} ms", started.elapsed().as_millis());
             }
 
             if !progressed {
