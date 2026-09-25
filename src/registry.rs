@@ -626,21 +626,29 @@ pub trait Finalizable<S>: Provider<S> {
 ///    * Building the operational snapshot (that's `boot()`).
 ///
 /// 2. **`boot()`** — async, called after every `register()` ran, in
-///    lifecycle order. This is where the provider becomes usable.
+///    lifecycle order. The object is booted: it is built and reads its
+///    configuration, and nothing more.
 ///
 ///    Allowed / expected:
 ///    * Resolve dependencies from the registry — by now every other
 ///      `register()` has run.
-///    * Async I/O — `tokio::fs` for config, network calls, etc. Never
-///      `std::fs` (it blocks the runtime).
+///    * Read configuration and state — `tokio::fs`, never `std::fs` (it
+///      blocks the runtime).
 ///    * Build the runtime snapshot and publish it via `ArcSwap` /
 ///      `ArcSwapOption` so concurrent readers see atomic swaps.
 ///    * Honor disabled-state from config: leave the snapshot empty and
 ///      return `Ok(())` rather than failing.
 ///
-///    Forbidden:
-///    * Spawning long-running tasks. Boot must return when state is
-///      ready; the long task lives in `Runnable::run()`.
+///    Forbidden — anything with an effect outside the object:
+///    * Binding a socket or opening a listener.
+///    * Connecting to or talking to a peer.
+///    * Spawning a task, long-running or not.
+///
+///    All of that is `Runnable::run()`. Boot runs where nothing may serve:
+///    a configuration check (`--check-config`) boots, validates and
+///    finalizes every provider without starting runnables, possibly as a
+///    user without the rights the server has and beside a server already
+///    running.
 ///
 /// 3. **`validate()`** — synchronous readiness/invariant check after
 ///    boot and before runnable tasks start. Use this for cheap checks
