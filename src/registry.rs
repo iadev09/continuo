@@ -661,9 +661,13 @@ pub trait Finalizable<S>: Provider<S> {
 ///    drain, and return — do NOT split that into a separate hook.
 ///
 /// 5. **`Finalizable::finalize()`** — optional capability (see that
-///    trait), exposed via `as_finalizable()`. Best-effort release of
-///    non-running resources after the runnable tasks have drained
-///    (shm segments, lock files). Not a stop mechanism for runnables.
+///    trait), exposed via `as_finalizable()`. The reverse of `boot()`:
+///    boot prepares, finalize releases what was prepared — best-effort,
+///    after the runnable tasks have drained (shm segments, lock files).
+///    Not a stop mechanism for runnables; stopping is `run()`'s own end.
+///
+///    `boot` → `validate` → `run` → `finalize`: prepare, check, work,
+///    release. Only `run` has effects on the world outside the object.
 ///
 /// Reload (`Reloadable::reload()`) follows the same shape as `boot()`.
 #[async_trait]
