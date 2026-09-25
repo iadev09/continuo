@@ -21,11 +21,8 @@ use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::{get, post};
 use axum::{Extension, Router};
 #[cfg(feature = "events")]
-use continuo::ProcessEventBus;
-use continuo::{
-    Error, HasEvents, HasRegistry, Provider, ProviderOrder, Registry, ReloadState, Reloadable,
-    Result, RunContext, Runnable, Runtime, ServiceManager, ServiceSnapshot, SharedState,
-};
+use continuo::{ProcessEventBus,HasEvents};
+use continuo::{Error, HasRegistry, Provider, ProviderOrder, Registry, ReloadState, Reloadable, Result, RunContext, Runnable, Runtime, ServiceManager, ServiceSnapshot, SharedState};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
