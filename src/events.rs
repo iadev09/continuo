@@ -94,7 +94,10 @@ impl ProcessEventBus {
         event: E,
     ) {
         let key = TypeId::of::<E>();
-        tracing::debug!(event_type = std::any::type_name::<E>(), "process event emitted");
+        tracing::debug!(
+            event_type = std::any::type_name::<E>(),
+            "process event emitted"
+        );
 
         if let Some(entry) = self.channels.get(&key)
             && let Some(sender) = entry.downcast_ref::<broadcast::Sender<E>>()

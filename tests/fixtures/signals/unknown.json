@@ -1,0 +1,5 @@
+{
+  "reload": "HUP",
+  "hit": "USR1",
+  "unexpected": true
+}

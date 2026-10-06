@@ -8,669 +8,378 @@
   <a href="https://github.com/iadev09/continuo/blob/main/LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="license"></a>
 </p>
 
-> **Runtime service composition for Rust**
+# Runtime service composition for Rust
 
-`continuo` is a typed runtime registry for Rust services.
+Register services once. Resolve the same shared instances by Rust type.
+Run, reload and stop them through an explicit lifecycle.
 
-Register providers once, resolve the same shared instances by Rust type, and
-let those instances join the application lifecycle when they need to.
+Continuo supplies the registry and runtime, not an application framework.
+Your application owns its state, configuration, transports and domain code.
 
-The provider graph stays explicit and stable. Runtime behavior can still change
-without recompiling: providers rebuild and publish their internal snapshots on
-reload, while callers keep resolving the same typed service.
+> In [Claviron](https://github.com/iadev09/claviron), Continuo handles the core
+> service lifecycle: registration, dependency ordering, startup, reload and
+> shutdown. [Congif](https://github.com/iadev09/congif) handles configuration
+> reading and snapshot storage. These
+> responsibilities live in independent crates, not in Claviron-specific APIs.
 
-Use it when an application has several long-lived services and needs one small,
-framework-agnostic place to:
+## An application can be this small
 
-- register providers once as typed shared instances
-- resolve the same instances later by concrete Rust type
-- boot, validate, reload, and finalize them in deterministic dependency order
-- spawn long-running async runnable providers
-- drain accepted work through graceful shutdown gates
-- publish optional typed in-process lifecycle events
+~~~rust
+Application::new()?
+    .with_services::<(CounterService, HttpService, SignalService)>()?
+    .run()
+    .await
+~~~
 
-This is the whole application:
+This is the entry point of the [playground](examples/playground/main.rs).
+`Application` belongs to that example: its [implementation](examples/playground/app.rs)
+puts a small application API on top of Continuo. Registration and lifecycle
+orchestration stay behind that API, rather than being repeated in `main.rs`.
 
-```rust
-let state = AppState::new();
-let mut runtime = Runtime::<AppState>::default();
+The three services demonstrate the same model in different roles:
 
-// The registry stores typed providers and walks their lifecycle.
-let registry = state.registry_ref();
-registry
-    .insert(runtime.manager())?             // same runtime control handle
-    .insert(Arc::new(CounterService::new()))?
-    .insert(Arc::new(HttpService::new(addr)))?
-    .insert(Arc::new(SignalService))?;  // even Ctrl+C is a service
+- **CounterService** accepts hits, restores its saved value on start and saves
+  it on stop. Its increment comes from configuration.
+- **HttpService** serves the playground and streams live updates with SSE.
+  Reloading its configuration can replace the listening address.
+- **SignalService** maps configured process signals to counter hits and reloads.
+  Ctrl+C initiates application shutdown.
 
-registry.boot_all(&state).await?;       // dependency-ordered
-let validation = registry.validate_all(&state)?;
-// The application decides how to report validation.failures().
+All three are typed providers, configurable, reloadable and runnable.
 
-// The runtime owns the live Runnable generations.
-runtime.spawn_all(registry, state.clone())?;
-runtime.wait_until_shutdown(&state).await?;
-runtime.drain().await?;                 // runnables end themselves
+### Try the playground
 
-let finalized = registry.finalize_all(&state).await?;
-// The application decides how to report finalized.failures().
-```
+~~~sh
+cargo run --example playground
+~~~
 
-After insertion, application code resolves providers by type and the runtime
-calls the hooks those providers expose. The full working version is
-[`examples/counter/main.rs`](https://github.com/iadev09/continuo/blob/main/examples/counter/main.rs).
+Open [http://127.0.0.1:3000/](http://127.0.0.1:3000/).
+Hit the counter, edit its configuration and control the service without
+refreshing the page. [The service list](http://127.0.0.1:3000/services) shows
+lifecycle state, generations and reload revisions.
 
-The core idea:
+Edit the JSON files directly, too: the same watcher handles both an editor
+save and a change submitted by the page.
 
-```text
-Registry<AppState>            — typed instances plus lifecycle hooks
-  ├─ ServiceManager -> Provider (control capability; no shadow state)
-  ├─ CounterService -> Provider + Reloadable + Runnable
-  ├─ HttpService    -> Provider + Runnable
-  └─ SignalService  -> Provider + Runnable
+~~~text
+examples/playground/
+├── main.rs          # logging and application entry point
+├── app.rs           # application composition and lifecycle
+├── app/
+│   ├── state.rs     # shared state and capabilities
+│   ├── config.rs    # configuration types and environment input
+│   ├── providers.rs
+│   ├── providers/   # counter, HTTP, signals and live updates
+│   └── handlers.rs
+├── config/          # counter.json, http.json and signals.json
+├── web/             # HTML, CSS and JavaScript
+└── storage/         # persisted counter state
+~~~
 
-Runtime<AppState>             — sole owner of live Runnable generations
-  ├─ applies each Runnable's initial ServiceStartPolicy
-  └─ applies ServiceManager start / stop / restart commands
-```
+The HTTP configuration uses `"${HTTP_LISTEN}"`. The example reads its `.env`
+and lets process environment values override it. That environment file is
+not watched; configuration files are.
 
-## Features
+## Build the services underneath
 
-Default features are:
+| Part | Responsibility |
+| --- | --- |
+| `Registry<S>` | Shared provider instances, typed resolution and lifecycle ordering |
+| `Register<S>` | Type-owned construction and registration |
+| `Provider<S>` | Identity, dependencies and optional lifecycle capabilities |
+| `Runtime<S>` | Runnable generations, control commands and shutdown |
+| `ServiceManager` | A control handle for that runtime |
+| Congif | Configuration reading, validation and snapshot publication |
 
-```toml
-default = ["registry"]
-full = ["registry", "support", "events"]
-```
+### Resolve by type
 
-- `registry` adds `registry_ref()` to `SharedState` for states that carry
-  `Registry<Self>`. The `Registry` type itself is always available.
-- `events` enables `ProcessEventBus`, adds `events()` to `SharedState`, and
-  enables the `dashmap` dependency.
-- `support` enables `Gate`, `Permit`, `GuardGroup`, and `Guard`.
+Application code asks for the service it needs, not its construction recipe:
 
-## Your State
-
-The crate does not own your app state. Your state only needs to implement
-`SharedState`. If you want `registry.reload_all(&state).await`, implement
-`ReloadState` too.
-
-```rust
-use async_trait::async_trait;
-use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
-use continuo::ProcessEventBus;
-use continuo::{Registry, ReloadState, Result, SharedState};
-
-#[derive(Clone)]
-pub struct AppState(Arc<Inner>);
-
-struct Inner {
-    shutdown: CancellationToken,
-    registry: Registry<AppState>,
-    events: ProcessEventBus,
-}
-
-impl Default for AppState {
-    fn default() -> Self {
-        Self(Arc::new(Inner {
-            shutdown: CancellationToken::new(),
-            registry: Registry::default(),
-            events: ProcessEventBus::new(),
-        }))
-    }
-}
-
-impl AppState {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn on_shutdown(&self) -> impl std::future::Future<Output = ()> + '_ {
-        self.0.shutdown.cancelled()
-    }
-}
-
-impl SharedState for AppState {
-    fn shutdown_token(&self) -> CancellationToken {
-        self.0.shutdown.clone()
-    }
-
-    fn registry_ref(&self) -> &Registry<Self> {
-        &self.0.registry
-    }
-
-    fn events(&self) -> &ProcessEventBus {
-        &self.0.events
-    }
-}
-
-#[async_trait]
-impl ReloadState for AppState {
-    async fn reload(&self) -> Result<()> {
-        Ok(())
-    }
-}
-```
-
-## The Registry
-
-`Registry<S>` stores providers as shared `Arc<T>` values keyed by concrete Rust
-type. Anything with access to your state can resolve the same instance later:
-
-```rust
-let db = state.registry_ref().resolve::<DbService>().expect("DbService registered");
-```
-
-The same registered object can have two roles:
-
-- application code resolves it by concrete type
-- the runtime walks its lifecycle hooks: `validate`, `boot`, `reload`, `run`,
-  `finalize`
-
-That means a provider can be:
-
-- a shared service resolved by application code
-- a lifecycle participant with `boot()` / `validate()`
-- a reload participant with `Reloadable`
-- a long-running task with `Runnable`
-- a post-drain cleanup participant with `Finalizable`
-
-```rust
-use std::sync::Arc;
-
-let state = AppState::new();
-state
+~~~rust
+let counter = state
     .registry_ref()
-    .insert(Arc::new(DbService::new()))?
-    .insert(Arc::new(CacheService::new()))?;
+    .resolve::<CounterService>()
+    .ok_or_else(|| continuo::Error::msg("counter is not registered"))?;
+~~~
 
-state.registry_ref().boot_all(&state).await?;
-let validation = state.registry_ref().validate_all(&state)?;
-```
+Resolution returns an `Arc<CounterService>` pointing to the registered instance.
+It does not construct another counter. Missing types return `None`; inserting
+a second provider of the same concrete type is an error.
 
-Register once. Resolve by type. Let the same object opt into only the lifecycle
-capabilities it actually needs.
+A provider can expose an interface without creating another instance.
+`bind_dyn` binds an interface to an existing concrete provider, and
+`resolve_dyn` retrieves that view:
 
-`Reloadable`, `Runnable`, and `Finalizable` are provider capability traits:
-each has `Provider<S>` as a supertrait. Implementing one therefore requires the
-same concrete type to implement `Provider<S>`; the corresponding `as_*` hook
-then exposes that capability to registry lifecycle traversal.
+~~~rust
+registry.bind_dyn::<dyn Logger, ConsoleLogger>(|provider| provider)?;
+let logger = registry.resolve_dyn::<dyn Logger>();
+~~~
 
-### How Resolve Works
+Here `Logger` and `ConsoleLogger` are application-defined types; the concrete
+provider must already be registered. `with_typed` also permits a closure to
+inspect a concrete provider without taking an owned handle.
 
-Concrete resolve uses only `Any` and `TypeId` from the standard library:
+### Let each service register itself
 
-```rust
-use std::any::{Any, TypeId};
-```
+`Register<S>` is a static registration function, not a constructor requirement.
+A service does not need `Default`. It can take paths, settings or dependencies
+from application state when it builds its instance.
 
-- `insert(Arc<P>)` stores the provider under `TypeId::of::<P>()`.
-- the same allocation is also stored as `Arc<dyn Provider<S>>` for lifecycle
-  traversal.
-- `resolve::<T>()` clones the stored `Arc<dyn Any + Send + Sync>` and
-  downcasts it back to `Arc<T>`.
-- `resolve::<T>()` requires `T: Provider<S>`, so non-provider types do not
-  compile as registry lookups.
+The playground counter registers itself with both its configuration path
+and its persistence path:
 
-There are no string keys, service tokens, macros, or request-path container
-lookups in the concrete resolve path.
+~~~rust
+impl Register<AppState> for CounterService {
+    fn register(state: &AppState) -> continuo::Result<()> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/playground");
 
-### Trait Object Capabilities
-
-Concrete providers can also expose a trait-object capability:
-
-```rust
-use std::sync::Arc;
-use async_trait::async_trait;
-use continuo::Provider;
-
-trait Logger: Send + Sync {
-    fn info(&self, message: &str);
-}
-
-struct ConsoleLogger;
-
-impl Logger for ConsoleLogger {
-    fn info(&self, message: &str) {
-        println!("{message}");
+        state.registry_ref().insert(Arc::new(Self::new(
+            root.join("config/counter.json"),
+            root.join("storage/counter.json"),
+        )))?;
+        Ok(())
     }
 }
+~~~
 
+Tuples compose registrations in declaration order. Each tuple supports up to
+eight members; nested tuples compose larger sets. A registration error stops
+that sequence without undoing providers already registered.
+
+`Runtime::with_services` invokes those registrations and installs its own
+`ServiceManager`. With `config-watch` enabled, it also prepares configuration
+watching. It does not boot the services.
+
+### Keep application state yours
+
+`SharedState` describes how the runtime observes shutdown. Other traits add
+capabilities independently:
+
+| State trait | Exposes |
+| --- | --- |
+| `SharedState` | A process shutdown `CancellationToken` |
+| `HasRegistry` | `&Registry<Self>` |
+| `HasEvents` | `&ProcessEventBus` |
+| `HasConfigReader` | `&congif::ConfigReader` |
+| `ReloadState` | An application-level hook before `reload_all` |
+
+A cheap cloneable handle around `Arc<Inner>` is enough. These are separate
+traits: enabling a feature does not add required methods to an existing
+`SharedState` implementation.
+
+See the complete [playground state](examples/playground/app/state.rs).
+
+### Expose only the lifecycle hooks you need
+
+Every registered service implements `Provider<S>`. Additional traits opt that
+same instance into additional work:
+
+| Trait | Capability exposed by `Provider` |
+| --- | --- |
+| `Configurable` | `as_configurable` |
+| `Reloadable<S>` | `as_reloadable` |
+| `Runnable<S>` | `as_runnable` |
+| `Finalizable<S>` | `as_finalizable` |
+
+A provider may have no running task at all. A runnable may be reloadable or
+not. Implementing a capability also requires exposing it through its
+corresponding `as_*` method.
+
+`Provider::boot` prepares dependencies and resources; `validate` checks the
+prepared provider. `Runnable::run` owns its long-lived work. `Reloadable::reload`
+applies a change; `Finalizable::finalize` performs final cleanup.
+
+Dependencies use Rust types:
+
+~~~rust
+fn order(&self) -> continuo::ProviderOrder {
+    continuo::ProviderOrder::new()
+        .after::<CounterService>()
+        .after::<ServiceManager>()
+        .after::<SignalService>()
+}
+~~~
+
+This is the playground HTTP provider's order. Boot, validation and reload
+follow the dependency plan. Finalization reverses it. Missing dependencies and
+cycles are errors; priorities provide tie-breaks, not replacements for declared
+dependencies. Run priority controls spawn order separately.
+
+### Configure once, reload through the runtime
+
+Continuo re-exports Congif's `Configurable` trait. It does not define a second
+configuration contract.
+
+A configurable owner declares its configuration type, sources and reading
+logic. Validation belongs to that owner:
+
+~~~rust
 #[async_trait]
-impl Provider<AppState> for ConsoleLogger {
-    fn name(&self) -> &'static str {
-        "console-logger"
-    }
-}
+impl Configurable for CounterService {
+    type Config = CounterConfig;
 
-registry.insert(Arc::new(ConsoleLogger))?;
-registry.bind_dyn::<dyn Logger, ConsoleLogger>(|logger| logger)?;
-
-let logger = registry.resolve_dyn::<dyn Logger>().expect("Logger bound");
-logger.info("ready");
-```
-
-`bind_dyn` does not add another lifecycle participant. It binds an already
-registered concrete provider as a capability, and `resolve_dyn::<dyn Logger>()`
-returns the same shared instance through that trait-object view.
-
-There is one active binding for a given trait object. Calling `bind_dyn` again
-for the same trait object replaces that binding; this is useful during
-bootstrap when configuration decides which registered provider should be the
-default capability.
-
-If an application needs runtime backend switching without recompiling, prefer a
-stable concrete provider that swaps its internal strategy during `reload()`:
-
-```rust
-// App code resolves DomainService; reload can swap GoDaddy for Namecheap
-// inside the service without changing the registry graph.
-let domains = registry.resolve::<DomainService>().expect("DomainService registered");
-```
-
-## Providers
-
-A provider is a plugin-shaped runtime participant registered as a shared typed
-instance. Application code can resolve it later by concrete Rust type, while
-the runtime can call its lifecycle hooks.
-
-```rust
-use async_trait::async_trait;
-use continuo::{Provider, Result};
-
-pub struct DbService;
-
-#[async_trait]
-impl Provider<AppState> for DbService {
-    fn name(&self) -> &'static str {
-        "db"
+    fn sources(&self) -> Vec<PathBuf> {
+        vec![self.config_path.clone()]
     }
 
-    async fn boot(
+    async fn configure(
         &self,
-        state: &AppState
-    ) -> Result<()> {
-        // Open pools, read config, build snapshots, publish ready state.
-        Ok(())
+        reader: &congif::ConfigReader,
+    ) -> congif::Result<Self::Config> {
+        reader.read(&self.config_path).await
     }
 
-    fn validate(
-        &self,
-        state: &AppState
-    ) -> Result<()> {
-        // Cheap readiness checks after boot.
-        Ok(())
-    }
+    // validate_config rejects an increment of zero.
 }
-```
+~~~
 
-## Lifecycle Ordering
+The [full implementation](examples/playground/app/providers/counter.rs)
+includes validation and applies a prepared snapshot during boot and reload.
 
-Lifecycle order is deterministic and type-aware. Providers can express concrete
-dependencies with `ProviderOrder::before::<T>()` / `ProviderOrder::after::<T>()`
-instead of relying on registration order or numeric priority conventions.
+Congif owns parsers, reads and configuration snapshots. Providers own their
+schema, validation and runtime application. Snapshots are indexed by owner
+type, so two owners can use the same configuration type independently.
 
-The same lifecycle plan is used for:
+With `config-watch` enabled:
 
-- `boot_all`
-- `validate_all`
-- `reload_all`
-- `finalize_all`, in reverse order (only providers exposing `Finalizable`)
+1. The runtime installs watches before provider boot.
+2. Congif reports a changed source; the affected owners are resolved from the registry.
+3. Their configurations are prepared and validated in dependency order.
+4. A successful batch publishes its configuration snapshots together.
+5. The runtime invokes the affected providers' reload capabilities.
 
-Reload skips providers that are not `Reloadable`, but it keeps the same relative
-dependency order as boot. If a dependency cycle is introduced, the registry
-returns an error before running the lifecycle phase.
+Watching shares native source watches; providers do not each create a polling
+loop or a configuration notification channel. Runtime consumption starts after
+`spawn_all`. A stopped runnable does not stop configuration watching.
 
-```rust
-use continuo::{Provider, ProviderOrder};
+An invalid configuration retains the previous snapshot catalog. Applying
+runtime resources remains a provider responsibility: configuration publication
+is not a transaction across every socket, pool or external resource.
 
-pub struct DbService;
-pub struct CacheService;
+The playground HTTP provider binds a replacement listener before giving up
+its working listener. A rejected bind leaves the old address serving. A
+successful replacement drains the old listener, including SSE connections,
+and reports the new address in the console.
 
-impl Provider<AppState> for CacheService {
-    fn order(&self) -> ProviderOrder {
-        ProviderOrder::new().after::<DbService>()
-    }
-}
-```
+For manual registry composition, `Runtime::watch_configurations` installs
+watching explicitly. `ConfigurationChanged::of::<Owner>()` can also notify the
+runtime through the typed event bus.
 
-Registration order can now stay ergonomic:
+### Control live services
 
-```rust
-use std::sync::Arc;
+Resolve the manager from a handler or another task while the runtime's control
+loop is running:
 
-state.registry_ref().insert(Arc::new(CacheService))?;
-state.registry_ref().insert(Arc::new(DbService))?;
+~~~rust
+let manager = state
+    .registry_ref()
+    .resolve::<ServiceManager>()
+    .ok_or_else(|| continuo::Error::msg("service manager is not registered"))?;
 
-let names = state.registry_ref().lifecycle_names()?;
-println!("Lifecycle order: {}", names.join(" -> "));
-
-state.registry_ref().boot_all(&state).await?;
-// DbService boots before CacheService because CacheService says:
-// ProviderOrder::new().after::<DbService>()
-```
-
-`boot_priority()` and `Reloadable::priority()` are still available as coarse
-tie-breakers among otherwise-ready providers. Prefer `ProviderOrder` for real
-dependencies. `run_priority()` controls only runtime task spawn order.
-
-`validate_all()` checks the complete lifecycle plan even when one provider is
-invalid. `ValidationOutcome` retains the successful count and every
-`ValidationFailure`; the application owns reporting and the decision to abort
-startup.
-
-## Runnable Providers
-
-Long-running loops live in `Runnable::run()`, not in `boot()`.
-`Runnable::run()` is an async trait method and receives `self: Arc<Self>`, so
-providers can be spawned without returning a boxed task future.
-
-Graceful teardown belongs inside the same future. Observe the supplied
-`RunContext`, drain your in-flight work, and return. Its cancellation token is
-scoped to one live generation and is a child of the process shutdown token, so
-targeted service stop and whole-process shutdown share one honest teardown
-path. Focused provider harnesses may construct the same shape with
-`RunContext::new(token)`; application boot should let `Runtime` own it.
-
-```rust
-use std::sync::Arc;
-use async_trait::async_trait;
-use continuo::{Provider, Result, RunContext, Runnable};
-
-#[async_trait]
-impl Runnable<AppState> for CacheService {
-    async fn run(
-        self: Arc<Self>,
-        state: AppState,
-        context: RunContext,
-    ) -> Result<()> {
-        context.cancelled().await;
-        Ok(())
-    }
-}
-
-impl Provider<AppState> for CacheService {
-    fn as_runnable(self: Arc<Self>) -> Option<Arc<dyn Runnable<AppState>>> {
-        Some(self)
-    }
-}
-```
-
-Then the runtime starts every runnable provider:
-
-```rust
-use continuo::{Runtime, SharedState};
-
-let state = AppState::new();
-let mut runtime = Runtime::<AppState>::default();
-state.registry_ref().insert(runtime.manager())?;
-
-runtime.spawn_all(state.registry_ref(), state.clone())?;
-state.initiate_shutdown();
-runtime.wait_until_shutdown(&state).await?;
-runtime.drain().await?;
-# Ok::<(), continuo::Error>(())
-```
-
-If process shutdown arrives during provider boot, `spawn_all` still submits
-each initial generation once with an already-cancelled context. This lets
-runnables perform their no-new-work and final-drain path. Later manager-driven
-starts remain rejected after process shutdown begins.
-
-### Managing Runnable Services
-
-`Runtime::manager()` returns the cloneable `ServiceManager` handle backed by
-that exact runtime. Register the same `Arc` as a provider before boot; HTTP,
-gRPC, CLI adapters, or other providers can then resolve it as an ordinary
-typed capability.
-
-```rust
-let mut runtime = Runtime::<AppState>::default();
-state.registry_ref().insert(runtime.manager())?;
-
-runtime.spawn_all(state.registry_ref(), state.clone())?;
-
-let manager = state.registry_ref().resolve::<ServiceManager>().unwrap();
 let services = manager.list().await?;
-manager.stop("counter").await?;       // waits until run() actually returns
-manager.start("counter").await?;      // creates the next generation
-manager.restart("counter").await?;   // strictly stop, then start
-manager.reload("counter").await?;    // same generation, targeted Reloadable
-```
+let stopped = manager.stop("counter").await?;
+let started = manager.start("counter").await?;
+let reloaded = manager.reload("counter").await?;
+let restarted = manager.restart("counter").await?;
+~~~
 
-Each runnable may declare the policy that the runtime first samples after
-provider boot. Exposing `Runnable` defaults to `Automatic`, preserving the
-usual always-on service behavior without a second opt-in:
+The manager sends commands to the runtime; it does not maintain a second
+service registry. Do not wait for its commands from the same task that must
+service the runtime control loop.
 
-```rust
-use continuo::ServiceStartPolicy;
+- **Start** creates a runnable generation; it is not a protocol-readiness guarantee.
+- **Stop** requests cancellation and waits for that generation to return.
+- **Restart** stops the current generation, then starts a new one.
+- **Reload** keeps the generation and tracks a separate reload revision.
 
-fn start_policy(&self, state: &AppState) -> ServiceStartPolicy {
-    if self.available_on(state) {
-        ServiceStartPolicy::Automatic
-    } else {
-        ServiceStartPolicy::Unavailable
-    }
-}
-```
+Snapshots report status, start policy, generation and reload outcome. They are
+lifecycle state, not a metrics subsystem. Only managed runnables appear in the
+manager's service list.
 
-`Automatic` starts an initial generation, `Manual` remains stopped but accepts
-an explicit `start`, and `Unavailable` remains stopped and rejects explicit
-`start` or `restart`. The policy is observable separately from
-`ServiceStatus`; manually started services remain `Manual` while running. The
-runtime re-evaluates the provider-owned policy for snapshots and explicit
-starts, so config reloads take effect without a second policy store.
+`ServiceStartPolicy` supports automatic startup, manual startup and an
+unavailable state that rejects explicit starts. The runtime remains the sole
+owner of running futures.
 
-`ServiceSnapshot::reload_revision()` advances when a targeted reload attempt
-completes, whether it succeeds or fails. `last_reload_error()` retains the
-failure text for observers that cannot receive the direct command result, while
-the live generation and runnable failure remain separate fields.
+### Own the shutdown contract
 
-The manager carries commands, not lifecycle state. `Runtime` remains the sole
-owner of futures, generation counters, cancellation tokens, and status. A
-successful `start` means the generation was accepted and spawned; readiness of
-an application protocol remains the service's own concern.
+A runnable receives `RunContext` with its generation's cancellation token.
+It decides how to stop accepting work and finish what it already accepted.
+Continuo does not invent a shutdown timeout.
 
-This API deliberately does not add scheduling, concurrency, placement,
-backoff, or configuration. Those belong to workload/task orchestration, not
-the structural lifecycle of code-registered services.
+The application normally boots and validates the registry, spawns runnables,
+services runtime commands until shutdown, drains them, then finalizes providers.
+The [playground application](examples/playground/app.rs) shows that orchestration
+behind its `run` method.
 
-## Reloadable Providers
+Boot stops on its first failure. Validation, reload and finalization return
+outcomes containing provider failures; callers must inspect those outcomes,
+not treat an outer `Ok` as proof that every provider succeeded.
+`reload_all` first invokes the application's `ReloadState` hook.
 
-Reload is a capability, not a second registry.
+With `support` enabled, `Gate` adds admission control and RAII `Permit` tracking.
+It can stop new admissions and wait for accepted work to finish. Capacity,
+acquisition timeout and graceful deadline are explicit inputs.
+`GuardGroup` is the smaller counting primitive when only in-flight tracking
+and waiting for an empty group are needed.
 
-```rust
-use async_trait::async_trait;
-use continuo::{Provider, Reloadable, Result};
+### Publish typed events
 
-#[async_trait]
-impl Reloadable<AppState> for DbService {
-    async fn reload(
-        &self,
-        state: &AppState
-    ) -> Result<()> {
-        // Rebuild runtime snapshot and atomically publish it.
-        Ok(())
-    }
+The optional `ProcessEventBus` carries typed, cloneable events within a
+process:
+
+~~~rust
+#[derive(Clone)]
+struct CounterChanged {
+    value: u64,
 }
 
-impl Provider<AppState> for DbService {
-    fn as_reloadable(&self) -> Option<&dyn Reloadable<AppState>> {
-        Some(self)
-    }
-}
-```
+impl continuo::Event for CounterChanged {}
 
-Use `registry.reload_one("db", &state).await` for targeted reloads or
-`registry.reload_all(&state).await` for full reloads.
+let mut changes = state.events().subscribe::<CounterChanged>();
+state.events().emit(CounterChanged { value: 42 });
+let event = changes.recv().await?;
+~~~
 
-`reload_all` first calls `ReloadState::reload()` on your state, then walks the
-same lifecycle order used by `boot_all` and calls `Reloadable::reload()` on
-reloadable providers. It is a best-effort broadcast: one provider failure does
-not prevent later providers from reloading. The returned `ReloadOutcome`
-contains the successful provider count and each `ReloadFailure` with its
-provider name and original typed error. The outer `Result` is reserved for a
-state reload or lifecycle-plan failure that prevents the broadcast itself.
+Subscribe before publishing events you need to observe. Channels are bounded;
+receivers must handle lag. This is an in-process bus, not durable storage or
+a cross-process job queue.
 
-## Finalizable Providers
+### Choose how diagnostics are collected
 
-Finalize releases non-running resources **after the runnable tasks have
-drained**: externally named things whose stale presence would break the next
-boot, such as shm segments or lock files. It is not a stop mechanism; runnables
-end their own futures inside `run()`.
+Continuo uses `tracing` to emit diagnostics. The executable installs its
+subscriber and chooses filtering, formatting and output.
 
-```rust
-use async_trait::async_trait;
-use continuo::{Finalizable, Provider, Result};
+The playground uses `tracing-subscriber`. A rejected configuration reload is
+visible there without turning an invalid edit into application shutdown.
+The library does not install a global logger for its callers.
 
-#[async_trait]
-impl Finalizable<AppState> for DbService {
-    async fn finalize(
-        &self,
-        state: &AppState
-    ) -> Result<()> {
-        // Releases non-running resources after runnables drain.
-        Ok(())
-    }
-}
+## Features and dependencies
 
-impl Provider<AppState> for DbService {
-    fn as_finalizable(&self) -> Option<&dyn Finalizable<AppState>> {
-        Some(self)
-    }
-}
-```
+~~~toml
+continuo = { version = "0.8", features = ["config-watch"] }
+~~~
 
-`registry.finalize_all(&state).await` walks the lifecycle plan in reverse and
-calls `finalize()` on every provider that exposes the capability. One failure
-does not stop the remaining finalizers. `FinalizeOutcome` retains the successful
-provider count and every `FinalizeFailure`; the caller owns logging and policy.
+| Feature | Enables |
+| --- | --- |
+| `registry` (default) | The `HasRegistry` state capability |
+| `events` | `ProcessEventBus` and `HasEvents` |
+| `config-watch` | Runtime configuration watching; includes `registry`, `events` and Congif's watcher |
+| `support` | `Gate`, `Permit`, `GuardGroup` and `Guard` |
+| `full` | All of the above |
 
-## Gates
+The registry and lifecycle traits remain available without default features.
+Native configuration watching supports Linux, macOS and FreeBSD.
 
-The `support` feature enables optional runtime support tools. They are not
-required by `Registry` or `Runtime`, but they are useful when implementing
-servers, connection loops, and request handlers.
-
-`Gate` is a graceful shutdown admission/drain tool. It is inspired by axum's
-server graceful-shutdown pattern, but lifted out of HTTP.
-
-It can:
-
-- reject new work after graceful shutdown starts
-- track accepted in-flight work with `Permit`
-- wait until all permits drop
-- force shutdown after a grace period
-- optionally apply simple max-in-flight admission control
-
-```rust
-use std::time::Duration;
-use continuo::{Gate, GateDrainOutcome};
-
-let gate = Gate::new(Some(1024), Duration::from_millis(100));
-let permit = gate.enter().await?;
-
-gate.graceful_shutdown(Some(Duration::from_secs(30)));
-if let GateDrainOutcome::Forced { remaining } = gate.wait_all_done().await {
-    eprintln!("forced shutdown with {remaining} permit(s) still active");
-}
-# Ok::<(), continuo::gate::Error>(())
-```
-
-`GuardGroup` is a smaller RAII in-flight counter for places where you only
-need “count active work and wait until zero” without admission control.
-
-## Process Events
-
-The `events` feature enables `ProcessEventBus`, a typed process-scoped event bus.
-Use it when services need a loose in-process signal without depending on each
-other directly.
-
-```rust
-use continuo::{Event, ProcessEventBus};
-
-#[derive(Clone, Debug)]
-struct ConfigReloaded;
-impl Event for ConfigReloaded {}
-
-let bus = ProcessEventBus::new();
-let mut rx = bus.subscribe::<ConfigReloaded>();
-bus.emit(ConfigReloaded);
-```
-
-## Example
-
-[`examples/counter/main.rs`](https://github.com/iadev09/continuo/blob/main/examples/counter/main.rs)
-shows the full flow in one file:
-
-```sh
-cargo run --example counter
-curl http://127.0.0.1:3000/hit        # repeat — the count grows
-curl http://127.0.0.1:3000/services   # list live runnable generations
-curl -X POST http://127.0.0.1:3000/services/counter/stop
-curl -X POST http://127.0.0.1:3000/services/counter/start
-curl -X POST http://127.0.0.1:3000/services/counter/restart
-curl -X POST http://127.0.0.1:3000/services/counter/reload
-curl -L http://127.0.0.1:3000/reload  # reload over HTTP — resets to 0
-kill -HUP <pid>                       # same reload, via signal
-# Ctrl+C — graceful drain
-```
-
-The counter is a managed runnable. Every start, including restart, creates a
-new generation and resets its state:
-
-```text
-counter started: reset to 0
-http listening on http://127.0.0.1:3000/hit
-http: hit #1 (client port 51422 -> its #1)
-counter stopped
-counter started: reset to 0
-http: hit #1 (client port 51423 -> its #1)
-^C
-signals: initiating process shutdown
-http drained and stopped
-counter stopped
-all services finished gracefully
-```
-
-Four providers are involved:
-
-- **`CounterService`** is **application-scoped**: one instance for the
-  process lifetime, shared by every request. Its managed `Runnable` generation
-  decides whether it is active and resets the count whenever it starts.
-- **`ServiceManager`** is the registered handle for the runtime-owned service
-  state. The HTTP control router resolves it like any other provider.
-- **`HttpService`** boots after its dependency
-  (`ProviderOrder::new().after::<CounterService>()`), resolves it from
-  the registry once while building the router, and serves/drains inside
-  `Runnable::run()`.
-- **`SignalService`** — even signal handling is a provider: Ctrl+C maps
-  to shutdown, SIGHUP to `reload_all`.
-
-axum is a dev-dependency only; the transport is an implementation detail.
+Core dependencies are `async-trait`, Congif, Tokio, `tokio-util` and `tracing`.
+`dashmap` is optional through `events`. Axum and `tracing-subscriber` are
+example/dev dependencies; Continuo does not require an HTTP framework.
 
 ## Why the name?
 
-In baroque music, the *basso continuo* is the part that plays through the
-whole piece while soloists enter and leave. `continuo` tries to be that steady
-part for application services: the registry stays available, while providers
-resolve, run, reload, and finalize around it.
-
-## Dependencies
-
-The dependency set is intentionally small and canonical for Tokio-based
-services:
-
-```toml
-async-trait = "0.1"
-dashmap = "6"
-tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
-tokio-util = "0.7"
-tracing = "0.1"
-```
-
-`dashmap` is only required when the `events` feature is enabled.
+In baroque music, the *basso continuo* plays through the whole piece while
+soloists enter and leave. The registry stays available while services start,
+run, reload and stop around it.
 
 ## License
 

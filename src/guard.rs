@@ -19,7 +19,10 @@ struct Inner {
 
 impl GuardGroup {
     pub fn new() -> Self {
-        Self(Arc::new(Inner { count: AtomicUsize::new(0), notify: Notify::new() }))
+        Self(Arc::new(Inner {
+            count: AtomicUsize::new(0),
+            notify: Notify::new(),
+        }))
     }
 
     pub fn guard(&self) -> Guard {

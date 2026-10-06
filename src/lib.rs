@@ -19,29 +19,39 @@ pub mod events;
 pub mod gate;
 #[cfg(feature = "support")]
 pub mod guard;
+mod register;
 pub mod registry;
 mod runtime;
 mod service;
 pub mod state;
+#[cfg(feature = "config-watch")]
+mod watcher;
 
+pub use congif::Configurable;
 #[cfg(feature = "events")]
 pub use events::{Event, ProcessEventBus, ShutdownInitiated};
 #[cfg(feature = "support")]
 pub use gate::{Gate, GateDrainOutcome, Permit};
 #[cfg(feature = "support")]
 pub use guard::{Guard, GuardGroup};
+pub use register::Register;
 pub use registry::{
-    BoxError, Error, Finalizable, FinalizeFailure, FinalizeOutcome, Provider, ProviderOrder,
-    Registry, ReloadFailure, ReloadOutcome, ReloadState, Reloadable, Result, Runnable, StdError,
-    ValidationFailure, ValidationOutcome,
+    BoxError, Error, Finalizable, FinalizeFailure, FinalizeOutcome, Provider,
+    ProviderOrder, Registry, ReloadFailure, ReloadOutcome, ReloadState,
+    Reloadable, Result, Runnable, StdError, ValidationFailure,
+    ValidationOutcome,
 };
 pub use runtime::Runtime;
 pub use service::{
-    RunContext, ServiceManager, ServiceManagerError, ServiceSnapshot, ServiceStartPolicy,
-    ServiceStatus,
+    RunContext, ServiceManager, ServiceManagerError, ServiceSnapshot,
+    ServiceStartPolicy, ServiceStatus,
 };
+#[cfg(feature = "config-watch")]
+pub use state::HasConfigReader;
 #[cfg(feature = "events")]
 pub use state::HasEvents;
 #[cfg(feature = "registry")]
 pub use state::HasRegistry;
 pub use state::SharedState;
+#[cfg(feature = "config-watch")]
+pub use watcher::ConfigurationChanged;

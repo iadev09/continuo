@@ -423,7 +423,10 @@ mod tests {
         let _permit = gate.try_enter().expect("permit should be admitted");
         gate.graceful_shutdown(Some(Duration::from_millis(1)));
 
-        assert_eq!(gate.wait_all_done().await, GateDrainOutcome::Forced { remaining: 1 });
+        assert_eq!(
+            gate.wait_all_done().await,
+            GateDrainOutcome::Forced { remaining: 1 }
+        );
     }
 
     /// `enter` under contention, which is the only way its limit can be wrong.
@@ -469,7 +472,10 @@ mod tests {
             }
 
             let observed = peak.load(Ordering::SeqCst);
-            assert!(observed <= 4, "gate held {observed} permits at once against max 4");
+            assert!(
+                observed <= 4,
+                "gate held {observed} permits at once against max 4"
+            );
         }
     }
 }

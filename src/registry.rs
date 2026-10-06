@@ -244,7 +244,9 @@ impl Error {
             // Runnables that opt into recoverable failure construct
             // `Recoverable` with an empty `name`; `run_all` fills in the
             // provider name here so log lines stay attributed.
-            Error::Recoverable { name: "", source } => Error::Recoverable { name, source },
+            Error::Recoverable { name: "", source } => {
+                Error::Recoverable { name, source }
+            }
             other => other,
         }
     }
@@ -736,6 +738,11 @@ pub trait Provider<S>: Any + Send + Sync + 'static {
         None
     }
 
+    /// Optional config-source discovery for application-owned notification.
+    fn as_configurable(&self) -> Option<&dyn congif::ConfigOwner> {
+        None
+    }
+
     /// Optional capability hook.
     fn as_finalizable(&self) -> Option<&dyn Finalizable<S>> {
         None
@@ -821,17 +828,29 @@ impl<S: 'static> Registry<S> {
     {
         let type_id = TypeId::of::<P>();
         let any: Arc<dyn Any + Send + Sync> = item.clone();
-        let mut by_type = self.by_type.write().expect("registry by_type lock poisoned");
+        let mut by_type =
+            self.by_type.write().expect("registry by_type lock poisoned");
         if by_type.contains_key(&type_id) {
-            return Err(Error::DuplicateProvider { type_name: std::any::type_name::<P>() });
+            return Err(Error::DuplicateProvider {
+                type_name: std::any::type_name::<P>(),
+            });
         }
         by_type.insert(type_id, any);
         drop(by_type);
 
         let it: Arc<dyn Provider<S>> = item;
-        self.providers.write().expect("registry providers lock poisoned").insert(type_id, it);
-        self.registration_order.write().expect("registry order lock poisoned").push(type_id);
-        *self.lifecycle_order.write().expect("registry lifecycle order lock poisoned") = None;
+        self.providers
+            .write()
+            .expect("registry providers lock poisoned")
+            .insert(type_id, it);
+        self.registration_order
+            .write()
+            .expect("registry order lock poisoned")
+            .push(type_id);
+        *self
+            .lifecycle_order
+            .write()
+            .expect("registry lifecycle order lock poisoned") = None;
         Ok(self)
     }
 
@@ -859,7 +878,10 @@ impl<S: 'static> Registry<S> {
         })?;
 
         let interface_id = TypeId::of::<I>();
-        let mut dyn_by_type = self.dyn_by_type.write().expect("registry dyn_by_type lock poisoned");
+        let mut dyn_by_type = self
+            .dyn_by_type
+            .write()
+            .expect("registry dyn_by_type lock poisoned");
         let erased: Box<dyn Any + Send + Sync> = Box::new(cast(concrete));
         if dyn_by_type.insert(interface_id, erased).is_some() {
             tracing::debug!(
@@ -903,6 +925,26 @@ impl<S: 'static> Registry<S> {
         Arc::downcast::<T>(any).ok()
     }
 
+    /// Resolve a registered provider's lifecycle capabilities by runtime type.
+    pub fn resolve_provider(
+        &self,
+        type_id: TypeId,
+    ) -> Option<Arc<dyn Provider<S>>> {
+        self.providers
+            .read()
+            .expect("registry providers lock poisoned")
+            .get(&type_id)
+            .cloned()
+    }
+
+    /// Registered provider identities and shared lifecycle handles.
+    pub fn provider_entries(&self) -> Vec<(TypeId, Arc<dyn Provider<S>>)> {
+        self.provider_entries_snapshot()
+            .into_iter()
+            .map(|entry| (entry.type_id, entry.provider))
+            .collect()
+    }
+
     /// Resolve a trait-object capability bound with `bind_dyn`.
     pub fn resolve_dyn<I>(&self) -> Option<Arc<I>>
     where
@@ -918,11 +960,17 @@ impl<S: 'static> Registry<S> {
 
     /// Return a snapshot of registered providers.
     pub fn providers(&self) -> Vec<Arc<dyn Provider<S>>> {
-        self.providers.read().expect("registry providers lock poisoned").values().cloned().collect()
+        self.providers
+            .read()
+            .expect("registry providers lock poisoned")
+            .values()
+            .cloned()
+            .collect()
     }
 
     fn provider_entries_snapshot(&self) -> Vec<ProviderEntry<S>> {
-        let providers = self.providers.read().expect("registry providers lock poisoned");
+        let providers =
+            self.providers.read().expect("registry providers lock poisoned");
         self.registration_order
             .read()
             .expect("registry order lock poisoned")
@@ -954,22 +1002,31 @@ impl<S: 'static> Registry<S> {
             return Ok(self.providers_from_type_ids(&type_ids));
         }
 
-        let ordered = order_provider_entries(self.provider_entries_snapshot(), lifecycle_priority)?;
-        let type_ids = ordered.iter().map(|entry| entry.type_id).collect::<Vec<_>>();
-        let providers = ordered.iter().map(|entry| entry.provider.clone()).collect::<Vec<_>>();
+        let ordered = order_provider_entries(
+            self.provider_entries_snapshot(),
+            lifecycle_priority,
+        )?;
+        let type_ids =
+            ordered.iter().map(|entry| entry.type_id).collect::<Vec<_>>();
+        let providers = ordered
+            .iter()
+            .map(|entry| entry.provider.clone())
+            .collect::<Vec<_>>();
         #[cfg(debug_assertions)]
         tracing::debug!(
             providers = ?providers.iter().map(|provider| provider.name()).collect::<Vec<_>>(),
             "provider lifecycle order"
         );
-        *self.lifecycle_order.write().expect("registry lifecycle order lock poisoned") =
-            Some(type_ids);
+        *self
+            .lifecycle_order
+            .write()
+            .expect("registry lifecycle order lock poisoned") = Some(type_ids);
         Ok(providers)
     }
 
     /// The lifecycle plan with each provider's `TypeId` alongside it, for the
     /// one caller that has to know which providers it has already handled.
-    fn lifecycle_entries(&self) -> Result<Vec<KeyedProvider<S>>> {
+    pub(crate) fn lifecycle_entries(&self) -> Result<Vec<KeyedProvider<S>>> {
         let plan = self.lifecycle_plan()?;
         let type_ids = self
             .lifecycle_order
@@ -985,8 +1042,12 @@ impl<S: 'static> Registry<S> {
         &self,
         type_ids: &[TypeId],
     ) -> Vec<Arc<dyn Provider<S>>> {
-        let providers = self.providers.read().expect("registry providers lock poisoned");
-        type_ids.iter().filter_map(|type_id| providers.get(type_id).cloned()).collect()
+        let providers =
+            self.providers.read().expect("registry providers lock poisoned");
+        type_ids
+            .iter()
+            .filter_map(|type_id| providers.get(type_id).cloned())
+            .collect()
     }
 
     /// Return the list of provider display names (for diagnostics only).
@@ -999,7 +1060,11 @@ impl<S: 'static> Registry<S> {
     /// This is useful for diagnostics and startup logging before running
     /// `boot_all()`.
     pub fn lifecycle_names(&self) -> Result<Vec<&'static str>> {
-        Ok(self.lifecycle_plan()?.iter().map(|provider| provider.name()).collect())
+        Ok(self
+            .lifecycle_plan()?
+            .iter()
+            .map(|provider| provider.name())
+            .collect())
     }
 
     /// Runnables in the order they should be started.
@@ -1011,13 +1076,22 @@ impl<S: 'static> Registry<S> {
     /// boot uses, with `run_priority` choosing among the providers that are
     /// genuinely independent.
     pub(crate) fn runnable_entries(&self) -> Result<Vec<RunnableEntry<S>>> {
-        let ordered = order_provider_entries(self.provider_entries_snapshot(), run_priority)?;
+        let ordered = order_provider_entries(
+            self.provider_entries_snapshot(),
+            run_priority,
+        )?;
 
         let mut runnables = Vec::new();
         for entry in ordered {
             let provider = entry.provider;
-            let Some(runnable) = provider.clone().as_runnable() else { continue };
-            runnables.push(RunnableEntry { name: provider.name(), provider, runnable });
+            let Some(runnable) = provider.clone().as_runnable() else {
+                continue;
+            };
+            runnables.push(RunnableEntry {
+                name: provider.name(),
+                provider,
+                runnable,
+            });
         }
 
         Ok(runnables)
@@ -1038,9 +1112,10 @@ impl<S: 'static> Registry<S> {
             let name = provider.name();
             match provider.validate(state) {
                 Ok(()) => outcome.validated_count += 1,
-                Err(error) => outcome
-                    .failures
-                    .push(ValidationFailure { provider: name, error: error.into_validate(name) }),
+                Err(error) => outcome.failures.push(ValidationFailure {
+                    provider: name,
+                    error: error.into_validate(name),
+                }),
             }
         }
         Ok(outcome)
@@ -1082,7 +1157,10 @@ impl<S: 'static> Registry<S> {
                 if let Err(e) = provider.boot(state).await {
                     return Err(e.into_boot(name));
                 }
-                tracing::debug!("✅ {name} booted in {} ms", started.elapsed().as_millis());
+                tracing::debug!(
+                    "✅ {name} booted in {} ms",
+                    started.elapsed().as_millis()
+                );
             }
 
             if !progressed {
@@ -1108,9 +1186,10 @@ impl<S: 'static> Registry<S> {
             let name = provider.name();
             match finalizable.finalize(state).await {
                 Ok(()) => outcome.finalized_count += 1,
-                Err(error) => outcome
-                    .failures
-                    .push(FinalizeFailure { provider: name, error: error.into_finalize(name) }),
+                Err(error) => outcome.failures.push(FinalizeFailure {
+                    provider: name,
+                    error: error.into_finalize(name),
+                }),
             }
         }
         Ok(outcome)
@@ -1121,7 +1200,10 @@ impl<S: 'static> Registry<S> {
         name: &str,
         state: &S,
     ) -> Result<()> {
-        let Some(provider) = self.providers().into_iter().find(|provider| provider.name() == name)
+        let Some(provider) = self
+            .providers()
+            .into_iter()
+            .find(|provider| provider.name() == name)
         else {
             return Err(Error::msg(format!(
                 "reload_by_name: no provider registered with name '{}'",
@@ -1137,7 +1219,10 @@ impl<S: 'static> Registry<S> {
         };
 
         let provider_name = provider.name();
-        reloadable.reload(state).await.map_err(|error| error.into_reload(provider_name))
+        reloadable
+            .reload(state)
+            .await
+            .map_err(|error| error.into_reload(provider_name))
     }
 }
 
@@ -1178,9 +1263,10 @@ where
             if let Some(reloadable) = provider.as_reloadable() {
                 match reloadable.reload(state).await {
                     Ok(()) => outcome.reloaded_count += 1,
-                    Err(error) => outcome
-                        .failures
-                        .push(ReloadFailure { provider: name, error: error.into_reload(name) }),
+                    Err(error) => outcome.failures.push(ReloadFailure {
+                        provider: name,
+                        error: error.into_reload(name),
+                    }),
                 }
             }
         }
@@ -1197,7 +1283,11 @@ struct ProviderEntry<S> {
 
 impl<S> Clone for ProviderEntry<S> {
     fn clone(&self) -> Self {
-        Self { type_id: self.type_id, index: self.index, provider: self.provider.clone() }
+        Self {
+            type_id: self.type_id,
+            index: self.index,
+            provider: self.provider.clone(),
+        }
     }
 }
 
@@ -1213,10 +1303,15 @@ fn order_provider_entries<S: 'static>(
     priority_of: impl Fn(&Arc<dyn Provider<S>>) -> u8,
 ) -> Result<Vec<ProviderEntry<S>>> {
     let len = entries.len();
-    let positions: HashMap<TypeId, usize> =
-        entries.iter().enumerate().map(|(idx, entry)| (entry.type_id, idx)).collect();
-    let priorities: Vec<u8> = entries.iter().map(|entry| priority_of(&entry.provider)).collect();
-    let mut outgoing: Vec<HashSet<usize>> = (0..len).map(|_| HashSet::new()).collect();
+    let positions: HashMap<TypeId, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| (entry.type_id, idx))
+        .collect();
+    let priorities: Vec<u8> =
+        entries.iter().map(|entry| priority_of(&entry.provider)).collect();
+    let mut outgoing: Vec<HashSet<usize>> =
+        (0..len).map(|_| HashSet::new()).collect();
     let mut indegree = vec![0usize; len];
 
     let mut add_edge = |from: usize, to: usize| {
@@ -1248,7 +1343,11 @@ fn order_provider_entries<S: 'static>(
 
     while !ready.is_empty() {
         ready.sort_by_key(|idx| {
-            (priorities[*idx], entries[*idx].index, entries[*idx].provider.name())
+            (
+                priorities[*idx],
+                entries[*idx].index,
+                entries[*idx].provider.name(),
+            )
         });
         let idx = ready.remove(0);
         ordered.push(idx);
@@ -1266,10 +1365,14 @@ fn order_provider_entries<S: 'static>(
         let blocked = indegree
             .iter()
             .enumerate()
-            .filter_map(|(idx, degree)| (*degree > 0).then_some(entries[idx].provider.name()))
+            .filter_map(|(idx, degree)| {
+                (*degree > 0).then_some(entries[idx].provider.name())
+            })
             .collect::<Vec<_>>()
             .join(", ");
-        return Err(Error::msg(format!("provider lifecycle order cycle detected: {blocked}")));
+        return Err(Error::msg(format!(
+            "provider lifecycle order cycle detected: {blocked}"
+        )));
     }
 
     Ok(ordered.into_iter().map(|idx| entries[idx].clone()).collect())
@@ -1282,7 +1385,11 @@ fn run_priority<S: 'static>(provider: &Arc<dyn Provider<S>>) -> u8 {
 fn lifecycle_priority<S: 'static>(provider: &Arc<dyn Provider<S>>) -> u8 {
     provider
         .boot_priority()
-        .or_else(|| provider.as_reloadable().and_then(|reloadable| reloadable.priority()))
+        .or_else(|| {
+            provider
+                .as_reloadable()
+                .and_then(|reloadable| reloadable.priority())
+        })
         .unwrap_or(priority::NORMAL)
 }
 
@@ -1415,7 +1522,8 @@ mod tests {
             .insert(Arc::new(DbProvider))
             .expect("database registration should succeed");
 
-        let outcome = registry.validate_all(&state).expect("validation should run");
+        let outcome =
+            registry.validate_all(&state).expect("validation should run");
         assert!(outcome.is_valid());
         assert_eq!(outcome.validated_count(), 3);
 
@@ -1428,7 +1536,9 @@ mod tests {
         let registry = Registry::<TestState>::new();
         let original = Arc::new(ApiProvider);
 
-        registry.insert(original.clone()).expect("first registration should succeed");
+        registry
+            .insert(original.clone())
+            .expect("first registration should succeed");
         let error = match registry.insert(Arc::new(ApiProvider)) {
             Err(error) => error,
             Ok(_) => panic!("duplicate registration must be rejected"),
@@ -1439,7 +1549,9 @@ mod tests {
             Error::DuplicateProvider { type_name }
                 if type_name == std::any::type_name::<ApiProvider>()
         ));
-        let resolved = registry.resolve::<ApiProvider>().expect("original provider should remain");
+        let resolved = registry
+            .resolve::<ApiProvider>()
+            .expect("original provider should remain");
         assert!(Arc::ptr_eq(&resolved, &original));
     }
 
@@ -1461,7 +1573,8 @@ mod tests {
         let names = registry.lifecycle_names().expect("plan should build");
         assert_eq!(names, vec!["metrics", "db", "cache", "api"]);
 
-        let outcome = registry.validate_all(&state).expect("validation should run");
+        let outcome =
+            registry.validate_all(&state).expect("validation should run");
         assert!(outcome.is_valid());
         assert_eq!(outcome.validated_count(), 4);
 
@@ -1479,19 +1592,26 @@ mod tests {
             .insert(Arc::new(DbProvider))
             .expect("successful validator should register");
 
-        let outcome = registry.validate_all(&state).expect("validation should complete");
+        let outcome =
+            registry.validate_all(&state).expect("validation should complete");
 
         assert!(!outcome.is_valid());
         assert_eq!(outcome.validated_count(), 1);
         assert_eq!(outcome.failed_count(), 1);
         let failure = &outcome.failures()[0];
         assert_eq!(failure.provider(), "fails-validation");
-        assert!(matches!(failure.error(), Error::Validate { name: "fails-validation", .. }));
+        assert!(matches!(
+            failure.error(),
+            Error::Validate { name: "fails-validation", .. }
+        ));
         assert_eq!(
             failure.error().to_string(),
             "provider 'fails-validation' failed during validate: validation rejected"
         );
-        assert_eq!(state.seen.lock().expect("test log poisoned").as_slice(), &["db"]);
+        assert_eq!(
+            state.seen.lock().expect("test log poisoned").as_slice(),
+            &["db"]
+        );
     }
 
     trait LogSink: Send + Sync {
@@ -1523,7 +1643,11 @@ mod tests {
             &self,
             state: &TestState,
         ) -> Result<()> {
-            state.seen.lock().expect("test log poisoned").push("console-logger");
+            state
+                .seen
+                .lock()
+                .expect("test log poisoned")
+                .push("console-logger");
             Ok(())
         }
     }
@@ -1548,20 +1672,28 @@ mod tests {
         let state = TestState::default();
         let registry = Registry::<TestState>::new();
 
-        registry.insert(Arc::new(ConsoleLogger)).expect("console logger should register");
+        registry
+            .insert(Arc::new(ConsoleLogger))
+            .expect("console logger should register");
         registry
             .bind_dyn::<dyn LogSink, ConsoleLogger>(|logger| logger)
             .expect("dyn binding should succeed");
 
-        let sink = registry.resolve_dyn::<dyn LogSink>().expect("LogSink should be bound");
+        let sink = registry
+            .resolve_dyn::<dyn LogSink>()
+            .expect("LogSink should be bound");
         assert_eq!(sink.line(), "console");
 
-        registry.insert(Arc::new(FileLogger)).expect("file logger should register");
+        registry
+            .insert(Arc::new(FileLogger))
+            .expect("file logger should register");
         registry
             .bind_dyn::<dyn LogSink, FileLogger>(|logger| logger)
             .expect("dyn binding replacement should succeed");
 
-        let sink = registry.resolve_dyn::<dyn LogSink>().expect("LogSink should be rebound");
+        let sink = registry
+            .resolve_dyn::<dyn LogSink>()
+            .expect("LogSink should be rebound");
         assert_eq!(sink.line(), "file");
 
         registry.boot_all(&state).await.expect("boot should succeed");
@@ -1602,7 +1734,11 @@ mod tests {
             &self,
             state: &TestState,
         ) -> Result<()> {
-            state.seen.lock().expect("test log poisoned").push("finalize-recorder");
+            state
+                .seen
+                .lock()
+                .expect("test log poisoned")
+                .push("finalize-recorder");
             Ok(())
         }
     }
@@ -1617,7 +1753,11 @@ mod tests {
             &self,
             state: &TestState,
         ) -> Result<()> {
-            state.seen.lock().expect("test log poisoned").push("boot-dependency");
+            state
+                .seen
+                .lock()
+                .expect("test log poisoned")
+                .push("boot-dependency");
             Ok(())
         }
 
@@ -1632,7 +1772,11 @@ mod tests {
             &self,
             state: &TestState,
         ) -> Result<()> {
-            state.seen.lock().expect("test log poisoned").push("finalize-dependency");
+            state
+                .seen
+                .lock()
+                .expect("test log poisoned")
+                .push("finalize-dependency");
             Ok(())
         }
     }
@@ -1649,14 +1793,22 @@ mod tests {
             .expect("boot dependency should register");
 
         registry.boot_all(&state).await.expect("boot should succeed");
-        let outcome = registry.finalize_all(&state).await.expect("finalize should succeed");
+        let outcome = registry
+            .finalize_all(&state)
+            .await
+            .expect("finalize should succeed");
         assert!(outcome.is_complete());
         assert_eq!(outcome.finalized_count(), 2);
 
         let seen = state.seen.lock().expect("test log poisoned").clone();
         assert_eq!(
             seen,
-            vec!["boot-dependency", "boot-recorder", "finalize-recorder", "finalize-dependency",]
+            vec![
+                "boot-dependency",
+                "boot-recorder",
+                "finalize-recorder",
+                "finalize-dependency",
+            ]
         );
     }
 
@@ -1696,8 +1848,11 @@ mod tests {
             .insert(Arc::new(CycleB))
             .expect("cycle B should register");
 
-        let err = registry.validate_all(&state).expect_err("cycle must be rejected");
-        assert!(err.to_string().contains("provider lifecycle order cycle detected"));
+        let err =
+            registry.validate_all(&state).expect_err("cycle must be rejected");
+        assert!(
+            err.to_string().contains("provider lifecycle order cycle detected")
+        );
     }
 
     struct Reloads;
@@ -1799,15 +1954,24 @@ mod tests {
             .insert(Arc::new(Reloads))
             .expect("successful reloader should register");
 
-        let outcome = registry.reload_all(&state).await.expect("broadcast should complete");
+        let outcome = registry
+            .reload_all(&state)
+            .await
+            .expect("broadcast should complete");
 
         assert!(!outcome.is_complete());
         assert_eq!(outcome.reloaded_count(), 1);
         assert_eq!(outcome.failed_count(), 1);
         let failure = &outcome.failures()[0];
         assert_eq!(failure.provider(), "fails-reload");
-        assert!(matches!(failure.error(), Error::Reload { name: "fails-reload", .. }));
-        assert_eq!(failure.error().to_string(), "reload of 'fails-reload' failed: reload rejected");
+        assert!(matches!(
+            failure.error(),
+            Error::Reload { name: "fails-reload", .. }
+        ));
+        assert_eq!(
+            failure.error().to_string(),
+            "reload of 'fails-reload' failed: reload rejected"
+        );
     }
 
     #[tokio::test]
@@ -1820,14 +1984,20 @@ mod tests {
             .insert(Arc::new(FailsFinalize))
             .expect("failing finalizer should register");
 
-        let outcome = registry.finalize_all(&state).await.expect("finalization should complete");
+        let outcome = registry
+            .finalize_all(&state)
+            .await
+            .expect("finalization should complete");
 
         assert!(!outcome.is_complete());
         assert_eq!(outcome.finalized_count(), 1);
         assert_eq!(outcome.failed_count(), 1);
         let failure = &outcome.failures()[0];
         assert_eq!(failure.provider(), "fails-finalize");
-        assert!(matches!(failure.error(), Error::Finalize { name: "fails-finalize", .. }));
+        assert!(matches!(
+            failure.error(),
+            Error::Finalize { name: "fails-finalize", .. }
+        ));
         assert_eq!(
             failure.error().to_string(),
             "finalize of 'fails-finalize' failed: finalize rejected"

@@ -79,3 +79,9 @@ pub trait HasRegistry: SharedState {
 pub trait HasEvents: SharedState {
     fn events(&self) -> &ProcessEventBus;
 }
+
+/// The application's common configuration reader and snapshot catalog.
+#[cfg(feature = "config-watch")]
+pub trait HasConfigReader: SharedState {
+    fn config_reader(&self) -> &congif::ConfigReader;
+}

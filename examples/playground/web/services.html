@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Continuo · Services</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <aside class="rail">
+    <a class="mark" href="/" aria-label="Continuo home"><svg viewBox="0 0 40 40" fill="none" aria-hidden="true"><path d="M29 10H17a10 10 0 0 0 0 20h12M11 16h12a4 4 0 0 1 0 8H11" stroke="currentColor" stroke-width="4" stroke-linecap="round"/></svg></a>
+    <a class="rail-link" href="/" title="Playground">◈</a>
+    <span class="rail-link selected" title="Services">▤</span>
+    <span class="rail-bottom">⌘</span>
+  </aside>
+  <div class="shell">
+    <header><a class="wordmark" href="/">continuo<span> / services</span></a><span class="environment"><i></i> LOCAL INSTANCE</span></header>
+    <main>
+      <div class="page-heading"><div><p class="eyebrow">SERVICE REGISTRY</p><h1>Every service.<br><span>In its own rhythm.</span></h1><p class="intro">{{count}} managed services · one shared lifecycle.</p></div><button id="refresh-services">↻ Refresh status</button></div>
+      <div class="service-grid">{{services}}</div>
+      <p id="action-status" class="muted" role="status"></p>
+      <footer><span>Built with <strong>continuo</strong> + <strong>congif</strong></span><nav><a href="/">Counter playground ↗</a></nav></footer>
+    </main>
+  </div>
+</body>
+</html>

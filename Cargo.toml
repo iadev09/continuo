@@ -16,8 +16,9 @@ exclude = ["/Cargo.lock", "/justfile", "/rustfmt.toml", "/.idea/**"]
 
 [features]
 default = ["registry"]
-full = ["registry", "support", "events"]
+full = ["registry", "support", "events","config-watch"]
 events = ["dep:dashmap"]
+config-watch = ["events", "registry", "congif/watch"]
 registry = []
 support = []
 
@@ -28,16 +29,24 @@ all-features = true
 
 [dependencies]
 async-trait = "0.1"
+congif = { path = "../congif" }
 dashmap = { version = "6", optional = true }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-util = "0.7"
 tracing = "0.1"
 
 [dev-dependencies]
+continuo = { path = ".", features = ["full"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
 axum = "0.8"
+dotenvy = "0.15"
+congif = { path = "../congif", features = ["json", "watch"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+futures-util = "0.3"
 tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal"] }
 
 [[example]]
-name = "counter"
-path = "examples/counter/main.rs"
-required-features = ["registry"]
+name = "playground"
+path = "examples/playground/main.rs"

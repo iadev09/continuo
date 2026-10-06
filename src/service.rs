@@ -176,10 +176,17 @@ impl fmt::Display for ServiceManagerError {
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
         match self {
-            Self::RuntimeUnavailable => f.write_str("service runtime is unavailable"),
-            Self::NotFound(name) => write!(f, "runnable service '{name}' is not registered"),
+            Self::RuntimeUnavailable => {
+                f.write_str("service runtime is unavailable")
+            }
+            Self::NotFound(name) => {
+                write!(f, "runnable service '{name}' is not registered")
+            }
             Self::Unavailable(name) => {
-                write!(f, "runnable service '{name}' is unavailable on this runtime")
+                write!(
+                    f,
+                    "runnable service '{name}' is unavailable on this runtime"
+                )
             }
             Self::NotReloadable(name) => {
                 write!(f, "runnable service '{name}' is not reloadable")
@@ -187,7 +194,9 @@ impl fmt::Display for ServiceManagerError {
             Self::Busy { name, status } => {
                 write!(f, "service '{name}' is currently {status}")
             }
-            Self::ShuttingDown => f.write_str("service runtime is shutting down"),
+            Self::ShuttingDown => {
+                f.write_str("service runtime is shutting down")
+            }
             Self::OperationFailed { name, message } => {
                 write!(f, "service '{name}' operation failed: {message}")
             }
@@ -197,8 +206,10 @@ impl fmt::Display for ServiceManagerError {
 
 impl std::error::Error for ServiceManagerError {}
 
-type SnapshotReply = oneshot::Sender<Result<ServiceSnapshot, ServiceManagerError>>;
-type ListReply = oneshot::Sender<Result<Vec<ServiceSnapshot>, ServiceManagerError>>;
+type SnapshotReply =
+    oneshot::Sender<Result<ServiceSnapshot, ServiceManagerError>>;
+type ListReply =
+    oneshot::Sender<Result<Vec<ServiceSnapshot>, ServiceManagerError>>;
 
 pub(crate) enum ServiceCommand {
     List { reply: ListReply },
@@ -233,7 +244,9 @@ impl ServiceManager {
         (Arc::new(Self { commands }), receiver)
     }
 
-    pub async fn list(&self) -> Result<Vec<ServiceSnapshot>, ServiceManagerError> {
+    pub async fn list(
+        &self
+    ) -> Result<Vec<ServiceSnapshot>, ServiceManagerError> {
         let (reply, result) = oneshot::channel();
         self.commands
             .send(ServiceCommand::List { reply })
