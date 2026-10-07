@@ -15,6 +15,45 @@ use crate::state::SharedState;
 #[cfg(feature = "registry")]
 use crate::{HasRegistry, Register};
 
+/// Apply one reload with the catalog bound during runtime configuration.
+/// Native file watching is only an invalidation source, not a prerequisite.
+async fn apply_configured_reload<S: 'static>(
+    reader: Option<&congif::ConfigReader>,
+    provider: &dyn Provider<S>,
+    reloadable: &dyn crate::Reloadable<S>,
+    state: &S,
+    config_prepared: bool,
+) -> Result<()> {
+    let candidate =
+        if let Some(owner) = provider.as_configurable() {
+            let reader = reader.ok_or_else(|| Error::msg(
+            "configure the runtime before reloading a configurable service",
+        ))?;
+            if !config_prepared {
+                reader.prepare_owners(&[owner]).await?;
+            }
+            reader.prepared_config(owner)
+        } else {
+            None
+        };
+    if config_prepared
+        && let (Some(reader), Some(owner)) =
+            (reader, provider.as_configurable())
+    {
+        reader.notify_changed(owner).await?;
+        return Ok(());
+    }
+    reloadable.reload(state).await?;
+    if let (Some(reader), Some(candidate)) = (reader, candidate) {
+        reader.confirm_applied(candidate).await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "../tests/runtime/config_reload.rs"]
+mod config_reload_tests;
+
 struct ServiceExit {
     name: &'static str,
     generation: u64,
@@ -72,6 +111,10 @@ pub struct Runtime<S> {
     manager: Arc<ServiceManager>,
     commands: mpsc::Receiver<ServiceCommand>,
     shutting_down: bool,
+    // Configuration is a runtime capability, independent of native watching.
+    config_reader: Option<fn(&S) -> &congif::ConfigReader>,
+    #[cfg(feature = "fleet")]
+    dispatcher: Option<Arc<dyn crate::fleet::Dispatcher<S>>>,
     #[cfg(feature = "config-watch")]
     configuration: Option<crate::watcher::ConfigurationWatch<S>>,
 }
@@ -87,6 +130,9 @@ impl<S> Default for Runtime<S> {
             manager,
             commands,
             shutting_down: false,
+            config_reader: None,
+            #[cfg(feature = "fleet")]
+            dispatcher: None,
             #[cfg(feature = "config-watch")]
             configuration: None,
         }
@@ -137,6 +183,55 @@ impl<S: HasRegistry + 'static> Runtime<S> {
     }
 }
 
+#[cfg(feature = "registry")]
+impl<S: HasRegistry + congif::HasConfigReader> Runtime<S> {
+    /// Prepare and validate all registered config owners before resources run.
+    /// Providers do not need a boot hook merely to initialize configuration.
+    pub async fn configure(
+        &mut self,
+        state: &S,
+    ) -> Result<()> {
+        if self.state.is_some() {
+            return Err(Error::msg("configure services before spawning them"));
+        }
+        let providers = state.registry_ref().lifecycle_entries()?;
+        let owners: Vec<_> = providers
+            .iter()
+            .filter_map(|(_, provider)| provider.as_configurable())
+            .collect();
+        state.config_reader().initialize_owners(&owners).await?;
+        for registration in owners {
+            state.config_reader().configure_registered(registration).await?;
+        }
+        // Programs are declared from the applied configuration, so their
+        // environments are prepared once every owner has been configured.
+        prepare_programs(state.config_reader(), &providers)?;
+        #[cfg(feature = "config-watch")]
+        if let Some(watching) = self.configuration.as_mut() {
+            watching.refresh_sources(state)?;
+        }
+        self.config_reader = Some(S::config_reader);
+        Ok(())
+    }
+}
+
+/// Register or replace the program environments of every `Environmental`
+/// provider among `providers`, from their applied configurations.
+fn prepare_programs<S: 'static>(
+    reader: &congif::ConfigReader,
+    providers: &[(std::any::TypeId, Arc<dyn Provider<S>>)],
+) -> Result<()> {
+    for (owner, provider) in providers {
+        if let Some(environmental) = provider.as_environmental() {
+            reader.prepare_programs(
+                *owner,
+                environmental.program_environments(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "config-watch")]
 impl<S: HasRegistry + crate::HasEvents + crate::HasConfigReader> Runtime<S> {
     /// Register services and prepare automatic config watching before boot.
@@ -153,6 +248,7 @@ impl<S: HasRegistry + crate::HasEvents + crate::HasConfigReader> Runtime<S> {
         // the previous watcher alive until its replacement is prepared.
         self.configuration =
             Some(crate::watcher::ConfigurationWatch::new(state)?);
+        self.config_reader = Some(S::config_reader);
         Ok(self)
     }
 
@@ -173,6 +269,7 @@ impl<S: HasRegistry + crate::HasEvents + crate::HasConfigReader> Runtime<S> {
         }
         self.configuration =
             Some(crate::watcher::ConfigurationWatch::new(state)?);
+        self.config_reader = Some(S::config_reader);
         Ok(())
     }
 }
@@ -181,6 +278,22 @@ impl<S> Runtime<S>
 where
     S: SharedState,
 {
+    /// Install fleet coordination before submitting any runnable services.
+    /// Local management remains owned by this runtime, not by the adapter.
+    #[cfg(feature = "fleet")]
+    pub fn with_dispatcher(
+        mut self,
+        dispatcher: Arc<dyn crate::fleet::Dispatcher<S>>,
+    ) -> Result<Self> {
+        if self.state.is_some() {
+            return Err(Error::msg(
+                "install dispatcher before spawning services",
+            ));
+        }
+        self.dispatcher = Some(dispatcher);
+        Ok(self)
+    }
+
     /// Register and start all runnable providers.
     ///
     /// Runnable names must be unique because they are the stable management
@@ -197,6 +310,24 @@ where
         }
 
         let runnables = registry.runnable_entries()?;
+        #[cfg(feature = "fleet")]
+        let runnables: Vec<_> = runnables
+            .into_iter()
+            .filter(|entry| {
+                let scope = entry
+                    .provider
+                    .as_scoped()
+                    .map(crate::fleet::Scoped::scope)
+                    .or_else(|| {
+                        entry
+                            .provider
+                            .as_dispatched()
+                            .map(|placement| placement.scope())
+                    })
+                    .unwrap_or_default();
+                scope.includes(state.process_scope())
+            })
+            .collect();
         let mut names = HashSet::with_capacity(runnables.len());
         for entry in &runnables {
             if !names.insert(entry.name) {
@@ -204,6 +335,26 @@ where
                 return Err(Error::msg(format!(
                     "duplicate runnable service name '{name}'"
                 )));
+            }
+            #[cfg(feature = "fleet")]
+            if let Some(placement) = entry.provider.as_dispatched()
+                && placement.dispatch().is_controller_driven()
+            {
+                let dispatcher = self.dispatcher.as_ref().ok_or_else(|| {
+                    Error::msg(format!(
+                        "service '{}' requires a fleet dispatcher",
+                        entry.name
+                    ))
+                })?;
+                dispatcher.validate(
+                    &crate::fleet::DispatchRequest {
+                        name: entry.name,
+                        generation: 1,
+                        scope: placement.scope(),
+                        dispatch: placement.dispatch(),
+                    },
+                    &state,
+                )?;
             }
         }
 
@@ -275,10 +426,30 @@ where
         let service = self.services.get_mut(name).ok_or_else(|| {
             Error::msg(format!("runnable service '{name}' is not registered"))
         })?;
-        service.generation =
+        let generation =
             service.generation.checked_add(1).ok_or_else(|| {
                 Error::msg(format!("service '{name}' generation overflow"))
             })?;
+        #[cfg(feature = "fleet")]
+        let dispatch = match service.provider.as_dispatched() {
+            Some(placement) if placement.dispatch().is_controller_driven() => {
+                let request = crate::fleet::DispatchRequest {
+                    name,
+                    generation,
+                    scope: placement.scope(),
+                    dispatch: placement.dispatch(),
+                };
+                let dispatcher = self.dispatcher.clone().ok_or_else(|| {
+                    Error::msg(format!(
+                        "service '{name}' requires a fleet dispatcher"
+                    ))
+                })?;
+                dispatcher.validate(&request, &state)?;
+                Some((dispatcher, request))
+            }
+            _ => None,
+        };
+        service.generation = generation;
         service.status = ServiceStatus::Running;
         service.last_error = None;
 
@@ -291,10 +462,23 @@ where
         let abort = self.join_set.spawn(
             async move {
                 let context = RunContext::new(cancellation);
-                let result = runnable
-                    .run(state, context)
-                    .await
-                    .map_err(|e| e.into_run(name));
+                #[cfg(feature = "fleet")]
+                let result = if let Some((dispatcher, request)) = dispatch {
+                    dispatcher
+                        .run(
+                            request,
+                            crate::fleet::ServiceExecution::new(
+                                runnable, state,
+                            ),
+                            context,
+                        )
+                        .await
+                } else {
+                    runnable.run(state, context).await
+                };
+                #[cfg(not(feature = "fleet"))]
+                let result = runnable.run(state, context).await;
+                let result = result.map_err(|e| e.into_run(name));
                 ServiceExit { name, generation, result }
             }
             .instrument(
@@ -333,8 +517,6 @@ where
         command: ServiceCommand,
         config_prepared: bool,
     ) {
-        #[cfg(not(feature = "config-watch"))]
-        let _ = config_prepared;
         if self.shutting_down {
             Self::reject_command(command, ServiceManagerError::ShuttingDown);
             return;
@@ -473,22 +655,18 @@ where
                         return;
                     }
                 };
-                #[cfg(feature = "config-watch")]
-                let prepared = if config_prepared {
-                    Ok(())
-                } else if let Some(watching) = &self.configuration {
-                    watching.prepare_provider(&state, provider.as_ref()).await
-                } else {
-                    Ok(())
-                };
-                #[cfg(not(feature = "config-watch"))]
-                let prepared: Result<()> = Ok(());
-                let reload = async {
-                    prepared?;
-                    reloadable.reload(&state).await
-                }
+                let reader = self.config_reader.map(|reader| reader(&state));
+                let reload = apply_configured_reload(
+                    reader,
+                    provider.as_ref(),
+                    reloadable,
+                    &state,
+                    config_prepared,
+                )
                 .await
-                .map_err(|error| error.into_reload(static_name).to_string());
+                .map_err(|error: Error| {
+                    error.into_reload(static_name).to_string()
+                });
                 let service = self
                     .services
                     .get_mut(static_name)
@@ -708,7 +886,7 @@ where
         changes: Vec<crate::watcher::ConfigurationChanged>,
     ) {
         let Some(state) = self.state.as_ref() else { return };
-        let Some(watching) = self.configuration.as_ref() else { return };
+        let Some(watching) = self.configuration.as_mut() else { return };
         let providers = match watching.prepare(state, changes).await {
             Ok(providers) => providers,
             Err(error) => {
@@ -717,11 +895,11 @@ where
             }
         };
         for provider in providers {
-            let Some(reloadable) = provider.as_reloadable() else { continue };
             let name = provider.name();
-            let result = if self.services.get(name).is_some_and(|service| {
-                Arc::ptr_eq(&service.provider, &provider)
-            }) {
+            let result = if provider.as_reloadable().is_some()
+                && self.services.get(name).is_some_and(|service| {
+                    Arc::ptr_eq(&service.provider, &provider)
+                }) {
                 let (reply, received) = oneshot::channel();
                 // Already inside the runtime loop: call the command handler,
                 // never enqueue a manager command and await ourselves.
@@ -740,10 +918,40 @@ where
                     })
             } else {
                 let Some(state) = self.state.as_ref() else { continue };
-                reloadable.reload(state).await
+                match provider.as_configurable() {
+                    Some(owner) => {
+                        (self.config_reader.expect("watch binds reader"))(state)
+                            .notify_changed(owner)
+                            .await
+                            .map_err(Error::from)
+                    }
+                    None => continue,
+                }
             };
             if let Err(error) = result {
                 error!(provider = name, %error, "configuration reload rejected");
+                continue;
+            }
+            // A reloaded configuration may declare programs differently.
+            if let (Some(state), Some(environmental)) =
+                (self.state.as_ref(), provider.as_environmental())
+            {
+                let reader =
+                    (self.config_reader.expect("watch binds reader"))(state);
+                if let Err(error) = reader.prepare_programs(
+                    (*provider).type_id(),
+                    environmental.program_environments(),
+                ) {
+                    error!(provider = name, %error, "program environments rejected");
+                }
+            }
+        }
+        if let (Some(state), Some(watching)) =
+            (self.state.as_ref(), self.configuration.as_mut())
+        {
+            watching.deliver_program_changes(state);
+            if let Err(error) = watching.refresh_sources(state) {
+                error!(%error, "configuration dependency watch update failed");
             }
         }
     }

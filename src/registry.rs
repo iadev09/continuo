@@ -497,15 +497,24 @@ impl ProviderOrder {
 
 #[async_trait]
 pub trait ReloadState: Send + Sync + Sized + 'static {
+    /// Optional configuration catalog for explicit broadcast reloads.
+    /// The registry prepares all owners before calling application/provider
+    /// hooks, and acknowledges each candidate only after successful application.
+    /// States without configuration retain the ordinary lifecycle-only path.
+    fn reload_config_reader(&self) -> Option<&congif::ConfigReader> {
+        None
+    }
+
     async fn reload(&self) -> Result<()>;
 }
 
 /// Anything that can hot-reload itself when config changes.
 ///
-/// `reload()` is the same shape as `Provider::boot()` — re-read the
-/// on-disk config (use `tokio::fs`, never `std::fs` in this async path)
-/// and rebuild the runtime snapshot, publishing it through an
-/// `ArcSwap` so in-flight requests/connections see the swap atomically.
+/// Configurable providers consume the candidate already prepared by Congif;
+/// they do not read sources again. The hook applies provider-owned resources
+/// and runtime values. A successful return acknowledges that application,
+/// while a failure leaves the candidate unacknowledged for a later retry.
+/// Providers outside Congif retain ownership of their own reload inputs.
 /// Reload must NOT change which providers are registered; it only
 /// refreshes state of an already-registered provider.
 #[async_trait]
@@ -738,8 +747,35 @@ pub trait Provider<S>: Any + Send + Sync + 'static {
         None
     }
 
+    /// Optional placement metadata for an application-owned fleet adapter.
+    /// The default is treated as `Scope::Worker`. Runtime consults this before
+    /// creating local runnable entries; provider/configuration registration
+    /// remains intact. Scope is sampled at initial runnable submission.
+    #[cfg(feature = "fleet")]
+    fn as_scoped(&self) -> Option<&dyn crate::fleet::Scoped> {
+        None
+    }
+
+    /// Optional dispatch metadata for a fleet execution adapter.
+    /// An absent capability means `Dispatch::Each`. The adapter selects among
+    /// scope-eligible processes; this hook neither arbitrates ownership nor
+    /// changes local service activation. It applies to runnable execution,
+    /// not provider construction, boot or configuration.
+    #[cfg(feature = "fleet")]
+    fn as_dispatched(&self) -> Option<&dyn crate::fleet::Dispatched> {
+        None
+    }
+
     /// Optional config-source discovery for application-owned notification.
-    fn as_configurable(&self) -> Option<&dyn congif::ConfigOwner> {
+    fn as_configurable(&self) -> Option<&dyn congif::ConfigRegistration> {
+        None
+    }
+
+    /// Optional declaration of the environments this provider's programs are
+    /// started with. Asked after `configure` and after a reload; the reader
+    /// keeps one node per program and the runtime delivers a re-read file
+    /// through `Environmental::environment_changed`.
+    fn as_environmental(&self) -> Option<&dyn congif::Environmental> {
         None
     }
 
@@ -1254,14 +1290,50 @@ where
         &self,
         state: &S,
     ) -> Result<ReloadOutcome> {
+        let providers = self.lifecycle_plan()?;
+        let reader = state.reload_config_reader();
+        if let Some(reader) = reader {
+            let owners: Vec<_> = providers
+                .iter()
+                .filter_map(|provider| provider.as_configurable())
+                .collect();
+            reader.prepare_owners(&owners).await?;
+            // A reload re-reads program environments as it re-reads
+            // configuration: the declarations from the prepared config, then
+            // every file they name.
+            for provider in &providers {
+                let Some(environmental) = provider.as_environmental() else {
+                    continue;
+                };
+                let owner = (**provider).type_id();
+                reader.prepare_programs(
+                    owner,
+                    environmental.program_environments(),
+                )?;
+                reader.refresh_programs(owner)?;
+            }
+        }
         state.reload().await?;
 
         let mut outcome = ReloadOutcome::default();
 
-        for provider in self.lifecycle_plan()? {
+        for provider in providers {
             let name = provider.name();
             if let Some(reloadable) = provider.as_reloadable() {
-                match reloadable.reload(state).await {
+                let prepared = reader.and_then(|reader| {
+                    provider
+                        .as_configurable()
+                        .and_then(|owner| reader.prepared_config(owner))
+                });
+                let result = async {
+                    reloadable.reload(state).await?;
+                    if let (Some(reader), Some(prepared)) = (reader, prepared) {
+                        reader.confirm_applied(prepared).await?;
+                    }
+                    Ok::<(), Error>(())
+                }
+                .await;
+                match result {
                     Ok(()) => outcome.reloaded_count += 1,
                     Err(error) => outcome.failures.push(ReloadFailure {
                         provider: name,

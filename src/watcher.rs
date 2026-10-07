@@ -42,14 +42,21 @@ impl<S: HasEvents + HasRegistry + HasConfigReader> ConfigurationWatch<S> {
             let Some(configurable) = provider.as_configurable() else {
                 continue;
             };
-            let sources = configurable.sources();
+            if !configurable.observes_config() {
+                continue;
+            }
+            let mut sources =
+                state.config_reader().sources_for(configurable)?;
+            if provider.as_environmental().is_some() {
+                sources.extend(state.config_reader().program_sources(owner)?);
+            }
             if sources.is_empty() {
                 continue;
             }
             if watcher.is_none() {
                 let events = state.events().clone();
                 watcher = Some(ConfigWatcher::new(move |error| {
-                    eprintln!("configuration watch failed: {error}");
+                    tracing::error!(%error, "configuration watch failed");
                     events.emit(ConfigurationChanged {
                         owner: None,
                         paths: Vec::new(),
@@ -78,9 +85,61 @@ impl<S: HasEvents + HasRegistry + HasConfigReader> ConfigurationWatch<S> {
 }
 
 impl<S: 'static> ConfigurationWatch<S> {
+    /// Reading can add or remove dependencies even if schema validation fails.
+    /// Keep the single watcher in sync so a correction triggers another try.
+    pub fn refresh_sources(
+        &mut self,
+        state: &S,
+    ) -> Result<()> {
+        let Some(watcher) = self.watcher.as_mut() else { return Ok(()) };
+        for (owner, provider) in (self.registry)(state).provider_entries() {
+            let Some(configurable) = provider.as_configurable() else {
+                continue;
+            };
+            if configurable.observes_config() {
+                let reader = (self.reader)(state);
+                let mut sources = reader.sources_for(configurable)?;
+                if provider.as_environmental().is_some() {
+                    sources.extend(reader.program_sources(owner)?);
+                }
+                watcher.update_owner_paths(owner, sources)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Tell each owner which of its programs had a file re-read by the batch
+    /// just prepared; the owner decides what follows.
+    pub fn deliver_program_changes(
+        &self,
+        state: &S,
+    ) {
+        let changes = match (self.reader)(state).take_program_changes() {
+            Ok(changes) => changes,
+            Err(error) => {
+                tracing::error!(%error, "program environment changes unavailable");
+                return;
+            }
+        };
+        for (owner, program, snapshot) in changes {
+            let Some(provider) = (self.registry)(state).resolve_provider(owner)
+            else {
+                continue;
+            };
+            if let Some(environmental) = provider.as_environmental() {
+                tracing::debug!(
+                    provider = provider.name(),
+                    program,
+                    "program environment re-read"
+                );
+                environmental.environment_changed(&program, &snapshot);
+            }
+        }
+    }
+
     /// Prepare all owners affected by these files before publishing any config.
     pub async fn prepare(
-        &self,
+        &mut self,
         state: &S,
         changes: Vec<ConfigurationChanged>,
     ) -> Result<Vec<Arc<dyn Provider<S>>>> {
@@ -108,7 +167,10 @@ impl<S: 'static> ConfigurationWatch<S> {
             .lifecycle_entries()?
             .into_iter()
             .filter(|(owner, provider)| {
-                owners.contains(owner) && provider.as_configurable().is_some()
+                owners.contains(owner)
+                    && provider
+                        .as_configurable()
+                        .is_some_and(|owner| owner.observes_config())
             })
             .collect();
         let configs: Vec<_> = entries
@@ -117,18 +179,38 @@ impl<S: 'static> ConfigurationWatch<S> {
                 provider.as_configurable().expect("filtered configurable")
             })
             .collect();
-        (self.reader)(state).prepare_owners(&configs).await?;
-        Ok(entries.into_iter().map(|(_, provider)| provider).collect())
-    }
-
-    pub async fn prepare_provider(
-        &self,
-        state: &S,
-        provider: &dyn Provider<S>,
-    ) -> Result<()> {
-        let Some(config) = provider.as_configurable() else { return Ok(()) };
-        (self.reader)(state).prepare_owners(&[config]).await?;
-        Ok(())
+        let reader = (self.reader)(state);
+        let changed =
+            if all || changes.iter().any(|event| event.paths.is_empty()) {
+                reader.prepare_changed_owners(&configs).await
+            } else {
+                reader.prepare_changed_sources(&configs, &paths).await
+            };
+        let refreshed = self.refresh_sources(state);
+        // Report the preparation error without dropping watch routing for
+        // paths discovered before it. No runtime resources were applied.
+        let changed = match changed {
+            Ok(changed) => {
+                refreshed?;
+                changed
+            }
+            Err(error) => {
+                if let Err(watch_error) = refreshed {
+                    tracing::error!(%watch_error, "configuration dependency watch update failed");
+                }
+                return Err(error.into());
+            }
+        };
+        tracing::debug!(
+            prepared = configs.len(),
+            changed = changed.len(),
+            "configuration batch prepared"
+        );
+        Ok(entries
+            .into_iter()
+            .filter(|(owner, _)| changed.contains(owner))
+            .map(|(_, provider)| provider)
+            .collect())
     }
 
     pub async fn next(

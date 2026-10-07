@@ -178,6 +178,7 @@ same instance into additional work:
 | Trait | Capability exposed by `Provider` |
 | --- | --- |
 | `Configurable` | `as_configurable` |
+| `Environmental` | `as_environmental` |
 | `Reloadable<S>` | `as_reloadable` |
 | `Runnable<S>` | `as_runnable` |
 | `Finalizable<S>` | `as_finalizable` |
@@ -211,31 +212,57 @@ dependencies. Run priority controls spawn order separately.
 Continuo re-exports Congif's `Configurable` trait. It does not define a second
 configuration contract.
 
-A configurable owner declares its configuration type, sources and reading
-logic. Validation belongs to that owner:
+For explicit broadcast reloads, a state can expose its reader through
+`ReloadState::reload_config_reader`. `Registry::reload_all` prepares and validates
+all registered config owners before invoking any state or provider reload hook.
+It acknowledges each exact candidate only after its provider succeeds. Rejected
+preparation runs no hooks; failed resource application remains retryable. An
+explicit reload still invokes every reloadable provider, even if its config is
+unchanged. File notifications retain the changed-owner-only path.
+
+`Runtime::configure` also binds the state's reader for targeted `ServiceManager`
+reloads. Reading, validation and successful-application acknowledgement work
+without a native watcher or the `config-watch` feature. A configurable service
+cannot silently reload stale configuration when no reader has been bound;
+that request returns an error. Watching only supplies automatic invalidations.
+
+A configurable component declares its configuration type and one source.
+Congif reads and validates the batch before invoking startup callbacks:
 
 ~~~rust
 #[async_trait]
 impl Configurable for CounterService {
     type Config = CounterConfig;
 
-    fn sources(&self) -> Vec<PathBuf> {
-        vec![self.config_path.clone()]
+    fn as_config_observer(&self) -> Option<&dyn congif::ConfigObserver<Config = Self::Config>> {
+        Some(self)
+    }
+
+    fn source(&self) -> congif::ConfigFile {
+        congif::ConfigFile {
+            path: self.config_path.clone(),
+            format: congif::Format::Json,
+        }
     }
 
     async fn configure(
         &self,
-        reader: &congif::ConfigReader,
-    ) -> congif::Result<Self::Config> {
-        reader.read(&self.config_path).await
+        config: &Self::Config,
+    ) -> congif::Result<()> {
+        // Apply the prepared candidate without reading its source again.
+        self.apply_candidate(config).await
     }
 
     // validate_config rejects an increment of zero.
 }
 ~~~
 
+Implement `congif::ConfigObserver::config_changed(&Self::Config)` to apply the
+new typed candidate without reading sources again. Owners returning `None`
+are still configurable and manually reloadable, but are not watched.
+
 The [full implementation](examples/playground/app/providers/counter.rs)
-includes validation and applies a prepared snapshot during boot and reload.
+includes validation and receives prepared candidates through this observer.
 
 Congif owns parsers, reads and configuration snapshots. Providers own their
 schema, validation and runtime application. Snapshots are indexed by owner
@@ -243,11 +270,23 @@ type, so two owners can use the same configuration type independently.
 
 With `config-watch` enabled:
 
-1. The runtime installs watches before provider boot.
+1. The runtime installs watches for owners exposing a config observer.
 2. Congif reports a changed source; the affected owners are resolved from the registry.
 3. Their configurations are prepared and validated in dependency order.
 4. A successful batch publishes its configuration snapshots together.
-5. The runtime invokes the affected providers' reload capabilities.
+5. The runtime invokes the affected owners' typed `config_changed` hooks.
+
+Manual service reloads continue to call `Reloadable::reload`. A file notification
+does not need an `EnvObserver`, a per-provider channel or another runtime task.
+
+A provider whose programs start with environments of their own — a PHP
+application, a task's process — implements Congif's `Environmental` and exposes
+it through `as_environmental`. After `configure` and after every reload the
+runtime hands its declarations to the reader, which keeps one dotenw node per
+program; the program's files join the owner's watch registration, a change is
+read by the same batch as a configuration change, and the runtime calls
+`environment_changed(program, snapshot)` on the owner. The owner decides what
+follows; nothing restarts on its own.
 
 Watching shares native source watches; providers do not each create a polling
 loop or a configuration notification channel. Runtime consumption starts after
@@ -366,6 +405,7 @@ continuo = { version = "0.8", features = ["config-watch"] }
 | `events` | `ProcessEventBus` and `HasEvents` |
 | `config-watch` | Runtime configuration watching; includes `registry`, `events` and Congif's watcher |
 | `support` | `Gate`, `Permit`, `GuardGroup` and `Guard` |
+| `fleet` | Transport-neutral placement enums/traits and provider scope/dispatch hooks; no transport dependency |
 | `full` | All of the above |
 
 The registry and lifecycle traits remain available without default features.
@@ -374,6 +414,44 @@ Native configuration watching supports Linux, macOS and FreeBSD.
 Core dependencies are `async-trait`, Congif, Tokio, `tokio-util` and `tracing`.
 `dashmap` is optional through `events`. Axum and `tracing-subscriber` are
 example/dev dependencies; Continuo does not require an HTTP framework.
+
+The `fleet` feature supplies `Scope`, `Dispatch`, `Scoped` and `Dispatched`,
+not a fleet runtime. An application adapter owns membership, target selection
+and transport; `ServiceManager` continues to manage local executions.
+Providers expose scope through `as_scoped`, whose default is `None`.
+Runtime filters local runnable entries against `SharedState::process_scope`
+before adding management records. An absent scope means `Worker`, with
+`Dispatch::Each`: master execution requires an explicit `Master` or `Any`
+scope. The state's default role remains `Any`, appropriate for a combined
+single-process host, so standalone hosts still execute worker-scoped work.
+Excluded providers remain registered and participate in provider lifecycle;
+they have no local service-list or start/stop/reload management entry.
+Scope is sampled at initial runnable submission; live placement changes and
+distributed dispatch are not implemented by this hook.
+
+`Provider::as_dispatched` exposes optional `Dispatched` metadata; its default
+`None` means `Dispatch::Each`. A dispatch capability also declares its scope
+through `Dispatched: Scoped`. Scope-only providers may expose `as_scoped`;
+dispatch-capable providers expose `as_dispatched`. The fleet adapter, not
+Continuo, owns selection and coordination. No dispatch policy starts work or
+changes provider configuration by itself.
+
+Install a `fleet::Dispatcher<S>` with `Runtime::with_dispatcher` to execute
+`One` or `Pool` services. Without an adapter those policies are rejected
+before initial services start; they never silently fall back to `Each`.
+The adapter validates its policy synchronously, then owns selection for the
+whole generation through its asynchronous `run` method. It receives a
+`DispatchRequest`, a cloneable `ServiceExecution<S>` capability and the
+generation's `RunContext`.
+
+Runtime owns the controller future and local start/stop/restart commands.
+The adapter owns slot acquisition and renewal: acquire before executing,
+cancel local work when ownership is lost, and retain ownership through drain.
+It must await every child execution before returning. Pool capacity and lease
+policy are explicit adapter configuration, not inferred runtime defaults.
+`Running` describes the managed controller generation, even while it waits
+for fleet ownership; it does not claim that this process currently owns a slot.
+Transport implementations belong outside Continuo.
 
 ## Why the name?
 

@@ -1,0 +1,7 @@
+[http]
+env_file = "http.env"
+config_path = "config/http.json"
+
+[counter]
+env_file = "counter.env"
+config_path = "config/counter.json"
