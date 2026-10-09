@@ -19,7 +19,6 @@ pub mod events;
 pub mod gate;
 #[cfg(feature = "support")]
 pub mod guard;
-mod register;
 pub mod registry;
 mod runtime;
 mod service;
@@ -34,7 +33,7 @@ pub use events::{Event, ProcessEventBus, ShutdownInitiated};
 pub use gate::{Gate, GateDrainOutcome, Permit};
 #[cfg(feature = "support")]
 pub use guard::{Guard, GuardGroup};
-pub use register::Register;
+pub use registry::Register;
 pub use registry::{
     BoxError, Error, Finalizable, FinalizeFailure, FinalizeOutcome, Provider,
     ProviderOrder, Registry, ReloadFailure, ReloadOutcome, ReloadState,

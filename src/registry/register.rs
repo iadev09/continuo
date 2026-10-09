@@ -1,4 +1,4 @@
-use crate::Result;
+use super::Result;
 
 /// Static, application-owned service registration.
 ///
