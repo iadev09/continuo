@@ -28,6 +28,7 @@ pub mod state;
 #[cfg(feature = "config-watch")]
 mod watcher;
 
+#[cfg(feature = "config")]
 pub use congif::{ConfigObserver, Configurable};
 #[cfg(feature = "events")]
 pub use events::{Event, ProcessEventBus, ReloadRequired, ShutdownInitiated};
@@ -38,17 +39,17 @@ pub use gate::{Gate, GateDrainOutcome, Permit};
 #[cfg(feature = "support")]
 pub use guard::{Guard, GuardGroup};
 pub use registry::{
-    Bootable, BoxError, Component, ComponentOrder, Error, Finalizable,
-    FinalizeFailure, FinalizeOutcome, Provider, ProviderOrder, Register,
-    Registry, ReloadFailure, ReloadOutcome, ReloadState, Reloadable, Result,
-    Runnable, StdError, ValidationFailure, ValidationOutcome,
+    AnyComponent, AnyRunnable, Bootable, BoxError, Component, ComponentOrder,
+    Error, Finalizable, FinalizeFailure, FinalizeOutcome, MissingDependency,
+    Register, Registry, ReloadFailure, ReloadOutcome, ReloadState, Reloadable,
+    Resolve, Result, Runnable, StdError, ValidationFailure, ValidationOutcome,
 };
 pub use runtime::Runtime;
 pub use service::{
     RunContext, ServiceManager, ServiceManagerError, ServiceSnapshot,
     ServiceStartPolicy, ServiceStatus,
 };
-#[cfg(feature = "config-watch")]
+#[cfg(feature = "config")]
 pub use state::HasConfigReader;
 #[cfg(feature = "events")]
 pub use state::HasEvents;

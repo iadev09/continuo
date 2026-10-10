@@ -12,13 +12,10 @@ pub struct ReloadService;
 impl ReloadService {
     async fn reload_application(
         &self,
+        manager: &ServiceManager,
         state: &AppState,
     ) -> Result<()> {
         let registry = state.registry_ref();
-        let manager =
-            state.registry_ref().resolve::<ServiceManager>().ok_or_else(
-                || Error::msg("reload: service manager not registered"),
-            )?;
         let services = manager
             .list()
             .await
@@ -83,26 +80,32 @@ impl ReloadService {
 
 impl Register<AppState> for ReloadService {
     fn register(state: &AppState) -> Result<()> {
-        state.registry_ref().register_lifecycle(Arc::new(Self))?;
+        state.registry_ref().register(Arc::new(Self))?;
         Ok(())
     }
 }
 
 #[async_trait]
 impl Component<AppState> for ReloadService {
+    // Reload is meaningless without the manager: a hard dependency.
+    type Deps = (Arc<ServiceManager>,);
+
     fn name(&self) -> &'static str {
         "reload"
     }
 
-    fn as_runnable(self: Arc<Self>) -> Option<Arc<dyn Runnable<AppState>>> {
+    fn as_runnable(
+        self: Arc<Self>
+    ) -> Option<Arc<dyn Runnable<AppState, Self::Deps>>> {
         Some(self)
     }
 }
 
 #[async_trait]
-impl Runnable<AppState> for ReloadService {
+impl Runnable<AppState, (Arc<ServiceManager>,)> for ReloadService {
     async fn run(
         self: Arc<Self>,
+        (manager,): (Arc<ServiceManager>,),
         state: AppState,
         context: RunContext,
     ) -> Result<()> {
@@ -113,7 +116,7 @@ impl Runnable<AppState> for ReloadService {
                 request = requests.recv() => {
                     match request {
                         Ok(ReloadRequired) => {
-                            match self.reload_application(&state).await {
+                            match self.reload_application(&manager, &state).await {
                                 Ok(()) => tracing::info!("application reloaded"),
                                 Err(error) => tracing::error!(%error, "application reload failed"),
                             }

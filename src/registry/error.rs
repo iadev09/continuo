@@ -8,12 +8,12 @@
 // own semantics and intentionally do not share this type.
 //
 // Consumers return any `std::error::Error + Send + Sync + 'static`
-// from their `Provider` / `Reloadable` / `Runnable` / `Finalizable`
+// from their `Component` / `Reloadable` / `Runnable` / `Finalizable`
 // methods — the blanket
 // `From<E>` impl wraps it into `Error::Other`. The registry then re-wraps
 // `Error::Other` into the appropriate lifecycle variant (`Boot`, `Reload`,
 // `Run`, `Validate`) at the call site, so downstream logs and matches see
-// where the failure happened. Providers that want to emit a typed variant
+// where the failure happened. Components that want to emit a typed variant
 // themselves can construct it directly — the registry will leave it
 // untouched.
 
@@ -24,9 +24,11 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-    DuplicateProvider {
+    DuplicateComponent {
         type_name: &'static str,
     },
+    /// `validate_all` reported failures; nothing was started.
+    Invalid(super::ValidationOutcome),
     Boot {
         name: &'static str,
         source: BoxError,
@@ -40,6 +42,11 @@ pub enum Error {
         source: BoxError,
     },
     Finalize {
+        name: &'static str,
+        source: BoxError,
+    },
+    /// A dependency named by the component's `Deps` could not be resolved.
+    Dependency {
         name: &'static str,
         source: BoxError,
     },
@@ -66,20 +73,39 @@ impl std::fmt::Display for Error {
         f: &mut std::fmt::Formatter<'_>,
     ) -> std::fmt::Result {
         match self {
-            Error::DuplicateProvider { type_name } => {
-                write!(f, "provider type '{type_name}' is already registered")
+            Error::Invalid(outcome) => {
+                let names = outcome
+                    .failures()
+                    .iter()
+                    .map(|failure| failure.component())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "{} component(s) failed validation: {names}",
+                    outcome.failed_count()
+                )
+            }
+            Error::DuplicateComponent { type_name } => {
+                write!(f, "component type '{type_name}' is already registered")
             }
             Error::Boot { name, source } => {
-                write!(f, "provider '{name}' failed during boot: {source}")
+                write!(f, "component '{name}' failed during boot: {source}")
             }
             Error::Validate { name, source } => {
-                write!(f, "provider '{name}' failed during validate: {source}")
+                write!(f, "component '{name}' failed during validate: {source}")
             }
             Error::Reload { name, source } => {
                 write!(f, "reload of '{name}' failed: {source}")
             }
             Error::Finalize { name, source } => {
                 write!(f, "finalize of '{name}' failed: {source}")
+            }
+            Error::Dependency { name, source } => {
+                write!(
+                    f,
+                    "component '{name}' is missing a dependency: {source}"
+                )
             }
             Error::Run { name, source } => {
                 write!(f, "runnable '{name}' failed: {source}")
@@ -157,6 +183,7 @@ impl std::error::Error for StdError {
             | Error::Validate { source, .. }
             | Error::Reload { source, .. }
             | Error::Finalize { source, .. }
+            | Error::Dependency { source, .. }
             | Error::Other(source) => Some(source.as_ref()),
             _ => None,
         }
@@ -207,13 +234,23 @@ impl Error {
             other => other,
         }
     }
-    /// Attach provider identity to an anonymous reload error.
+    /// Attach component identity to an anonymous reload error.
     pub(crate) fn into_reload(
         self,
         name: &'static str,
     ) -> Self {
         match self {
             Error::Other(source) => Error::Reload { name, source },
+            other => other,
+        }
+    }
+    /// Attach the dependent component's identity to a resolution error.
+    pub(super) fn into_dependency(
+        self,
+        name: &'static str,
+    ) -> Self {
+        match self {
+            Error::Other(source) => Error::Dependency { name, source },
             other => other,
         }
     }
@@ -234,7 +271,7 @@ impl Error {
             Error::Other(source) => Error::Run { name, source },
             // Runnables that opt into recoverable failure construct
             // `Recoverable` with an empty `name`; `run_all` fills in the
-            // provider name here so log lines stay attributed.
+            // component name here so log lines stay attributed.
             Error::Recoverable { name: "", source } => {
                 Error::Recoverable { name, source }
             }
@@ -244,7 +281,7 @@ impl Error {
 
     /// Build a recoverable runnable error from an arbitrary message.
     /// The runtime logs this and lets the worker keep serving instead of
-    /// tearing it down. The provider `name` is filled in by `run_all`'s
+    /// tearing it down. The component `name` is filled in by `run_all`'s
     /// wrapper, so callers only supply the message.
     pub fn recoverable(s: impl Into<String>) -> Self {
         #[derive(Debug)]

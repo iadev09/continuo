@@ -67,34 +67,6 @@ async fn invalid_configuration_preserves_published_snapshot() {
 }
 
 #[tokio::test]
-async fn web_editor_validates_before_replacing_the_file() {
-    let reader = ConfigReader::new().with_builtin_parsers().unwrap();
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("counter.json");
-    tokio::fs::copy(fixture("valid.json"), &path).await.unwrap();
-    let service = service(path.clone(), directory.path().join("state.json"));
-    reader.initialize_owners(&[&service]).await.unwrap();
-    let before = tokio::fs::read(&path).await.unwrap();
-    let invalid =
-        tokio::fs::read_to_string(fixture("invalid.json")).await.unwrap();
-    assert!(
-        super::super::super::handlers::save_counter_config(
-            &reader, &service, &invalid
-        )
-        .await
-        .is_err()
-    );
-    assert_eq!(tokio::fs::read(&path).await.unwrap(), before);
-    let valid = tokio::fs::read_to_string(fixture("valid.json")).await.unwrap();
-    super::super::super::handlers::save_counter_config(
-        &reader, &service, &valid,
-    )
-    .await
-    .unwrap();
-    assert_eq!(reader.prepare(&service).await.unwrap().increment, 3);
-}
-
-#[tokio::test]
 async fn configuration_rejects_unknown_fields() {
     let reader = ConfigReader::new().with_builtin_parsers().unwrap();
     let directory = tempfile::tempdir().unwrap();

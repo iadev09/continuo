@@ -16,14 +16,15 @@ impl ReloadState for TestState {
     }
 }
 
-struct DbProvider;
-struct CacheProvider;
-struct ApiProvider;
-struct MetricsProvider;
+struct DbComponent;
+struct CacheComponent;
+struct ApiComponent;
+struct MetricsComponent;
 struct FailsValidation;
 
 #[async_trait]
-impl Provider<TestState> for DbProvider {
+impl Component<TestState> for DbComponent {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "db"
     }
@@ -38,13 +39,10 @@ impl Provider<TestState> for DbProvider {
 }
 
 #[async_trait]
-impl Provider<TestState> for CacheProvider {
+impl Component<TestState> for CacheComponent {
+    type Deps = (Arc<DbComponent>,);
     fn name(&self) -> &'static str {
         "cache"
-    }
-
-    fn order(&self) -> ProviderOrder {
-        ProviderOrder::new().after::<DbProvider>()
     }
 
     fn validate(
@@ -57,13 +55,10 @@ impl Provider<TestState> for CacheProvider {
 }
 
 #[async_trait]
-impl Provider<TestState> for ApiProvider {
+impl Component<TestState> for ApiComponent {
+    type Deps = (Arc<CacheComponent>,);
     fn name(&self) -> &'static str {
         "api"
-    }
-
-    fn order(&self) -> ProviderOrder {
-        ProviderOrder::new().after::<CacheProvider>()
     }
 
     fn validate(
@@ -76,13 +71,14 @@ impl Provider<TestState> for ApiProvider {
 }
 
 #[async_trait]
-impl Provider<TestState> for MetricsProvider {
+impl Component<TestState> for MetricsComponent {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "metrics"
     }
 
-    fn order(&self) -> ProviderOrder {
-        ProviderOrder::new().before::<ApiProvider>()
+    fn order(&self) -> ComponentOrder {
+        ComponentOrder::new().before::<ApiComponent>()
     }
 
     fn validate(
@@ -95,7 +91,8 @@ impl Provider<TestState> for MetricsProvider {
 }
 
 #[async_trait]
-impl Provider<TestState> for FailsValidation {
+impl Component<TestState> for FailsValidation {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "fails-validation"
     }
@@ -114,11 +111,11 @@ fn lifecycle_order_uses_type_dependencies() {
     let registry = Registry::<TestState>::new();
 
     registry
-        .register(Arc::new(ApiProvider))
+        .register(Arc::new(ApiComponent))
         .expect("api registration should succeed")
-        .register(Arc::new(CacheProvider))
+        .register(Arc::new(CacheComponent))
         .expect("cache registration should succeed")
-        .register(Arc::new(DbProvider))
+        .register(Arc::new(DbComponent))
         .expect("database registration should succeed");
 
     let outcome = registry.validate_all(&state).expect("validation should run");
@@ -130,26 +127,26 @@ fn lifecycle_order_uses_type_dependencies() {
 }
 
 #[test]
-fn duplicate_provider_registration_is_rejected_without_replacement() {
+fn duplicate_component_registration_is_rejected_without_replacement() {
     let registry = Registry::<TestState>::new();
-    let original = Arc::new(ApiProvider);
+    let original = Arc::new(ApiComponent);
 
     registry
         .register(original.clone())
         .expect("first registration should succeed");
-    let error = match registry.register(Arc::new(ApiProvider)) {
+    let error = match registry.register(Arc::new(ApiComponent)) {
         Err(error) => error,
         Ok(_) => panic!("duplicate registration must be rejected"),
     };
 
     assert!(matches!(
         error,
-        Error::DuplicateProvider { type_name }
-            if type_name == std::any::type_name::<ApiProvider>()
+        Error::DuplicateComponent { type_name }
+            if type_name == std::any::type_name::<ApiComponent>()
     ));
     let resolved = registry
-        .resolve::<ApiProvider>()
-        .expect("original provider should remain");
+        .resolve::<ApiComponent>()
+        .expect("original component should remain");
     assert!(Arc::ptr_eq(&resolved, &original));
 }
 
@@ -159,13 +156,13 @@ fn lifecycle_order_supports_before_edges_and_diagnostics() {
     let registry = Registry::<TestState>::new();
 
     registry
-        .register(Arc::new(ApiProvider))
+        .register(Arc::new(ApiComponent))
         .expect("api registration should succeed")
-        .register(Arc::new(MetricsProvider))
+        .register(Arc::new(MetricsComponent))
         .expect("metrics registration should succeed")
-        .register(Arc::new(CacheProvider))
+        .register(Arc::new(CacheComponent))
         .expect("cache registration should succeed")
-        .register(Arc::new(DbProvider))
+        .register(Arc::new(DbComponent))
         .expect("database registration should succeed");
 
     let names = registry.lifecycle_names().expect("plan should build");
@@ -180,13 +177,13 @@ fn lifecycle_order_supports_before_edges_and_diagnostics() {
 }
 
 #[test]
-fn validate_all_retains_provider_failures_and_continues() {
+fn validate_all_retains_component_failures_and_continues() {
     let state = TestState::default();
     let registry = Registry::<TestState>::new();
     registry
         .register(Arc::new(FailsValidation))
         .expect("failing validator should register")
-        .register(Arc::new(DbProvider))
+        .register(Arc::new(DbComponent))
         .expect("successful validator should register");
 
     let outcome =
@@ -203,7 +200,7 @@ fn validate_all_retains_provider_failures_and_continues() {
     ));
     assert_eq!(
         failure.error().to_string(),
-        "provider 'fails-validation' failed during validate: validation rejected"
+        "component 'fails-validation' failed during validate: validation rejected"
     );
     assert_eq!(
         state.seen.lock().expect("test log poisoned").as_slice(),
@@ -231,7 +228,8 @@ impl LogSink for FileLogger {
 }
 
 #[async_trait]
-impl Provider<TestState> for ConsoleLogger {
+impl Component<TestState> for ConsoleLogger {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "console-logger"
     }
@@ -245,6 +243,7 @@ impl Provider<TestState> for ConsoleLogger {
 impl Bootable<TestState> for ConsoleLogger {
     async fn boot(
         &self,
+        _deps: (),
         state: &TestState,
     ) -> Result<()> {
         state.seen.lock().expect("test log poisoned").push("console-logger");
@@ -253,7 +252,8 @@ impl Bootable<TestState> for ConsoleLogger {
 }
 
 #[async_trait]
-impl Provider<TestState> for FileLogger {
+impl Component<TestState> for FileLogger {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "file-logger"
     }
@@ -267,6 +267,7 @@ impl Provider<TestState> for FileLogger {
 impl Bootable<TestState> for FileLogger {
     async fn boot(
         &self,
+        _deps: (),
         state: &TestState,
     ) -> Result<()> {
         state.seen.lock().expect("test log poisoned").push("file-logger");
@@ -312,16 +313,13 @@ struct BootRecorder;
 struct BootDependency;
 
 #[async_trait]
-impl Provider<TestState> for BootRecorder {
+impl Component<TestState> for BootRecorder {
+    type Deps = (Arc<BootDependency>,);
     fn name(&self) -> &'static str {
         "boot-recorder"
     }
 
-    fn order(&self) -> ProviderOrder {
-        ProviderOrder::new().after::<BootDependency>()
-    }
-
-    fn as_bootable(&self) -> Option<&dyn Bootable<TestState>> {
+    fn as_bootable(&self) -> Option<&dyn Bootable<TestState, Self::Deps>> {
         Some(self)
     }
 
@@ -331,11 +329,14 @@ impl Provider<TestState> for BootRecorder {
 }
 
 #[async_trait]
-impl Bootable<TestState> for BootRecorder {
+impl Bootable<TestState, (Arc<BootDependency>,)> for BootRecorder {
     async fn boot(
         &self,
+        (dependency,): (Arc<BootDependency>,),
         state: &TestState,
     ) -> Result<()> {
+        // The dependency arrives resolved and already booted.
+        assert_eq!(Component::name(dependency.as_ref()), "boot-dependency");
         state.seen.lock().expect("test log poisoned").push("boot-recorder");
         Ok(())
     }
@@ -353,7 +354,8 @@ impl Finalizable<TestState> for BootRecorder {
 }
 
 #[async_trait]
-impl Provider<TestState> for BootDependency {
+impl Component<TestState> for BootDependency {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "boot-dependency"
     }
@@ -371,6 +373,7 @@ impl Provider<TestState> for BootDependency {
 impl Bootable<TestState> for BootDependency {
     async fn boot(
         &self,
+        _deps: (),
         state: &TestState,
     ) -> Result<()> {
         state.seen.lock().expect("test log poisoned").push("boot-dependency");
@@ -422,28 +425,169 @@ async fn boot_and_finalize_share_lifecycle_plan() {
     );
 }
 
-struct CycleA;
-struct CycleB;
+/// A layer: never registered, only named in `order()`.
+struct Network;
+struct Dns;
+struct Edge;
 
-#[async_trait]
-impl Provider<TestState> for CycleA {
+impl Component<TestState> for Dns {
+    type Deps = ();
     fn name(&self) -> &'static str {
-        "cycle-a"
+        "dns"
     }
 
-    fn order(&self) -> ProviderOrder {
-        ProviderOrder::new().after::<CycleB>()
+    fn order(&self) -> ComponentOrder {
+        ComponentOrder::new().before::<Network>()
+    }
+}
+
+impl Component<TestState> for Edge {
+    type Deps = ();
+    fn name(&self) -> &'static str {
+        "edge"
+    }
+
+    fn order(&self) -> ComponentOrder {
+        ComponentOrder::new().after::<Network>()
+    }
+}
+
+#[test]
+fn targets_order_layers_without_naming_their_members() {
+    let registry = Registry::<TestState>::new();
+    registry
+        .register(Arc::new(Edge))
+        .expect("edge should register")
+        .register(Arc::new(Dns))
+        .expect("dns should register");
+
+    let names = registry.lifecycle_names().expect("plan should build");
+    assert_eq!(names, vec!["dns", "edge"]);
+}
+
+struct MarkerCycle;
+
+impl Component<TestState> for MarkerCycle {
+    type Deps = ();
+
+    fn name(&self) -> &'static str {
+        "marker-cycle"
+    }
+
+    fn order(&self) -> ComponentOrder {
+        ComponentOrder::new().before::<Network>().after::<Network>()
+    }
+}
+
+#[test]
+fn marker_cycle_returns_a_named_error_instead_of_panicking() {
+    let registry = Registry::<TestState>::new();
+    registry.register(Arc::new(MarkerCycle)).unwrap();
+    let error = registry.lifecycle_names().unwrap_err();
+    assert!(error.to_string().contains("cycle detected: marker-cycle"));
+    assert!(registry.runnable_entries().is_err());
+}
+
+struct Absent;
+struct NeedsAbsent;
+
+impl Component<TestState> for NeedsAbsent {
+    type Deps = (Arc<Absent>,);
+    fn name(&self) -> &'static str {
+        "needs-absent"
+    }
+
+    fn as_bootable(&self) -> Option<&dyn Bootable<TestState, Self::Deps>> {
+        Some(self)
+    }
+
+    fn as_runnable(
+        self: Arc<Self>
+    ) -> Option<Arc<dyn Runnable<TestState, Self::Deps>>> {
+        Some(self)
     }
 }
 
 #[async_trait]
-impl Provider<TestState> for CycleB {
+impl Bootable<TestState, (Arc<Absent>,)> for NeedsAbsent {
+    async fn boot(
+        &self,
+        _: (Arc<Absent>,),
+        _: &TestState,
+    ) -> Result<()> {
+        unreachable!("boot must not run without its dependency")
+    }
+}
+
+#[async_trait]
+impl Runnable<TestState, (Arc<Absent>,)> for NeedsAbsent {
+    async fn run(
+        self: Arc<Self>,
+        _: (Arc<Absent>,),
+        _: TestState,
+        _: crate::RunContext,
+    ) -> Result<()> {
+        unreachable!("run must not start without its dependency")
+    }
+}
+
+#[tokio::test]
+async fn missing_dependency_names_the_component_and_the_type() {
+    let state = TestState::default();
+    let registry = Registry::<TestState>::new();
+    registry.register(Arc::new(NeedsAbsent)).expect("should register");
+
+    let error = registry.boot_all(&state).await.expect_err("boot must fail");
+    assert!(matches!(error, Error::Dependency { name: "needs-absent", .. }));
+    assert!(error.to_string().contains("Absent"));
+
+    let entries =
+        registry.runnable_entries().expect("discovery needs no dependencies");
+    let error = entries[0]
+        .runnable
+        .clone()
+        .bind(&registry)
+        .err()
+        .expect("activation must fail");
+    assert!(matches!(error, Error::Dependency { name: "needs-absent", .. }));
+
+    registry.insert(Arc::new(Absent)).expect("dependency should insert");
+    entries[0]
+        .runnable
+        .clone()
+        .bind(&registry)
+        .expect("published dependency is visible");
+    assert_eq!(
+        registry.runnable_entries().expect("resolved").len(),
+        1,
+        "once the dependency exists the runnable is submitted"
+    );
+}
+
+struct CycleA;
+struct CycleB;
+
+#[async_trait]
+impl Component<TestState> for CycleA {
+    type Deps = ();
+    fn name(&self) -> &'static str {
+        "cycle-a"
+    }
+
+    fn order(&self) -> ComponentOrder {
+        ComponentOrder::new().after::<CycleB>()
+    }
+}
+
+#[async_trait]
+impl Component<TestState> for CycleB {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "cycle-b"
     }
 
-    fn order(&self) -> ProviderOrder {
-        ProviderOrder::new().after::<CycleA>()
+    fn order(&self) -> ComponentOrder {
+        ComponentOrder::new().after::<CycleA>()
     }
 }
 
@@ -461,7 +605,7 @@ fn lifecycle_order_rejects_cycles() {
     let err =
         registry.validate_all(&state).expect_err("cycle must be rejected");
     assert!(
-        err.to_string().contains("provider lifecycle order cycle detected")
+        err.to_string().contains("component lifecycle order cycle detected")
     );
 }
 
@@ -471,7 +615,8 @@ struct Finalizes;
 struct FailsFinalize;
 
 #[async_trait]
-impl Provider<TestState> for Finalizes {
+impl Component<TestState> for Finalizes {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "finalizes"
     }
@@ -492,7 +637,8 @@ impl Finalizable<TestState> for Finalizes {
 }
 
 #[async_trait]
-impl Provider<TestState> for FailsFinalize {
+impl Component<TestState> for FailsFinalize {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "fails-finalize"
     }
@@ -513,7 +659,8 @@ impl Finalizable<TestState> for FailsFinalize {
 }
 
 #[async_trait]
-impl Provider<TestState> for Reloads {
+impl Component<TestState> for Reloads {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "reloads"
     }
@@ -534,7 +681,8 @@ impl Reloadable<TestState> for Reloads {
 }
 
 #[async_trait]
-impl Provider<TestState> for FailsReload {
+impl Component<TestState> for FailsReload {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "fails-reload"
     }
@@ -555,7 +703,7 @@ impl Reloadable<TestState> for FailsReload {
 }
 
 #[tokio::test]
-async fn reload_all_retains_provider_failures_and_continues() {
+async fn reload_all_retains_component_failures_and_continues() {
     let state = TestState::default();
     let registry = Registry::<TestState>::new();
     registry
@@ -583,7 +731,7 @@ async fn reload_all_retains_provider_failures_and_continues() {
 }
 
 #[tokio::test]
-async fn finalize_all_retains_provider_failures_and_continues() {
+async fn finalize_all_retains_component_failures_and_continues() {
     let state = TestState::default();
     let registry = Registry::<TestState>::new();
     registry

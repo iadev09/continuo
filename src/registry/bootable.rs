@@ -4,19 +4,21 @@ use super::Result;
 
 /// Ordered, finite preparation before runtime work is admitted.
 ///
-/// This is not a running service. Resolve already-prepared dependencies,
-/// consume validated configuration, construct complete objects and publish
-/// their handles here. A registration component may prepare several related
-/// objects; those objects do not need a boot hook themselves.
+/// `D` is the component's `Deps`, resolved by the registry and passed in; the
+/// hook does not look its dependencies up. It consumes validated
+/// configuration, constructs complete objects and publishes their handles. A
+/// preparation component may prepare several related objects; those objects
+/// need no boot hook of their own.
 ///
-/// Do not serve requests, start a listener, spawn detached tasks or run an
-/// operational loop here. Such work belongs to a runtime-owned `Runnable`.
-/// Expose this capability through `Component::as_bootable`; implementing this
-/// trait does not insert an object into DI or register it for execution.
+/// No listener, detached task or operational loop starts here; that work
+/// belongs to a runtime-owned `Runnable`. Expose this capability through
+/// `Component::as_bootable`; implementing the trait alone neither inserts an
+/// object into DI nor registers it for execution.
 #[async_trait]
-pub trait Bootable<S>: Send + Sync {
+pub trait Bootable<S, D = ()>: Send + Sync {
     async fn boot(
         &self,
+        deps: D,
         state: &S,
     ) -> Result<()>;
 }

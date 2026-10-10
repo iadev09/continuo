@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use continuo::{
@@ -69,14 +70,18 @@ fn runtime_registers_its_manager_and_service_types_without_boot() {
         capacity: 7,
         shutdown: tokio_util::sync::CancellationToken::new(),
     };
-    let runtime =
-        Runtime::default().with_services::<(CacheService,)>(&state).unwrap();
+    let mut runtime = Runtime::default().with_services::<(CacheService,)>();
+    // Recording registers nothing.
+    assert!(state.registry.resolve::<CacheService>().is_none());
+    runtime.register_services(&state).unwrap();
     assert_eq!(state.registry.resolve::<CacheService>().unwrap().capacity, 7);
     let manager = state.registry.resolve::<ServiceManager>().unwrap();
     assert!(Arc::ptr_eq(&manager, &runtime.manager()));
-    let runtime = runtime.with_services::<()>(&state).unwrap();
+    // Applying again is a no-op; the manager stays.
+    runtime.register_services(&state).unwrap();
     assert!(Arc::ptr_eq(&manager, &runtime.manager()));
-    assert!(Runtime::default().with_services::<()>(&state).is_err());
+    // Another runtime cannot take over the registry's manager.
+    assert!(Runtime::default().register_services(&state).is_err());
     assert!(Arc::ptr_eq(
         &manager,
         &state.registry.resolve::<ServiceManager>().unwrap()
@@ -119,4 +124,73 @@ fn empty_registration_is_a_noop() {
     let state = State::default();
     <()>::register(&state).unwrap();
     assert!(state.lock().unwrap().is_empty());
+}
+
+struct RegistrationLog {
+    fail: AtomicBool,
+    seen: Mutex<Vec<u8>>,
+}
+
+impl Register<AppState> for First {
+    fn register(state: &AppState) -> Result<()> {
+        state
+            .registry
+            .resolve::<RegistrationLog>()
+            .unwrap()
+            .seen
+            .lock()
+            .unwrap()
+            .push(1);
+        Ok(())
+    }
+}
+
+impl Register<AppState> for Second {
+    fn register(state: &AppState) -> Result<()> {
+        state
+            .registry
+            .resolve::<RegistrationLog>()
+            .unwrap()
+            .seen
+            .lock()
+            .unwrap()
+            .push(2);
+        Ok(())
+    }
+}
+
+impl Register<AppState> for Rejected {
+    fn register(state: &AppState) -> Result<()> {
+        let log = state.registry.resolve::<RegistrationLog>().unwrap();
+        if log.fail.load(Ordering::SeqCst) {
+            return Err(Error::msg("registration rejected"));
+        }
+        log.seen.lock().unwrap().push(3);
+        Ok(())
+    }
+}
+
+#[test]
+fn runtime_keeps_failed_and_pending_registrations_for_retry() {
+    let state = AppState {
+        registry: Arc::new(Registry::new()),
+        capacity: 7,
+        shutdown: tokio_util::sync::CancellationToken::new(),
+    };
+    let log = Arc::new(RegistrationLog {
+        fail: AtomicBool::new(true),
+        seen: Mutex::new(Vec::new()),
+    });
+    state.registry.insert(log.clone()).unwrap();
+    let mut runtime = Runtime::default()
+        .with_services::<First>()
+        .with_services::<Rejected>()
+        .with_services::<Second>();
+    assert!(runtime.register_services(&state).is_err());
+    assert_eq!(*log.seen.lock().unwrap(), [1]);
+    assert!(runtime.register_services(&state).is_err());
+    assert_eq!(*log.seen.lock().unwrap(), [1]);
+    log.fail.store(false, Ordering::SeqCst);
+    runtime.register_services(&state).unwrap();
+    assert_eq!(*log.seen.lock().unwrap(), [1, 3, 2]);
 }

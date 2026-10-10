@@ -1,10 +1,16 @@
 use std::any::TypeId;
 
-/// Type-based lifecycle ordering hints.
+/// Placement of a component relative to other types.
 ///
-/// Numeric priorities still provide a coarse tie-breaker. `ComponentOrder`
-/// adds explicit relationships between lifecycle component types, so code can
-/// say "prepare me before `T`" without relying on magic numbers or names.
+/// A type named here that is a registered component becomes a direct edge.
+/// A type that is not registered acts as a target: a node with no work of its
+/// own that completes once every component ordered `before` it has completed,
+/// and releases every component ordered `after` it. Targets let a component
+/// say "after the network layer" without naming, or depending on, the
+/// components that make up that layer. Requirements on specific components
+/// belong in `Component::Deps`.
+/// A plain DI value produced during boot does not identify its producer:
+/// declare the value in `Deps` and order after its preparation component.
 #[derive(Clone, Debug, Default)]
 pub struct ComponentOrder {
     before: Vec<TypeId>,

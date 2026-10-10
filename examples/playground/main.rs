@@ -3,28 +3,22 @@
 //! The active listening address is printed at startup.
 
 mod app;
-use app::{
-    Application, CounterService, HttpService, OtherService, ReloadService,
-    SignalService,
+use app::services::{
+    CounterService, HttpService, OtherService, ReloadService, SignalService,
 };
+use app::{Application, Environment};
 
-fn main() -> continuo::Result<()> {
-    // SAFETY: this executable owns startup; no runtime threads exist yet.
-    let environments = unsafe { app::environment()? };
-
-    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(
-        async {
-            Application::new(environments)
-                .await?
-                .with_services::<(
-                    CounterService,
-                    OtherService,
-                    HttpService,
-                    ReloadService,
-                    SignalService,
-                )>()?
-                .run()
-                .await
-        },
-    )
+#[tokio::main]
+async fn main() -> continuo::Result<()> {
+    Application::new()
+        .with_environment(Environment::from_args()?)
+        .with_services::<(
+            CounterService,
+            OtherService,
+            HttpService,
+            ReloadService,
+            SignalService,
+        )>()
+        .run()
+        .await
 }

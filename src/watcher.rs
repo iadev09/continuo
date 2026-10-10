@@ -4,7 +4,8 @@ use std::any::TypeId;
 use std::path::PathBuf;
 
 use crate::{
-    Component, Event, HasConfigReader, HasEvents, HasRegistry, Registry, Result,
+    AnyComponent, Event, HasConfigReader, HasEvents, HasRegistry, Registry,
+    Result,
 };
 use congif::watch::ConfigWatcher;
 use std::sync::Arc;
@@ -29,7 +30,7 @@ impl ConfigurationChanged {
 pub(crate) struct ConfigurationWatch<S> {
     watcher: Option<ConfigWatcher>,
     changes: broadcast::Receiver<ConfigurationChanged>,
-    // Capability accessors: no captured state or second provider registry.
+    // Capability accessors: no captured state or second component registry.
     registry: fn(&S) -> &Registry<S>,
     reader: fn(&S) -> &congif::ConfigReader,
     rebuild: fn(&S) -> Result<Self>,
@@ -39,8 +40,10 @@ impl<S: HasEvents + HasRegistry + HasConfigReader> ConfigurationWatch<S> {
     pub fn new(state: &S) -> Result<Self> {
         let changes = state.events().subscribe::<ConfigurationChanged>();
         let mut watcher = None;
-        for (owner, provider) in state.registry_ref().configuration_entries()? {
-            let Some(configurable) = provider.as_configurable() else {
+        for (owner, component) in
+            state.registry_ref().configuration_entries()?
+        {
+            let Some(configurable) = component.as_configurable() else {
                 continue;
             };
             if !configurable.observes_config() {
@@ -48,11 +51,11 @@ impl<S: HasEvents + HasRegistry + HasConfigReader> ConfigurationWatch<S> {
             }
             let mut sources =
                 state.config_reader().sources_for(configurable)?;
-            if provider.as_environmental().is_some() {
+            if component.as_environmental().is_some() {
                 sources.extend(
                     state
                         .config_reader()
-                        .program_sources((*provider).type_id())?,
+                        .program_sources((*component).type_id())?,
                 );
             }
             if sources.is_empty() {
@@ -105,18 +108,19 @@ impl<S: 'static> ConfigurationWatch<S> {
         state: &S,
     ) -> Result<()> {
         let Some(watcher) = self.watcher.as_mut() else { return Ok(()) };
-        for (owner, provider) in
+        for (owner, component) in
             (self.registry)(state).configuration_entries()?
         {
-            let Some(configurable) = provider.as_configurable() else {
+            let Some(configurable) = component.as_configurable() else {
                 continue;
             };
             if configurable.observes_config() {
                 let reader = (self.reader)(state);
                 let mut sources = reader.sources_for(configurable)?;
-                if provider.as_environmental().is_some() {
-                    sources
-                        .extend(reader.program_sources((*provider).type_id())?);
+                if component.as_environmental().is_some() {
+                    sources.extend(
+                        reader.program_sources((*component).type_id())?,
+                    );
                 }
                 watcher.update_owner_paths(owner, sources)?;
             }
@@ -138,13 +142,14 @@ impl<S: 'static> ConfigurationWatch<S> {
             }
         };
         for (owner, program, snapshot) in changes {
-            let Some(provider) = (self.registry)(state).resolve_provider(owner)
+            let Some(component) =
+                (self.registry)(state).resolve_component(owner)
             else {
                 continue;
             };
-            if let Some(environmental) = provider.as_environmental() {
+            if let Some(environmental) = component.as_environmental() {
                 tracing::debug!(
-                    provider = provider.name(),
+                    component = component.name(),
                     program,
                     "program environment re-read"
                 );
@@ -158,7 +163,7 @@ impl<S: 'static> ConfigurationWatch<S> {
         &mut self,
         state: &S,
         changes: Vec<ConfigurationChanged>,
-    ) -> Result<Vec<Arc<dyn Component<S>>>> {
+    ) -> Result<Vec<Arc<dyn AnyComponent<S>>>> {
         let all = changes.is_empty()
             || changes.iter().any(|event| event.owner.is_none());
         let paths: Vec<_> = changes
@@ -192,17 +197,17 @@ impl<S: 'static> ConfigurationWatch<S> {
         let entries: Vec<_> = (self.registry)(state)
             .configuration_entries()?
             .into_iter()
-            .filter(|(owner, provider)| {
+            .filter(|(owner, component)| {
                 owners.contains(owner)
-                    && provider
+                    && component
                         .as_configurable()
                         .is_some_and(|owner| owner.observes_config())
             })
             .collect();
         let configs: Vec<_> = entries
             .iter()
-            .map(|(_, provider)| {
-                provider.as_configurable().expect("filtered configurable")
+            .map(|(_, component)| {
+                component.as_configurable().expect("filtered configurable")
             })
             .collect();
         let reader = (self.reader)(state);
@@ -235,7 +240,7 @@ impl<S: 'static> ConfigurationWatch<S> {
         Ok(entries
             .into_iter()
             .filter(|(owner, _)| changed.contains(owner))
-            .map(|(_, provider)| provider)
+            .map(|(_, component)| component)
             .collect())
     }
 

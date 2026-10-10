@@ -39,9 +39,9 @@ impl Scope {
     }
 }
 
-/// Declares eligible process roles without changing provider registration.
+/// Declares eligible process roles without changing component registration.
 ///
-/// Expose this through `Provider::as_scoped` (or `as_dispatched`) so Runtime
+/// Expose this through `Component::as_scoped` (or `as_dispatched`) so Runtime
 /// can filter local entries against `SharedState::process_scope`. An explicit
 /// `as_scoped` capability takes precedence when both hooks are exposed; both
 /// must describe the same scope. Merely implementing the trait without

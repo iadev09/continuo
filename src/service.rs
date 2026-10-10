@@ -8,8 +8,8 @@ const COMMAND_CAPACITY: usize = 64;
 
 /// Initial activation policy for one registered runnable service.
 ///
-/// The runtime samples this policy after provider boot and re-evaluates it for
-/// observation and explicit starts, so a provider config reload changes the
+/// The runtime samples this policy after component boot and re-evaluates it for
+/// observation and explicit starts, so a component config reload changes the
 /// effective policy without duplicating it in the manager. It is independent
 /// from [`ServiceStatus`]: a manually started service is both `Manual` and
 /// `Running`.
@@ -58,7 +58,7 @@ impl RunContext {
     ///
     /// [`crate::Runtime`] normally constructs this from a child of the
     /// process shutdown token. The public constructor is useful to focused
-    /// provider harnesses that drive one [`crate::Runnable`] directly while
+    /// component harnesses that drive one [`crate::Runnable`] directly while
     /// preserving the same cancellation contract.
     pub fn new(cancellation: CancellationToken) -> Self {
         Self { cancellation }
@@ -217,7 +217,7 @@ pub(crate) enum ServiceCommand {
 
 /// Cloneable control handle for runnable services owned by [`crate::Runtime`].
 ///
-/// This provider contains no duplicate lifecycle state. Commands cross a
+/// This component contains no duplicate lifecycle state. Commands cross a
 /// bounded channel and are applied by the runtime that owns the live futures.
 ///
 /// # Do not call back into this from a lifecycle hook
@@ -276,7 +276,7 @@ impl ServiceManager {
         result.await.map_err(|_| ServiceManagerError::RuntimeUnavailable)?
     }
 
-    /// Reload one runnable provider without replacing its live generation.
+    /// Reload one runnable component without replacing its live generation.
     pub async fn reload(
         &self,
         name: impl Into<String>,

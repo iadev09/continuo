@@ -1,16 +1,14 @@
 use super::super::state::AppState;
 use async_trait::async_trait;
 use axum::Router;
-use axum::{
-    Extension,
-    routing::{get, post},
-};
+use axum::routing::{get, post};
 use congif::{ConfigObserver, Configurable};
+use continuo::registry::priority;
 use continuo::{
-    Component, ComponentOrder, Error, HasRegistry, Register, Reloadable,
-    Result, RunContext, Runnable,
+    Component, Error, HasRegistry, Register, Reloadable, Result, RunContext,
+    Runnable,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -20,7 +18,7 @@ use std::time::Duration;
 mod listener;
 pub use listener::PeerAddress;
 
-#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HttpConfig {
     listen: SocketAddr,
@@ -63,54 +61,33 @@ impl HttpService {
         Ok(())
     }
 
-    fn routes(state: &AppState) -> Result<Router<AppState>> {
+    // Handlers resolve the counter, the signals and the manager per request
+    // and answer 503 while one is absent. None of them is a dependency.
+    fn routes() -> Router<AppState> {
         use super::super::handlers::*;
-        let counter =
-            state
-                .registry_ref()
-                .resolve::<super::CounterService>()
-                .ok_or_else(|| Error::msg("http: counter not registered"))?;
-        let value = state
-            .registry_ref()
-            .resolve::<super::super::counter::Counter>()
-            .ok_or_else(|| Error::msg("http: counter value not registered"))?;
-        let manager = state
-            .registry_ref()
-            .resolve::<continuo::ServiceManager>()
-            .ok_or_else(|| {
-                Error::msg("http: service manager not registered")
-            })?;
-        let signals = state
-            .registry_ref()
-            .resolve::<super::SignalService>()
-            .ok_or_else(|| Error::msg("http: signals not registered"))?;
-        Ok(Router::new()
+        Router::new()
             .route("/", get(index))
-            .route("/config", get(read_config))
             .route("/hit", post(hit))
-            .route("/counter/config", post(update_config))
             .route("/counter/events", get(counter_events))
             .route("/assets/app.css", get(styles))
             .route("/assets/app.js", get(script))
             .route("/reload", get(reload))
             .merge(service_control_routes())
-            .layer(Extension(counter))
-            .layer(Extension(value))
-            .layer(Extension(manager))
-            .layer(Extension(signals)))
     }
 }
 
 #[async_trait]
 impl Component<AppState> for HttpService {
+    type Deps = ();
+
     fn name(&self) -> &'static str {
         "HttpService"
     }
 
-    fn order(&self) -> ComponentOrder {
-        ComponentOrder::new()
-            .after::<super::CounterService>()
-            .after::<super::SignalService>()
+    // Prefer to start after the services the handlers use, so the first
+    // requests find them. A preference, not a requirement.
+    fn run_priority(&self) -> Option<u8> {
+        Some(priority::LATE)
     }
 
     fn as_reloadable(&self) -> Option<&dyn Reloadable<AppState>> {
@@ -141,10 +118,11 @@ impl Reloadable<AppState> for HttpService {
 impl Runnable<AppState> for HttpService {
     async fn run(
         self: Arc<Self>,
+        _deps: (),
         state: AppState,
         context: RunContext,
     ) -> Result<()> {
-        let app = Self::routes(&state)?.with_state(state.clone());
+        let app = Self::routes().with_state(state.clone());
         let startup = self.reload_lock.lock().await;
         let mut config = *state.reader().snapshot::<Self>()?;
         let (mut listener, gate, grace) = {
@@ -243,11 +221,11 @@ impl Runnable<AppState> for HttpService {
 
 impl Register<AppState> for HttpService {
     fn register(state: &AppState) -> Result<()> {
-        state.reader().bind_environment::<Self>(
-            state.environment(&state.application_config().http.env_file)?,
-        )?;
+        state
+            .reader()
+            .bind_environment::<Self>(state.environment("http.env")?)?;
         state.registry_ref().register(Arc::new(Self::new(
-            state.application_config().http.config_path.clone(),
+            super::super::config::root().join("config/http.json"),
         )))?;
         Ok(())
     }
@@ -261,15 +239,6 @@ impl Configurable for HttpService {
             path: self.config_path.clone(),
             format: congif::Format::Json,
         }
-    }
-    fn namespace(&self) -> String {
-        "http".to_owned()
-    }
-    fn export_config(
-        &self,
-        config: &HttpConfig,
-    ) -> congif::Result<Option<congif::ConfigValue>> {
-        congif::export(config)
     }
     fn as_config_observer(
         &self

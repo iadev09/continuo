@@ -8,6 +8,7 @@ pub trait ReloadState: Send + Sync + Sized + 'static {
     /// The registry prepares all owners before calling application/component
     /// hooks, and acknowledges each candidate only after successful application.
     /// States without configuration retain the ordinary lifecycle-only path.
+    #[cfg(feature = "config")]
     fn reload_config_reader(&self) -> Option<&congif::ConfigReader> {
         None
     }
@@ -21,7 +22,7 @@ pub trait ReloadState: Send + Sync + Sized + 'static {
 /// they do not read sources again. The hook applies component-owned resources
 /// and runtime values. A successful return acknowledges that application,
 /// while a failure leaves the candidate unacknowledged for a later retry.
-/// Providers outside Congif retain ownership of their own reload inputs.
+/// Components outside Congif retain ownership of their own reload inputs.
 /// Reload must NOT change which components are registered; it only
 /// refreshes state of an already-registered component.
 #[async_trait]

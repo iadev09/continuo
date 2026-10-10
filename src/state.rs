@@ -5,7 +5,7 @@ use crate::ProcessEventBus;
 #[cfg(feature = "registry")]
 use crate::Registry;
 
-/// Shared application state passed to providers and runtime tasks.
+/// Shared application state passed to components and runtime tasks.
 ///
 /// Applications keep ownership of their real state. Put config handles,
 /// typed services, caches, event buses, and domain state wherever they belong;
@@ -87,5 +87,5 @@ pub trait HasEvents: SharedState {
     fn events(&self) -> &ProcessEventBus;
 }
 
-#[cfg(feature = "config-watch")]
+#[cfg(feature = "config")]
 pub use congif::HasConfigReader;

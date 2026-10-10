@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::{Result, RunContext, Runnable, SharedState};
+use crate::{AnyRunnable, Result, RunContext, SharedState};
 
 use super::{Scope, Scoped};
 
@@ -37,8 +37,8 @@ impl Dispatch {
 ///
 /// This contract has no dependency on `Runnable`, allowing tasks and other
 /// execution types to share the vocabulary. Service dispatch applies to
-/// runnable executions, not to provider construction or configuration.
-/// Providers expose this capability through `Provider::as_dispatched`.
+/// runnable executions, not to component construction or configuration.
+/// Components expose this capability through `Component::as_dispatched`.
 /// The execution adapter owns selection, leases, failover and command transport;
 /// Continuo does not implement those mechanisms. Absence means `Dispatch::Each`.
 pub trait Dispatched: Scoped {
@@ -47,7 +47,7 @@ pub trait Dispatched: Scoped {
 
 /// Identity and placement of one locally managed controller generation.
 /// Pool capacity and lease policy belong to the adapter's configuration;
-/// neither is inferred from the number of registered providers.
+/// neither is inferred from the number of registered components.
 #[derive(Clone, Copy, Debug)]
 pub struct DispatchRequest {
     pub name: &'static str,
@@ -62,9 +62,9 @@ pub struct DispatchRequest {
 /// slot it owns, using a child of its generation cancellation token. It must
 /// await every execution through graceful drain before returning or releasing
 /// ownership. A runnable used with `Pool` must support concurrent executions
-/// of the same shared provider instance.
+/// of the same shared component instance.
 pub struct ServiceExecution<S> {
-    runnable: Arc<dyn Runnable<S>>,
+    runnable: Arc<dyn AnyRunnable<S>>,
     state: S,
 }
 
@@ -81,7 +81,7 @@ impl<S: SharedState> ServiceExecution<S> {
     }
 
     pub(crate) fn new(
-        runnable: Arc<dyn Runnable<S>>,
+        runnable: Arc<dyn AnyRunnable<S>>,
         state: S,
     ) -> Self {
         Self { runnable, state }
@@ -105,7 +105,7 @@ impl<S: SharedState> ServiceExecution<S> {
 /// Returning is the acknowledgement that no child execution remains alive.
 ///
 /// No process-global transport or timing policy is imposed here. A controller
-/// is installed explicitly on Runtime, not started as another provider whose
+/// is installed explicitly on Runtime, not started as another component whose
 /// registration order determines whether dispatch is available.
 #[async_trait]
 pub trait Dispatcher<S>: Send + Sync + 'static {

@@ -1,6 +1,5 @@
 //! Shared application state and its runtime capabilities.
 use super::counter::Counter;
-use congif::HasConfigReader;
 use continuo::{HasEvents, ProcessEventBus};
 use continuo::{HasRegistry, Registry, Result, SharedState};
 use std::collections::HashMap;
@@ -14,7 +13,6 @@ use tokio_util::sync::CancellationToken;
 pub struct AppState(Arc<Inner>);
 
 struct Inner {
-    config: super::config::ApplicationConfig,
     reader: Arc<congif::ConfigReader>,
     environment: dotenw::EnvHandle,
     shutdown: CancellationToken,
@@ -35,24 +33,12 @@ pub struct CounterView {
 }
 
 impl AppState {
-    // Keep the capability trait inside this module. Callers need only AppState.
-    pub fn config<T: serde::de::DeserializeOwned>(
-        &self,
-        key: &str,
-    ) -> congif::Result<Option<T>> {
-        self.get_config(key)
-    }
-
-    pub async fn new(environments: dotenw::EnvStore) -> Result<Self> {
+    pub fn new(environments: dotenw::EnvStore) -> Result<Self> {
         let reader = congif::ConfigReader::new()
             .with_environment_store(environments)
             .with_builtin_parsers()?;
         let environment = super::config::environment(&reader, ".env", None)?;
-        let config =
-            super::config::ApplicationConfig::read(&reader, &environment)
-                .await?;
         Ok(Self(Arc::new(Inner {
-            config,
             reader: Arc::new(reader),
             environment,
             shutdown: CancellationToken::new(),
@@ -113,10 +99,6 @@ impl AppState {
         self.0.counter_updates.send_modify(|view| {
             view.page_revision = view.page_revision.wrapping_add(1);
         });
-    }
-
-    pub fn application_config(&self) -> &super::config::ApplicationConfig {
-        &self.0.config
     }
 
     pub fn environment(

@@ -1,37 +1,37 @@
-use super::{
-    services::{CounterService, SignalService},
-    state::AppState,
-};
-use axum::extract::{ConnectInfo, Form, State};
+use super::{counter::Counter, services::SignalService, state::AppState};
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
-use axum::response::{Html, IntoResponse, Redirect};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use continuo::{HasEvents, ReloadRequired, ServiceManager, ServiceSnapshot};
-use serde::Deserialize;
-use std::net::SocketAddr;
+use continuo::{
+    HasEvents, HasRegistry, ReloadRequired, ServiceManager, ServiceSnapshot,
+};
+use std::any::Any;
 use std::sync::Arc;
 
-pub async fn read_config(
-    State(state): State<AppState>
-) -> axum::response::Response {
-    let settings = (|| -> congif::Result<_> {
-        let listen = state.config::<SocketAddr>("http.listen")?;
-        let increment = state.config::<u64>("counter.increment")?;
-        let missing = state.config::<String>("counter.missing")?;
-        Ok(
-            serde_json::json!({ "http": { "listen": listen }, "counter": { "increment": increment }, "missing": missing }),
-        )
-    })();
-    match settings {
-        Ok(settings) => Json(settings).into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"message": error.to_string()})),
-        )
-            .into_response(),
-    }
+/// Resolve a service the handler uses at request time. The HTTP service does
+/// not depend on it: while it is absent the handler answers 503, and once it
+/// is registered the same handler answers normally.
+fn available<T: Any + Send + Sync>(
+    state: &AppState,
+    what: &str,
+    headers: &HeaderMap,
+) -> std::result::Result<Arc<T>, Box<Response>> {
+    state.registry_ref().resolve::<T>().ok_or_else(|| {
+        let message = format!("{what} is not available");
+        let response = if wants_json(headers) {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"message": message})),
+            )
+                .into_response()
+        } else {
+            (StatusCode::SERVICE_UNAVAILABLE, message).into_response()
+        };
+        Box::new(response)
+    })
 }
 
 pub async fn counter_events(
@@ -101,9 +101,16 @@ async fn asset(
 
 pub async fn index(
     State(state): State<AppState>,
-    Extension(manager): Extension<Arc<ServiceManager>>,
-    Extension(signals): Extension<Arc<SignalService>>,
-) -> std::result::Result<Html<String>, (StatusCode, String)> {
+    headers: HeaderMap,
+) -> Response {
+    let manager = match available::<ServiceManager>(
+        &state,
+        "service manager",
+        &headers,
+    ) {
+        Ok(manager) => manager,
+        Err(response) => return *response,
+    };
     let status = manager
         .list()
         .await
@@ -116,27 +123,29 @@ pub async fn index(
 
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("examples/playground/web/index.html");
-    let page = tokio::fs::read_to_string(path).await.map_err(|error| {
-        (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
-    })?;
-    let json =
-        state.reader().snapshot::<CounterService>().map_err(|error| {
-            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
-        })?;
-    let json =
-        serde_json::to_string_pretty(json.as_ref()).map_err(|error| {
-            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
-        })?;
-    let (reload_command, hit_command) =
-        signals.commands(state.reader()).map_err(|error| {
-            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
-        })?;
-    Ok(Html(
+    let page = match tokio::fs::read_to_string(path).await {
+        Ok(page) => page,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                .into_response();
+        }
+    };
+    // Signals are optional on this page: without them the commands are
+    // simply not shown.
+    let (reload_command, hit_command) = state
+        .registry_ref()
+        .resolve::<SignalService>()
+        .and_then(|signals| signals.commands(state.reader()).ok())
+        .unwrap_or_else(|| {
+            let unavailable = "signals are not available".to_owned();
+            (unavailable.clone(), unavailable)
+        });
+    Html(
         page.replace("{{status}}", &escape_html(&status))
-            .replace("{{config}}", &escape_html(&json))
             .replace("{{reload_command}}", &escape_html(&reload_command))
             .replace("{{hit_command}}", &escape_html(&hit_command)),
-    ))
+    )
+    .into_response()
 }
 
 pub async fn hit(
@@ -144,9 +153,12 @@ pub async fn hit(
         super::services::PeerAddress,
     >,
     State(state): State<AppState>,
-    Extension(counter): Extension<Arc<super::counter::Counter>>,
     headers: HeaderMap,
-) -> axum::response::Response {
+) -> Response {
+    let counter = match available::<Counter>(&state, "counter", &headers) {
+        Ok(counter) => counter,
+        Err(response) => return *response,
+    };
     match state.hit(&counter, Some(client), false) {
         Some((value, yours)) if wants_json(&headers) => Json(serde_json::json!({
             "message": "Hit added", "value": value, "yours": yours,
@@ -165,33 +177,18 @@ fn escape_html(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-#[derive(Deserialize)]
-pub struct ConfigForm {
-    json: String,
-}
-
-pub async fn update_config(
-    State(state): State<AppState>,
-    Extension(counter): Extension<Arc<CounterService>>,
-    headers: HeaderMap,
-    Form(form): Form<ConfigForm>,
-) -> axum::response::Response {
-    match save_counter_config(state.reader(), &counter, &form.json).await {
-        Ok(()) if wants_json(&headers) => Json(serde_json::json!({"message":"Configuration saved; watcher will apply it."})).into_response(),
-        Ok(()) => Redirect::to("/").into_response(),
-        Err(error) if wants_json(&headers) => (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"message":error.to_string()}))).into_response(),
-        Err(error) => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("Configuration not saved: {error}"),
-        )
-            .into_response(),
-    }
-}
-
 async fn list_services(
-    Extension(manager): Extension<Arc<ServiceManager>>,
+    State(state): State<AppState>,
     headers: HeaderMap,
-) -> impl IntoResponse {
+) -> Response {
+    let manager = match available::<ServiceManager>(
+        &state,
+        "service manager",
+        &headers,
+    ) {
+        Ok(manager) => manager,
+        Err(response) => return *response,
+    };
     match manager.list().await {
         Ok(services) if wants_json(&headers) => Json(serde_json::json!({
             "services": services.iter().map(|service| serde_json::json!({
@@ -259,31 +256,53 @@ async fn list_services(
 }
 
 async fn start_counter(
-    Extension(manager): Extension<Arc<ServiceManager>>,
+    State(state): State<AppState>,
     headers: HeaderMap,
-) -> impl IntoResponse {
-    control_result("start", manager.start("counter").await, &headers)
+) -> Response {
+    match available::<ServiceManager>(&state, "service manager", &headers) {
+        Ok(manager) => {
+            control_result("start", manager.start("counter").await, &headers)
+        }
+        Err(response) => *response,
+    }
 }
 
 async fn stop_counter(
-    Extension(manager): Extension<Arc<ServiceManager>>,
+    State(state): State<AppState>,
     headers: HeaderMap,
-) -> impl IntoResponse {
-    control_result("stop", manager.stop("counter").await, &headers)
+) -> Response {
+    match available::<ServiceManager>(&state, "service manager", &headers) {
+        Ok(manager) => {
+            control_result("stop", manager.stop("counter").await, &headers)
+        }
+        Err(response) => *response,
+    }
 }
 
 async fn restart_counter(
-    Extension(manager): Extension<Arc<ServiceManager>>,
+    State(state): State<AppState>,
     headers: HeaderMap,
-) -> impl IntoResponse {
-    control_result("restart", manager.restart("counter").await, &headers)
+) -> Response {
+    match available::<ServiceManager>(&state, "service manager", &headers) {
+        Ok(manager) => control_result(
+            "restart",
+            manager.restart("counter").await,
+            &headers,
+        ),
+        Err(response) => *response,
+    }
 }
 
 async fn reload_counter(
-    Extension(manager): Extension<Arc<ServiceManager>>,
+    State(state): State<AppState>,
     headers: HeaderMap,
-) -> impl IntoResponse {
-    control_result("reload", manager.reload("counter").await, &headers)
+) -> Response {
+    match available::<ServiceManager>(&state, "service manager", &headers) {
+        Ok(manager) => {
+            control_result("reload", manager.reload("counter").await, &headers)
+        }
+        Err(response) => *response,
+    }
 }
 
 pub fn service_control_routes() -> Router<AppState> {
@@ -320,7 +339,7 @@ fn control_result(
     action: &str,
     result: std::result::Result<ServiceSnapshot, continuo::ServiceManagerError>,
     headers: &HeaderMap,
-) -> axum::response::Response {
+) -> Response {
     match result {
         Ok(service) if wants_json(headers) => Json(serde_json::json!({
             "message":format!("{action} completed"),
@@ -362,25 +381,4 @@ pub async fn reload(State(app): State<AppState>) -> Redirect {
     app.events().emit(ReloadRequired);
     tracing::info!("http: application reload requested");
     Redirect::to("/")
-}
-
-pub(super) async fn save_counter_config(
-    reader: &congif::ConfigReader,
-    service: &CounterService,
-    json: &str,
-) -> continuo::Result<()> {
-    let path = congif::Configurable::source(service).path;
-    let candidate = reader
-        .parse_for::<CounterService>(congif::ConfigSource {
-            path: &path,
-            bytes: json.as_bytes(),
-        })
-        .await?;
-    congif::Configurable::validate_config(service, &candidate)?;
-    let bytes = serde_json::to_vec_pretty(&candidate)?;
-    tokio::task::spawn_blocking(move || {
-        super::config::atomic_write(&path, &bytes)
-    })
-    .await??;
-    Ok(())
 }

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use congif::{ConfigReader, ConfigRegistration, Configurable};
-use continuo::{Provider, Registry, ReloadState, Reloadable, Result};
+use continuo::{Component, Registry, ReloadState, Reloadable, Result};
 
 #[derive(Default)]
 struct State {
@@ -61,7 +61,8 @@ impl Configurable for Settings {
 }
 
 #[async_trait]
-impl Provider<State> for Settings {
+impl Component<State> for Settings {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "settings"
     }

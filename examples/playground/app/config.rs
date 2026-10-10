@@ -4,7 +4,7 @@ use continuo::Result;
 use dotenw::{EnvHandle, Environment, MergeMode};
 use std::path::PathBuf;
 
-#[derive(Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(Clone, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CounterConfig {
     pub(crate) increment: u64,
@@ -43,42 +43,8 @@ pub fn atomic_write(
     Ok(())
 }
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ApplicationConfig {
-    pub http: ServiceConfig,
-    pub counter: ServiceConfig,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ServiceConfig {
-    pub env_file: PathBuf,
-    pub config_path: PathBuf,
-}
-
 pub fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/playground")
-}
-
-impl ApplicationConfig {
-    pub async fn read(
-        reader: &ConfigReader,
-        environment: &EnvHandle,
-    ) -> Result<Self> {
-        let snapshot = environment.snapshot().map_err(congif::Error::from)?;
-        let mut config: Self = reader
-            .read_with_variables(
-                root().join("playground.toml"),
-                snapshot.as_ref(),
-            )
-            .await?;
-        config.http.env_file = root().join(config.http.env_file);
-        config.http.config_path = root().join(config.http.config_path);
-        config.counter.env_file = root().join(config.counter.env_file);
-        config.counter.config_path = root().join(config.counter.config_path);
-        Ok(config)
-    }
 }
 
 pub fn environment(

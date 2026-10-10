@@ -1,11 +1,11 @@
 use super::super::counter::Counter;
 use super::super::state::AppState;
-use super::CounterService;
 use async_trait::async_trait;
 use congif::{ConfigObserver, ConfigReader, Configurable};
+use continuo::registry::priority;
 use continuo::{
-    Component, ComponentOrder, HasRegistry, Register, Reloadable, Result,
-    RunContext, Runnable, SharedState,
+    Component, HasRegistry, Register, Reloadable, Result, RunContext, Runnable,
+    SharedState,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -68,12 +68,15 @@ impl SignalService {
 
 #[async_trait]
 impl Component<AppState> for SignalService {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "signals"
     }
 
-    fn order(&self) -> ComponentOrder {
-        ComponentOrder::new().after::<CounterService>()
+    // Hits go to the counter when it is registered; reload and shutdown
+    // work without it.
+    fn run_priority(&self) -> Option<u8> {
+        Some(priority::LATE)
     }
 
     fn as_reloadable(&self) -> Option<&dyn Reloadable<AppState>> {
@@ -102,14 +105,11 @@ impl Reloadable<AppState> for SignalService {
 impl Runnable<AppState> for SignalService {
     async fn run(
         self: Arc<Self>,
+        _deps: (),
         state: AppState,
         context: RunContext,
     ) -> Result<()> {
         let pid = std::process::id();
-        let counter =
-            state.registry_ref().resolve::<Counter>().ok_or_else(|| {
-                continuo::Error::msg("signals: counter not registered")
-            })?;
         let startup = self.reload_lock.lock().await;
         let mut config = *state.reader().snapshot::<Self>()?;
         let mut listeners = Listeners::prepare(config)?;
@@ -131,9 +131,12 @@ impl Runnable<AppState> for SignalService {
                     println!("signals: application reload requested");
                 }
                 _ = listeners.hit.recv() => {
-                    match state.hit(&counter, None, true).map(|(value, _)| value) {
-                        Some(value) => println!("signals: hit added (count {value})"),
-                        None => println!("signals: hit ignored; counter stopped"),
+                    match state.registry_ref().resolve::<Counter>() {
+                        None => println!("signals: hit ignored; counter is not registered"),
+                        Some(counter) => match state.hit(&counter, None, true).map(|(value, _)| value) {
+                            Some(value) => println!("signals: hit added (count {value})"),
+                            None => println!("signals: hit ignored; counter stopped"),
+                        },
                     }
                 }
                 replacement = self.live.replacement() => {
@@ -178,9 +181,6 @@ impl Configurable for SignalService {
             path: self.config_path.clone(),
             format: congif::Format::Json,
         }
-    }
-    fn namespace(&self) -> String {
-        "signals".to_owned()
     }
     fn validate_config(
         &self,

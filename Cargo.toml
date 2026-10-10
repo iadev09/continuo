@@ -5,7 +5,7 @@ edition = "2024"
 # Let-chains, used ungated in runtime.rs, gate.rs and events.rs.
 rust-version = "1.88"
 authors = ["iadev09 <iadev09@claviron.org>"]
-description = "Runtime service composition for multi-service Rust applications: typed provider resolution, dependency-ordered lifecycle, reload, runnable tasks, graceful drain, and finalization."
+description = "Runtime service composition for multi-service Rust applications: typed component resolution, dependency-ordered lifecycle, reload, runnable tasks, graceful drain, and finalization."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/iadev09/continuo"
 documentation = "https://docs.rs/continuo"
@@ -16,22 +16,26 @@ exclude = ["/Cargo.lock", "/justfile", "/rustfmt.toml", "/.idea/**"]
 
 [features]
 default = ["registry"]
-full = ["registry", "support", "events","config-watch", "fleet"]
+full = ["registry", "support", "events", "config", "config-watch", "fleet"]
 fleet = ["dep:serde"]
 events = ["dep:dashmap"]
-config-watch = ["events", "registry", "congif/watch"]
+# Typed configuration through Congif: `Configurable`, `Component::as_configurable`,
+# reload acknowledgement; with `registry`, `Runtime::configure` / `prepare`.
+config = ["dep:congif"]
+# Native source watching on top of `config`; needs the event bus and registry.
+config-watch = ["config", "events", "registry", "congif/watch"]
 registry = []
 support = []
 
 [package.metadata.docs.rs]
-# `gate`, `guard` and `events` are behind features; without this docs.rs
-# renders the registry and nothing else.
+# `gate`, `guard`, `events`, `config` and `fleet` are behind features; without
+# this docs.rs renders the registry and nothing else.
 all-features = true
 
 [dependencies]
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"], optional = true }
-congif = { path = "../congif" }
+congif = { version = "0.1", path = "../congif", optional = true }
 dashmap = { version = "6", optional = true }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-util = "0.7"
@@ -41,8 +45,8 @@ tracing = "0.1"
 continuo = { path = ".", features = ["full"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 axum = "0.8"
-dotenw = { path = "../dotenw" }
-congif = { path = "../congif", features = ["json", "toml", "watch"] }
+dotenw = { version = "0.1", path = "../dotenw" }
+congif = { version = "0.1", path = "../congif", features = ["json", "toml", "watch"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

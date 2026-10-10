@@ -47,15 +47,9 @@
           <div class="runtime-details"><span class="eyebrow">SERVICE STATUS</span><p id="action-status" role="status">Ready for commands</p><code id="runtime-snapshot">{{status}}</code></div>
         </section>
         <section class="card editor-card">
-          <div class="card-heading"><div><span class="eyebrow">LIVE CONFIGURATION</span><h2>Make a change.</h2></div><span class="file-tag">counter.json</span></div>
+          <div class="card-heading"><div><span class="eyebrow">LIVE CONFIGURATION</span><h2>Edit the file.</h2></div><span class="file-tag">counter.json</span></div>
           <p class="muted">Save the file. Let the watcher do the rest.</p>
-          <form method="post" action="/counter/config" id="config-form">
-            <div class="editor-heading"><span>JSON</span><button type="button" class="text-button" id="format">Format</button></div>
-            <label for="config" class="sr-only">Counter JSON configuration</label>
-            <textarea name="json" id="config" required spellcheck="false">{{config}}</textarea>
-            <div class="editor-footer"><span id="editor-status">Validated on the server</span><button class="primary" type="submit">Save configuration ↗</button></div>
-          </form>
-          <aside class="manual-config-note"><strong>Your editor works, too.</strong><p>This panel is just a helper. Edit <code>examples/playground/config/counter.json</code> directly and save — the application watches the file and reloads the counter settings, even while the counter is stopped.</p></aside>
+          <aside class="manual-config-note"><strong>Your editor is the editor.</strong><p>Edit <code>examples/playground/config/counter.json</code> and save. The application watches the file, validates the candidate and reloads the counter settings, even while the counter is stopped. An invalid edit is rejected and the previous configuration stays in effect.</p></aside>
           <div class="config-hints"><div><code>increment</code><span>Added when you press Hit. Reload preserves the count.</span></div><div><code>state</code><span>The count is saved separately when the service stops.</span></div></div>
         </section>
       </div>
@@ -68,12 +62,12 @@
         <p class="muted">Hits are ignored while the counter is stopped. Standard Unix signals may coalesce; this is a demo trigger, not a counted message queue.</p>
       </section>
       <section class="flow-strip">
-        <div><span class="step">01</span><strong>Validate</strong><small>Typed schema + domain rules</small></div><span class="arrow">→</span>
-        <div><span class="step">02</span><strong>Save</strong><small>Atomic file replacement</small></div><span class="arrow">→</span>
-        <div><span class="step">03</span><strong>Watch</strong><small>Native filesystem signal</small></div><span class="arrow">→</span>
+        <div><span class="step">01</span><strong>Save</strong><small>Your editor writes the file</small></div><span class="arrow">→</span>
+        <div><span class="step">02</span><strong>Watch</strong><small>Native filesystem signal</small></div><span class="arrow">→</span>
+        <div><span class="step">03</span><strong>Validate</strong><small>Typed schema + domain rules</small></div><span class="arrow">→</span>
         <div><span class="step">04</span><strong>Apply</strong><small>Swap configuration · preserve count</small></div>
       </section>
-      <footer><span>Built with <strong>continuo</strong> + <strong>congif</strong></span><nav><a href="/services">Service registry ↗</a><a href="/reload">Reload providers ↗</a></nav></footer>
+      <footer><span>Built with <strong>continuo</strong> + <strong>congif</strong></span><nav><a href="/services">Service registry ↗</a><a href="/reload">Reload components ↗</a></nav></footer>
     </main>
   </div>
 </body>

@@ -1,7 +1,7 @@
 #[path = "../support/atomic_parser.rs"]
 mod atomic_parser;
 use super::apply_configured_reload;
-use crate::{Error, Provider, Reloadable, Result};
+use crate::{Component, Error, Reloadable, Result};
 use async_trait::async_trait;
 use congif::{ConfigReader, ConfigRegistration, Configurable};
 use std::sync::Arc;
@@ -61,7 +61,8 @@ impl congif::ConfigObserver for Settings {
 }
 
 #[async_trait]
-impl Provider<ConfigReader> for Settings {
+impl Component<ConfigReader> for Settings {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "settings"
     }

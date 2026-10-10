@@ -98,6 +98,7 @@ impl congif::ConfigObserver for Preparation {
 }
 #[async_trait]
 impl Component<State> for Preparation {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "preparation"
     }
@@ -113,6 +114,7 @@ impl Component<State> for Preparation {
 impl Bootable<State> for Preparation {
     async fn boot(
         &self,
+        _deps: (),
         state: &State,
     ) -> Result<()> {
         let config = state.config_reader().snapshot::<Self>()?;
@@ -124,6 +126,7 @@ impl Bootable<State> for Preparation {
 struct Ready(Preparation);
 #[async_trait]
 impl Component<State> for Ready {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "ready"
     }
@@ -167,7 +170,7 @@ async fn wrapper_and_ready_service_share_one_config_owner_and_reload_target() {
     }));
     state
         .registry_ref()
-        .register_lifecycle(Arc::new(Preparation {
+        .register(Arc::new(Preparation {
             configured: configured.clone(),
             value: value.clone(),
         }))
@@ -176,7 +179,6 @@ async fn wrapper_and_ready_service_share_one_config_owner_and_reload_target() {
     assert_eq!(reads.load(Ordering::Relaxed), 1);
     assert_eq!(configured.load(Ordering::Relaxed), 1);
     assert_eq!(value.load(Ordering::Relaxed), 7);
-    assert!(state.registry_ref().resolve::<Preparation>().is_none());
     let ready = state.registry_ref().resolve::<Ready>().unwrap();
     let entries = state.registry_ref().configuration_entries().unwrap();
     assert_eq!(entries.len(), 1);

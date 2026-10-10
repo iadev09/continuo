@@ -6,7 +6,9 @@ use tokio::task::{Id, JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error};
 
-use crate::registry::{Component, Error, Registry, Result, Runnable};
+#[cfg(feature = "registry")]
+use crate::registry::FinalizeOutcome;
+use crate::registry::{AnyComponent, AnyRunnable, Error, Registry, Result};
 use crate::service::{
     RunContext, ServiceCommand, ServiceManager, ServiceManagerError,
     ServiceSnapshot, ServiceStartPolicy, ServiceStatus,
@@ -17,15 +19,16 @@ use crate::{HasRegistry, Register};
 
 /// Apply one reload with the catalog bound during runtime configuration.
 /// Native file watching is only an invalidation source, not a prerequisite.
+#[cfg(feature = "config")]
 async fn apply_configured_reload<S: 'static>(
     reader: Option<&congif::ConfigReader>,
-    provider: &dyn Component<S>,
+    component: &dyn AnyComponent<S>,
     reloadable: &dyn crate::Reloadable<S>,
     state: &S,
     config_prepared: bool,
 ) -> Result<()> {
     let candidate =
-        if let Some(owner) = provider.as_configurable() {
+        if let Some(owner) = component.as_configurable() {
             let reader = reader.ok_or_else(|| Error::msg(
             "configure the runtime before reloading a configurable service",
         ))?;
@@ -38,7 +41,7 @@ async fn apply_configured_reload<S: 'static>(
         };
     if config_prepared
         && let (Some(reader), Some(owner)) =
-            (reader, provider.as_configurable())
+            (reader, component.as_configurable())
     {
         reader.notify_changed(owner).await?;
         return Ok(());
@@ -50,7 +53,7 @@ async fn apply_configured_reload<S: 'static>(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "config"))]
 #[path = "../tests/runtime/config_reload.rs"]
 mod config_reload_tests;
 
@@ -71,8 +74,8 @@ struct TaskIdentity {
 }
 
 struct ServiceEntry<S> {
-    provider: Arc<dyn Component<S>>,
-    runnable: Arc<dyn Runnable<S>>,
+    component: Arc<dyn AnyComponent<S>>,
+    runnable: Arc<dyn AnyRunnable<S>>,
     status: ServiceStatus,
     generation: u64,
     cancellation: Option<CancellationToken>,
@@ -93,7 +96,7 @@ impl<S: 'static> ServiceEntry<S> {
             name,
             status: self.status,
             start_policy: self.runnable.start_policy(state),
-            reloadable: self.provider.as_reloadable().is_some(),
+            reloadable: self.component.as_reloadable().is_some(),
             generation: self.generation,
             last_error: self.last_error.clone(),
             reload_revision: self.reload_revision,
@@ -112,10 +115,14 @@ pub struct Runtime<S> {
     task_identities: HashMap<Id, TaskIdentity>,
     services: HashMap<&'static str, ServiceEntry<S>>,
     state: Option<S>,
+    registry: Option<Registry<S>>,
     manager: Arc<ServiceManager>,
     commands: mpsc::Receiver<ServiceCommand>,
     shutting_down: bool,
+    // Registrations recorded by `with_services`, applied by `register_services`.
+    registrations: Vec<fn(&S) -> Result<()>>,
     // Configuration is a runtime capability, independent of native watching.
+    #[cfg(feature = "config")]
     config_reader: Option<fn(&S) -> &congif::ConfigReader>,
     #[cfg(feature = "fleet")]
     dispatcher: Option<Arc<dyn crate::fleet::Dispatcher<S>>>,
@@ -131,9 +138,12 @@ impl<S> Default for Runtime<S> {
             task_identities: HashMap::new(),
             services: HashMap::new(),
             state: None,
+            registry: None,
             manager,
             commands,
             shutting_down: false,
+            registrations: Vec::new(),
+            #[cfg(feature = "config")]
             config_reader: None,
             #[cfg(feature = "fleet")]
             dispatcher: None,
@@ -147,7 +157,7 @@ impl<S> Runtime<S> {
     /// Return the control capability backed by this runtime.
     ///
     /// `with_services` registers this capability automatically. For manual
-    /// composition, register this same `Arc` before provider boot.
+    /// composition, register this same `Arc` before component boot.
     pub fn manager(&self) -> Arc<ServiceManager> {
         self.manager.clone()
     }
@@ -155,12 +165,83 @@ impl<S> Runtime<S> {
 
 #[cfg(feature = "registry")]
 impl<S: HasRegistry + 'static> Runtime<S> {
-    /// Register application service types before boot, together with this
-    /// runtime's own control capability. Repeated calls retain the same manager;
-    /// a manager belonging to another runtime is rejected, never replaced.
-    /// As with `Register`, failures retain already completed registrations.
-    fn register_services<R: Register<S>>(
-        &self,
+    /// Boot, then [`run_prepared`](Self::run_prepared).
+    ///
+    /// The whole lifecycle of an application without typed configuration:
+    /// `boot_all`, `validate_all`, `spawn_all`, wait for shutdown, drain,
+    /// `finalize_all`.
+    pub async fn run(
+        mut self,
+        state: S,
+    ) -> Result<FinalizeOutcome> {
+        self.register_services(&state)?;
+        state.registry_ref().boot_all(&state).await?;
+        self.run_prepared(state).await
+    }
+
+    /// Run an already booted registry to completion.
+    ///
+    /// Validates every component and refuses to start if any fails
+    /// (`Error::Invalid` carries the whole outcome). Spawns the runnables,
+    /// waits until shutdown is initiated or a runnable fails fatally, drains,
+    /// then finalizes. Finalization runs even after a failure, so named
+    /// resources are released; the failure is then returned and finalize
+    /// failures are reported through `tracing`. On success the finalize
+    /// outcome is returned for the caller to inspect.
+    pub async fn run_prepared(
+        mut self,
+        state: S,
+    ) -> Result<FinalizeOutcome> {
+        let admission =
+            state.registry_ref().validate_all(&state).and_then(|validated| {
+                if !validated.is_valid() {
+                    return Err(Error::Invalid(validated));
+                }
+                self.spawn_all(state.registry_ref(), state.clone()).map(|_| ())
+            });
+        let outcome = match admission {
+            Ok(()) => self.wait_until_shutdown(&state).await,
+            Err(error) => {
+                self.begin_shutdown();
+                Err(error)
+            }
+        };
+        let drained = self.drain().await;
+        let finalized = state.registry_ref().finalize_all(&state).await;
+        match outcome.and(drained) {
+            Ok(()) => finalized,
+            Err(failure) => {
+                match finalized {
+                    Ok(finalized) => {
+                        for failure in finalized.failures() {
+                            error!(component = failure.component(), error = %failure.error(), "finalize failed after runtime failure");
+                        }
+                    }
+                    Err(error) => {
+                        error!(%error, "finalization did not run after runtime failure");
+                    }
+                }
+                Err(failure)
+            }
+        }
+    }
+
+    /// Record the application's service types. Nothing is registered yet:
+    /// `register_services` applies the recorded registrations, and `run`,
+    /// `serve`, `configure` and `prepare` call it first.
+    pub fn with_services<R: Register<S>>(mut self) -> Self {
+        self.registrations.push(R::register);
+        self
+    }
+
+    /// Apply the registrations recorded by `with_services`, in order, together
+    /// with this runtime's own `ServiceManager`. A manager belonging to
+    /// another runtime is rejected, never replaced. As with `Register`, a
+    /// failure retains the registrations already completed. Failed and pending
+    /// callbacks stay queued; retrying requires the failed callback to tolerate
+    /// any work it already completed, since registration is not transactional.
+    pub fn register_services(
+        &mut self,
         state: &S,
     ) -> Result<()> {
         let registry = state.registry_ref();
@@ -173,29 +254,18 @@ impl<S: HasRegistry + 'static> Runtime<S> {
         } else {
             registry.insert(self.manager())?;
         }
-        R::register(state)?;
-        Ok(())
-    }
-
-    /// Register services and this runtime's manager, without preparing
-    /// configuration or installing watches. Watching is an explicit opt-in
-    /// through `watch_configurations`, independent of service registration.
-    pub fn with_services<R: Register<S>>(
-        self,
-        state: &S,
-    ) -> Result<Self> {
-        if self.state.is_some() {
-            return Err(Error::msg("register services before spawning them"));
+        while let Some(register) = self.registrations.first().copied() {
+            register(state)?;
+            self.registrations.remove(0);
         }
-        self.register_services::<R>(state)?;
-        Ok(self)
+        Ok(())
     }
 }
 
-#[cfg(feature = "registry")]
+#[cfg(all(feature = "registry", feature = "config"))]
 impl<S: HasRegistry + congif::HasConfigReader> Runtime<S> {
     /// Prepare and validate all registered config owners before resources run.
-    /// Providers do not need a boot hook merely to initialize configuration.
+    /// Components do not need a boot hook merely to initialize configuration.
     pub async fn configure(
         &mut self,
         state: &S,
@@ -203,10 +273,11 @@ impl<S: HasRegistry + congif::HasConfigReader> Runtime<S> {
         if self.state.is_some() {
             return Err(Error::msg("configure services before spawning them"));
         }
-        let providers = state.registry_ref().configuration_entries()?;
-        let owners: Vec<_> = providers
+        self.register_services(state)?;
+        let components = state.registry_ref().configuration_entries()?;
+        let owners: Vec<_> = components
             .iter()
-            .filter_map(|(_, provider)| provider.as_configurable())
+            .filter_map(|(_, component)| component.as_configurable())
             .collect();
         state.config_reader().initialize_owners(&owners).await?;
         for registration in owners {
@@ -234,6 +305,7 @@ impl<S: HasRegistry + congif::HasConfigReader> Runtime<S> {
         &mut self,
         state: &S,
     ) -> Result<()> {
+        self.register_services(state)?;
         let declared: std::collections::HashSet<_> = state
             .registry_ref()
             .configuration_entries()?
@@ -265,13 +337,14 @@ impl<S: HasRegistry + congif::HasConfigReader> Runtime<S> {
 }
 
 /// Register or replace the program environments of every `Environmental`
-/// provider among `providers`, from their applied configurations.
+/// component among `components`, from their applied configurations.
+#[cfg(all(feature = "registry", feature = "config"))]
 fn prepare_programs<S: 'static>(
     reader: &congif::ConfigReader,
-    providers: &[(std::any::TypeId, Arc<dyn Component<S>>)],
+    components: &[(std::any::TypeId, Arc<dyn AnyComponent<S>>)],
 ) -> Result<()> {
-    for (owner, provider) in providers {
-        if let Some(environmental) = provider.as_environmental() {
+    for (owner, component) in components {
+        if let Some(environmental) = component.as_environmental() {
             reader.prepare_programs(
                 *owner,
                 environmental.program_environments(),
@@ -283,6 +356,18 @@ fn prepare_programs<S: 'static>(
 
 #[cfg(feature = "config-watch")]
 impl<S: HasRegistry + crate::HasEvents + crate::HasConfigReader> Runtime<S> {
+    /// The whole lifecycle of a configured, watched application:
+    /// [`watch_configurations`](Self::watch_configurations),
+    /// [`prepare`](Self::prepare), then [`run_prepared`](Self::run_prepared).
+    pub async fn serve(
+        mut self,
+        state: S,
+    ) -> Result<FinalizeOutcome> {
+        self.watch_configurations(&state)?;
+        self.prepare(&state).await?;
+        self.run_prepared(state).await
+    }
+
     /// Prepare common file watches and event subscription after registration,
     /// before boot reads config. The existing runtime control loop consumes
     /// notifications; no separate task, future or Application join is needed.
@@ -298,6 +383,7 @@ impl<S: HasRegistry + crate::HasEvents + crate::HasConfigReader> Runtime<S> {
         if self.configuration.is_some() {
             return Err(Error::msg("configuration watching already prepared"));
         }
+        self.register_services(state)?;
         self.configuration =
             Some(crate::watcher::ConfigurationWatch::new(state)?);
         self.config_reader = Some(S::config_reader);
@@ -325,7 +411,7 @@ where
         Ok(self)
     }
 
-    /// Register and start all runnable providers.
+    /// Register and start all runnable components.
     ///
     /// Runnable names must be unique because they are the stable management
     /// identity. The runtime may only be initialized once.
@@ -339,6 +425,11 @@ where
                 "runtime runnable set is already initialized",
             ));
         }
+        if !self.registrations.is_empty() {
+            return Err(Error::msg(
+                "services were recorded after boot; register them before prepare or run",
+            ));
+        }
 
         let runnables = registry.runnable_entries()?;
         #[cfg(feature = "fleet")]
@@ -346,12 +437,12 @@ where
             .into_iter()
             .filter(|entry| {
                 let scope = entry
-                    .provider
+                    .component
                     .as_scoped()
                     .map(crate::fleet::Scoped::scope)
                     .or_else(|| {
                         entry
-                            .provider
+                            .component
                             .as_dispatched()
                             .map(|placement| placement.scope())
                     })
@@ -367,40 +458,54 @@ where
                     "duplicate runnable service name '{name}'"
                 )));
             }
-            #[cfg(feature = "fleet")]
-            if let Some(placement) = entry.provider.as_dispatched()
-                && placement.dispatch().is_controller_driven()
-            {
-                let dispatcher = self.dispatcher.as_ref().ok_or_else(|| {
-                    Error::msg(format!(
-                        "service '{}' requires a fleet dispatcher",
-                        entry.name
-                    ))
-                })?;
-                dispatcher.validate(
-                    &crate::fleet::DispatchRequest {
-                        name: entry.name,
-                        generation: 1,
-                        scope: placement.scope(),
-                        dispatch: placement.dispatch(),
-                    },
-                    &state,
-                )?;
-            }
         }
 
+        // Admit all automatic generations before starting any task. A missing
+        // dependency must not leave earlier services partially running.
+        let runnables = runnables
+            .into_iter()
+            .map(|entry| {
+                let bound = if entry.runnable.start_policy(&state)
+                    == ServiceStartPolicy::Automatic
+                {
+                    #[cfg(feature = "fleet")]
+                    if let Some(placement) = entry.component.as_dispatched()
+                        && placement.dispatch().is_controller_driven()
+                    {
+                        let dispatcher =
+                            self.dispatcher.as_ref().ok_or_else(|| {
+                                Error::msg(format!(
+                                    "service '{}' requires a fleet dispatcher",
+                                    entry.name
+                                ))
+                            })?;
+                        dispatcher.validate(
+                            &crate::fleet::DispatchRequest {
+                                name: entry.name,
+                                generation: 1,
+                                scope: placement.scope(),
+                                dispatch: placement.dispatch(),
+                            },
+                            &state,
+                        )?;
+                    }
+                    Some(entry.runnable.clone().bind(registry)?)
+                } else {
+                    None
+                };
+                Ok((entry, bound))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        self.registry = Some(registry.shared());
         self.state = Some(state);
-        for entry in runnables {
+        for (entry, bound) in runnables {
             let name = entry.name;
-            let start_policy = entry.runnable.start_policy(
-                self.state
-                    .as_ref()
-                    .expect("runtime state was initialized above"),
-            );
+            let automatic = bound.is_some();
             self.services.insert(
                 name,
                 ServiceEntry {
-                    provider: entry.provider,
+                    component: entry.component,
                     runnable: entry.runnable,
                     status: ServiceStatus::Stopped,
                     generation: 0,
@@ -411,12 +516,12 @@ where
                     stop_waiters: Vec::new(),
                 },
             );
-            if start_policy == ServiceStartPolicy::Automatic {
-                // Boot may have been interrupted after providers registered work
+            if automatic {
+                // Boot may have been interrupted after components registered work
                 // but before runnable submission. Submit the initial generation
                 // even with an already-cancelled parent so each runnable can
                 // perform its own no-new-work/final-drain path.
-                self.start_generation(name, true)?;
+                self.start_admitted_generation(name, true, bound)?;
             }
         }
 
@@ -428,6 +533,15 @@ where
         name: &'static str,
         allow_cancelled_parent: bool,
     ) -> Result<ServiceSnapshot> {
+        self.start_admitted_generation(name, allow_cancelled_parent, None)
+    }
+
+    fn start_admitted_generation(
+        &mut self,
+        name: &'static str,
+        allow_cancelled_parent: bool,
+        bound: Option<Arc<dyn AnyRunnable<S>>>,
+    ) -> Result<ServiceSnapshot> {
         let state =
             self.state.as_ref().cloned().ok_or_else(|| {
                 Error::msg("service runtime is not initialized")
@@ -438,31 +552,25 @@ where
             return Err(Error::msg("service runtime is shutting down"));
         }
 
-        let start_policy = self
-            .services
-            .get(name)
-            .ok_or_else(|| {
-                Error::msg(format!(
-                    "runnable service '{name}' is not registered"
-                ))
-            })?
-            .runnable
-            .start_policy(&state);
-        if start_policy == ServiceStartPolicy::Unavailable {
+        let service = self.services.get_mut(name).ok_or_else(|| {
+            Error::msg(format!("runnable service '{name}' is not registered"))
+        })?;
+        // Initial automatic activation was already decided during preflight.
+        // Explicit starts and restarts consult the current policy instead.
+        if bound.is_none()
+            && service.runnable.start_policy(&state)
+                == ServiceStartPolicy::Unavailable
+        {
             return Err(Error::msg(format!(
                 "runnable service '{name}' is unavailable on this runtime"
             )));
         }
-
-        let service = self.services.get_mut(name).ok_or_else(|| {
-            Error::msg(format!("runnable service '{name}' is not registered"))
-        })?;
         let generation =
             service.generation.checked_add(1).ok_or_else(|| {
                 Error::msg(format!("service '{name}' generation overflow"))
             })?;
         #[cfg(feature = "fleet")]
-        let dispatch = match service.provider.as_dispatched() {
+        let dispatch = match service.component.as_dispatched() {
             Some(placement) if placement.dispatch().is_controller_driven() => {
                 let request = crate::fleet::DispatchRequest {
                     name,
@@ -475,17 +583,26 @@ where
                         "service '{name}' requires a fleet dispatcher"
                     ))
                 })?;
-                dispatcher.validate(&request, &state)?;
+                if bound.is_none() {
+                    dispatcher.validate(&request, &state)?;
+                }
                 Some((dispatcher, request))
             }
             _ => None,
+        };
+        let runnable = match bound {
+            Some(runnable) => runnable,
+            None => service.runnable.clone().bind(
+                self.registry.as_ref().ok_or_else(|| {
+                    Error::msg("service registry is not initialized")
+                })?,
+            )?,
         };
         service.generation = generation;
         service.status = ServiceStatus::Running;
         service.last_error = None;
 
         let generation = service.generation;
-        let runnable = service.runnable.clone();
         let cancellation = state.shutdown_token().child_token();
         service.cancellation = Some(cancellation.clone());
         let snapshot = service.snapshot(name, &state);
@@ -513,7 +630,7 @@ where
                 ServiceExit { name, generation, result }
             }
             .instrument(
-                tracing::debug_span!("provider", provider = %name, generation),
+                tracing::debug_span!("component", component = %name, generation),
             ),
         );
         self.task_identities
@@ -665,8 +782,8 @@ where
                         .send(Err(ServiceManagerError::RuntimeUnavailable));
                     return;
                 };
-                let provider = self.services[static_name].provider.clone();
-                let Some(reloadable) = provider.as_reloadable() else {
+                let component = self.services[static_name].component.clone();
+                let Some(reloadable) = component.as_reloadable() else {
                     let _ = reply
                         .send(Err(ServiceManagerError::NotReloadable(name)));
                     return;
@@ -686,16 +803,21 @@ where
                         return;
                     }
                 };
-                let reader = self.config_reader.map(|reader| reader(&state));
+                #[cfg(feature = "config")]
                 let reload = apply_configured_reload(
-                    reader,
-                    provider.as_ref(),
+                    self.config_reader.map(|reader| reader(&state)),
+                    component.as_ref(),
                     reloadable,
                     &state,
                     config_prepared,
                 )
-                .await
-                .map_err(|error: Error| {
+                .await;
+                #[cfg(not(feature = "config"))]
+                let reload = {
+                    let _ = config_prepared;
+                    reloadable.reload(&state).await
+                };
+                let reload = reload.map_err(|error: Error| {
                     error.into_reload(static_name).to_string()
                 });
                 let service = self
@@ -785,7 +907,7 @@ where
                     let _ = waiter.send(Ok(snapshot.clone()));
                 }
                 debug!(
-                    provider = exit.name,
+                    component = exit.name,
                     generation = exit.generation,
                     "runnable stopped"
                 );
@@ -806,7 +928,7 @@ where
 
                 match error {
                     Error::Recoverable { name, source } => {
-                        error!(provider = %name, "runnable failed (runtime continuing): {}", source);
+                        error!(component = %name, "runnable failed (runtime continuing): {}", source);
                         Ok(())
                     }
                     fatal => Err(fatal),
@@ -918,18 +1040,18 @@ where
     ) {
         let Some(state) = self.state.as_ref() else { return };
         let Some(watching) = self.configuration.as_mut() else { return };
-        let providers = match watching.prepare(state, changes).await {
-            Ok(providers) => providers,
+        let components = match watching.prepare(state, changes).await {
+            Ok(components) => components,
             Err(error) => {
                 error!(%error, "configuration preparation rejected; previous snapshots retained");
                 return;
             }
         };
-        for provider in providers {
-            let name = provider.name();
-            let result = if provider.as_reloadable().is_some()
+        for component in components {
+            let name = component.name();
+            let result = if component.as_reloadable().is_some()
                 && self.services.get(name).is_some_and(|service| {
-                    Arc::ptr_eq(&service.provider, &provider)
+                    Arc::ptr_eq(&service.component, &component)
                 }) {
                 let (reply, received) = oneshot::channel();
                 // Already inside the runtime loop: call the command handler,
@@ -949,7 +1071,7 @@ where
                     })
             } else {
                 let Some(state) = self.state.as_ref() else { continue };
-                match provider.as_configurable() {
+                match component.as_configurable() {
                     Some(owner) => {
                         (self.config_reader.expect("watch binds reader"))(state)
                             .notify_changed(owner)
@@ -960,20 +1082,20 @@ where
                 }
             };
             if let Err(error) = result {
-                error!(provider = name, %error, "configuration reload rejected");
+                error!(component = name, %error, "configuration reload rejected");
                 continue;
             }
             // A reloaded configuration may declare programs differently.
             if let (Some(state), Some(environmental)) =
-                (self.state.as_ref(), provider.as_environmental())
+                (self.state.as_ref(), component.as_environmental())
             {
                 let reader =
                     (self.config_reader.expect("watch binds reader"))(state);
                 if let Err(error) = reader.prepare_programs(
-                    (*provider).type_id(),
+                    (*component).type_id(),
                     environmental.program_environments(),
                 ) {
-                    error!(provider = name, %error, "program environments rejected");
+                    error!(component = name, %error, "program environments rejected");
                 }
             }
         }
@@ -1021,3 +1143,7 @@ where
 #[cfg(test)]
 #[path = "../tests/runtime/management.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/runtime/admission.rs"]
+mod admission_tests;

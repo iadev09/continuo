@@ -18,17 +18,19 @@ impl OtherService {
 
 impl Register<AppState> for OtherService {
     fn register(state: &AppState) -> Result<()> {
-        state.reader().bind_environment::<Self>(
-            state.environment(&state.application_config().counter.env_file)?,
-        )?;
+        state
+            .reader()
+            .bind_environment::<Self>(state.environment("counter.env")?)?;
         state.registry_ref().register(Arc::new(Self {
-            config_path: state.application_config().counter.config_path.clone(),
+            config_path: super::super::config::root()
+                .join("config/counter.json"),
         }))?;
         Ok(())
     }
 }
 
 impl Component<AppState> for OtherService {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "DuplicateReaderService"
     }
@@ -48,9 +50,6 @@ impl Configurable for OtherService {
             path: self.config_path.clone(),
             format: congif::Format::Json,
         }
-    }
-    fn namespace(&self) -> String {
-        "other".to_owned()
     }
     fn validate_config(
         &self,

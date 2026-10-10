@@ -1,56 +1,48 @@
-//! Application composition and lifecycle; the executable only launches it.
+//! The playground application: state, services and handlers, composed in
+//! `main` and run by Continuo.
 
 mod config;
 mod counter;
 mod environment;
 mod events;
 mod handlers;
-mod services;
+pub mod services;
 mod state;
 
-use continuo::{Error, HasRegistry, Register, Result, Runtime};
-pub use environment::environment;
-pub use services::{
-    CounterService, HttpService, OtherService, ReloadService, SignalService,
-};
+use continuo::{Register, Result, Runtime};
+pub use environment::Environment;
 use state::AppState;
 
+/// Composition of the playground. Nothing happens until `run`.
+#[derive(Default)]
 pub struct Application {
-    state: AppState,
+    environment: Environment,
     runtime: Runtime<AppState>,
 }
 
 impl Application {
-    pub async fn new(environments: dotenw::EnvStore) -> Result<Self> {
-        let state = AppState::new(environments).await?;
-        let runtime = Runtime::<AppState>::default();
-        Ok(Self { state, runtime })
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    pub fn with_services<R: Register<AppState>>(mut self) -> Result<Self> {
-        self.runtime = self.runtime.with_services::<R>(&self.state)?;
-        Ok(self)
+    pub fn with_environment(
+        mut self,
+        environment: Environment,
+    ) -> Self {
+        self.environment = environment;
+        self
     }
 
+    pub fn with_services<R: Register<AppState>>(mut self) -> Self {
+        self.runtime = self.runtime.with_services::<R>();
+        self
+    }
+
+    /// Build the state from the selected environment, then hand the
+    /// composition to Continuo: register, watch, prepare, run, finalize.
     pub async fn run(self) -> Result<()> {
-        let Self { state, mut runtime } = self;
-        let registry = state.registry_ref();
-        runtime.watch_configurations(&state)?;
-        runtime.prepare(&state).await?;
-        runtime.spawn_all(registry, state.clone())?;
-
-        // Read a required config value using dot notation.
-        let increment = state
-            .config::<usize>("counter.increment")?
-            .ok_or_else(|| Error::msg("counter.increment is not configured"))?;
-
-        println!("Counter hit increments by {increment}");
-
-        let runtime_result = runtime.wait_until_shutdown(&state).await;
-        runtime.drain().await?;
-        runtime_result?;
-
-        let finalized = registry.finalize_all(&state).await?;
+        let state = AppState::new(self.environment.store()?)?;
+        let finalized = self.runtime.serve(state).await?;
         for failure in finalized.failures() {
             eprintln!(
                 "finalize failed for {}: {}",
@@ -58,8 +50,6 @@ impl Application {
                 failure.error()
             );
         }
-
-        println!("all services finished gracefully");
         Ok(())
     }
 }

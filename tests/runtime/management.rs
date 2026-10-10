@@ -1,11 +1,14 @@
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 
 use super::*;
-use crate::{HasRegistry, Reloadable, RunContext, ServiceStartPolicy};
+use crate::{
+    Component, HasRegistry, Reloadable, RunContext, Runnable,
+    ServiceStartPolicy,
+};
 
 #[derive(Clone)]
 struct TestState(Arc<TestStateInner>);
@@ -69,6 +72,7 @@ impl ManagedCounter {
 
 #[async_trait]
 impl Component<TestState> for ManagedCounter {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "counter"
     }
@@ -100,6 +104,7 @@ impl Reloadable<TestState> for ManagedCounter {
 impl Runnable<TestState> for ManagedCounter {
     async fn run(
         self: Arc<Self>,
+        _deps: (),
         _state: TestState,
         context: RunContext,
     ) -> Result<()> {
@@ -110,6 +115,135 @@ impl Runnable<TestState> for ManagedCounter {
         self.stops.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+}
+
+struct Lifecycle {
+    steps: Mutex<Vec<&'static str>>,
+}
+
+impl Lifecycle {
+    fn new() -> Self {
+        Self { steps: Mutex::new(Vec::new()) }
+    }
+
+    fn record(
+        &self,
+        step: &'static str,
+    ) {
+        self.steps.lock().expect("steps poisoned").push(step);
+    }
+}
+
+#[async_trait]
+impl Component<TestState> for Lifecycle {
+    type Deps = ();
+    fn name(&self) -> &'static str {
+        "lifecycle"
+    }
+
+    fn as_bootable(&self) -> Option<&dyn crate::Bootable<TestState>> {
+        Some(self)
+    }
+
+    fn as_runnable(self: Arc<Self>) -> Option<Arc<dyn Runnable<TestState>>> {
+        Some(self)
+    }
+
+    fn as_finalizable(&self) -> Option<&dyn crate::Finalizable<TestState>> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl crate::Bootable<TestState> for Lifecycle {
+    async fn boot(
+        &self,
+        _deps: (),
+        _state: &TestState,
+    ) -> Result<()> {
+        self.record("boot");
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Runnable<TestState> for Lifecycle {
+    async fn run(
+        self: Arc<Self>,
+        _deps: (),
+        state: TestState,
+        context: RunContext,
+    ) -> Result<()> {
+        self.record("run");
+        // The service decides the process is done, as a signal handler would.
+        state.initiate_shutdown();
+        context.cancelled().await;
+        self.record("stop");
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl crate::Finalizable<TestState> for Lifecycle {
+    async fn finalize(
+        &self,
+        _state: &TestState,
+    ) -> Result<()> {
+        self.record("finalize");
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn run_drives_boot_spawn_drain_and_finalize_in_order() {
+    let state = TestState::new();
+    let lifecycle = Arc::new(Lifecycle::new());
+    state.registry_ref().register(lifecycle.clone()).unwrap();
+
+    let finalized = Runtime::<TestState>::default().run(state).await.unwrap();
+
+    assert_eq!(finalized.finalized_count(), 1);
+    assert_eq!(
+        *lifecycle.steps.lock().unwrap(),
+        ["boot", "run", "stop", "finalize"]
+    );
+}
+
+struct Invalid;
+
+impl Component<TestState> for Invalid {
+    type Deps = ();
+    fn name(&self) -> &'static str {
+        "invalid"
+    }
+
+    fn validate(
+        &self,
+        _: &TestState,
+    ) -> Result<()> {
+        Err(Error::msg("not ready"))
+    }
+}
+
+#[tokio::test]
+async fn run_refuses_to_start_when_validation_fails() {
+    let state = TestState::new();
+    state.registry_ref().register(Arc::new(Invalid)).unwrap();
+    let lifecycle = Arc::new(Lifecycle::new());
+    state.registry_ref().register(lifecycle.clone()).unwrap();
+
+    let error = Runtime::<TestState>::default()
+        .run(state.clone())
+        .await
+        .expect_err("invalid component must stop the start");
+
+    let Error::Invalid(outcome) = error else {
+        panic!("expected Error::Invalid, got {error}");
+    };
+    assert_eq!(outcome.failed_count(), 1);
+    assert_eq!(outcome.failures()[0].component(), "invalid");
+    assert!(!state.is_shutting_down(), "nothing ran, nothing shut down");
+    assert_eq!(*lifecycle.steps.lock().unwrap(), ["boot", "finalize"]);
 }
 
 async fn wait_for(
@@ -239,6 +373,7 @@ impl PolicyService {
 
 #[async_trait]
 impl Component<TestState> for PolicyService {
+    type Deps = ();
     fn name(&self) -> &'static str {
         self.name
     }
@@ -259,6 +394,7 @@ impl Runnable<TestState> for PolicyService {
 
     async fn run(
         self: Arc<Self>,
+        _deps: (),
         _state: TestState,
         context: RunContext,
     ) -> Result<()> {

@@ -39,7 +39,7 @@ impl<T> Live<T> {
         self.state.lock().expect("live resource poisoned").running
     }
 
-    /// The provider serializes reloads; at most one handoff is outstanding.
+    /// The component serializes reloads; at most one handoff is outstanding.
     pub async fn replace(
         &self,
         value: T,

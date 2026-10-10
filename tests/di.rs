@@ -55,6 +55,7 @@ struct Constructor {
 
 #[async_trait]
 impl Component<PreparationState> for Constructor {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "constructor"
     }
@@ -68,6 +69,7 @@ impl Component<PreparationState> for Constructor {
 impl Bootable<PreparationState> for Constructor {
     async fn boot(
         &self,
+        _deps: (),
         state: &PreparationState,
     ) -> Result<()> {
         if self.fail {
@@ -76,7 +78,7 @@ impl Bootable<PreparationState> for Constructor {
         state.steps.lock().unwrap().push("construct");
         state.registry.insert(Arc::new(PreparedService { value: 7 }))?;
         state.registry.insert(Arc::new(PreparedDependency))?;
-        state.registry.register_lifecycle(Arc::new(LateDependency))?;
+        state.registry.register(Arc::new(LateDependency))?;
         Ok(())
     }
 }
@@ -84,6 +86,7 @@ impl Bootable<PreparationState> for Constructor {
 struct LateDependency;
 #[async_trait]
 impl Component<PreparationState> for LateDependency {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "late-dependency"
     }
@@ -96,6 +99,7 @@ impl Component<PreparationState> for LateDependency {
 impl Bootable<PreparationState> for LateDependency {
     async fn boot(
         &self,
+        _deps: (),
         state: &PreparationState,
     ) -> Result<()> {
         state.steps.lock().unwrap().push("dependency");
@@ -105,6 +109,7 @@ impl Bootable<PreparationState> for LateDependency {
 struct Consumer;
 #[async_trait]
 impl Component<PreparationState> for Consumer {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "consumer"
     }
@@ -120,6 +125,7 @@ impl Component<PreparationState> for Consumer {
 impl Bootable<PreparationState> for Consumer {
     async fn boot(
         &self,
+        _deps: (),
         state: &PreparationState,
     ) -> Result<()> {
         assert_eq!(
@@ -134,11 +140,8 @@ impl Bootable<PreparationState> for Consumer {
 #[tokio::test]
 async fn construction_publishes_complete_di_values_and_replans_dependencies() {
     let state = PreparationState::default();
-    state.registry.register_lifecycle(Arc::new(Consumer)).unwrap();
-    state
-        .registry
-        .register_lifecycle(Arc::new(Constructor { fail: false }))
-        .unwrap();
+    state.registry.register(Arc::new(Consumer)).unwrap();
+    state.registry.register(Arc::new(Constructor { fail: false })).unwrap();
     assert!(state.registry.resolve::<PreparedService>().is_none());
     state.registry.boot_all(&state).await.unwrap();
     assert_eq!(
@@ -146,16 +149,12 @@ async fn construction_publishes_complete_di_values_and_replans_dependencies() {
         ["construct", "dependency", "consumer"]
     );
     assert!(state.registry.resolve::<PreparedDependency>().is_some());
-    assert!(state.registry.resolve::<Constructor>().is_none());
 }
 
 #[tokio::test]
 async fn rejected_construction_publishes_no_empty_service() {
     let state = PreparationState::default();
-    state
-        .registry
-        .register_lifecycle(Arc::new(Constructor { fail: true }))
-        .unwrap();
+    state.registry.register(Arc::new(Constructor { fail: true })).unwrap();
     assert!(state.registry.boot_all(&state).await.is_err());
     assert!(state.registry.resolve::<PreparedService>().is_none());
     assert!(state.registry.resolve::<PreparedDependency>().is_none());
@@ -176,6 +175,7 @@ impl Finalizable<()> for Resource {
 struct Cleanup(Arc<Resource>);
 #[async_trait]
 impl Component<()> for Cleanup {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "cleanup"
     }
@@ -189,14 +189,13 @@ impl Component<()> for Cleanup {
 async fn finalization_needs_neither_a_runnable_nor_di() {
     let registry = Registry::new();
     let resource = Arc::new(Resource(AtomicBool::new(false)));
-    registry.register_lifecycle(Arc::new(Cleanup(resource.clone()))).unwrap();
-    assert!(registry.resolve::<Cleanup>().is_none());
+    registry.register(Arc::new(Cleanup(resource.clone()))).unwrap();
     assert!(registry.resolve::<Resource>().is_none());
     assert!(
         registry
             .components()
             .iter()
-            .all(|entry| entry.clone().as_runnable().is_none())
+            .all(|entry| entry.clone().runnable().is_none())
     );
     let outcome = registry.finalize_all(&()).await.unwrap();
     assert!(outcome.is_complete());

@@ -77,13 +77,14 @@ impl CounterService {
 
 impl Register<AppState> for CounterService {
     fn register(state: &AppState) -> Result<()> {
-        state.reader().bind_environment::<Self>(
-            state.environment(&state.application_config().counter.env_file)?,
-        )?;
+        let root = super::super::config::root();
+        state
+            .reader()
+            .bind_environment::<Self>(state.environment("counter.env")?)?;
         state.registry_ref().insert(state.counter().clone())?;
         state.registry_ref().register(Arc::new(Self::new(
-            state.application_config().counter.config_path.clone(),
-            super::super::config::root().join("storage/counter.json"),
+            root.join("config/counter.json"),
+            root.join("storage/counter.json"),
             state.counter().clone(),
             state.counter_updates().clone(),
         )))?;
@@ -92,6 +93,7 @@ impl Register<AppState> for CounterService {
 }
 
 impl Component<AppState> for CounterService {
+    type Deps = ();
     fn name(&self) -> &'static str {
         "counter"
     }
@@ -113,6 +115,7 @@ impl Component<AppState> for CounterService {
 impl Bootable<AppState> for CounterService {
     async fn boot(
         &self,
+        _deps: (),
         _state: &AppState,
     ) -> Result<()> {
         self.restore_state().await
@@ -133,21 +136,12 @@ impl Configurable for CounterService {
     ) -> Option<&dyn ConfigObserver<Config = CounterConfig>> {
         Some(self)
     }
-    fn namespace(&self) -> String {
-        "counter".to_owned()
-    }
     async fn configure(
         &self,
         config: &CounterConfig,
     ) -> congif::Result<()> {
         self.apply_config(config);
         Ok(())
-    }
-    fn export_config(
-        &self,
-        config: &CounterConfig,
-    ) -> congif::Result<Option<congif::ConfigValue>> {
-        congif::export(config)
     }
     fn validate_config(
         &self,
@@ -188,6 +182,7 @@ impl Reloadable<AppState> for CounterService {
 impl Runnable<AppState> for CounterService {
     async fn run(
         self: Arc<Self>,
+        _deps: (),
         _state: AppState,
         context: RunContext,
     ) -> Result<()> {
