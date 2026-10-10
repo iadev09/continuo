@@ -4,7 +4,7 @@ use std::any::TypeId;
 use std::path::PathBuf;
 
 use crate::{
-    Event, HasConfigReader, HasEvents, HasRegistry, Provider, Registry, Result,
+    Component, Event, HasConfigReader, HasEvents, HasRegistry, Registry, Result,
 };
 use congif::watch::ConfigWatcher;
 use std::sync::Arc;
@@ -32,13 +32,14 @@ pub(crate) struct ConfigurationWatch<S> {
     // Capability accessors: no captured state or second provider registry.
     registry: fn(&S) -> &Registry<S>,
     reader: fn(&S) -> &congif::ConfigReader,
+    rebuild: fn(&S) -> Result<Self>,
 }
 
 impl<S: HasEvents + HasRegistry + HasConfigReader> ConfigurationWatch<S> {
     pub fn new(state: &S) -> Result<Self> {
         let changes = state.events().subscribe::<ConfigurationChanged>();
         let mut watcher = None;
-        for (owner, provider) in state.registry_ref().provider_entries() {
+        for (owner, provider) in state.registry_ref().configuration_entries()? {
             let Some(configurable) = provider.as_configurable() else {
                 continue;
             };
@@ -48,7 +49,11 @@ impl<S: HasEvents + HasRegistry + HasConfigReader> ConfigurationWatch<S> {
             let mut sources =
                 state.config_reader().sources_for(configurable)?;
             if provider.as_environmental().is_some() {
-                sources.extend(state.config_reader().program_sources(owner)?);
+                sources.extend(
+                    state
+                        .config_reader()
+                        .program_sources((*provider).type_id())?,
+                );
             }
             if sources.is_empty() {
                 continue;
@@ -80,11 +85,19 @@ impl<S: HasEvents + HasRegistry + HasConfigReader> ConfigurationWatch<S> {
             changes,
             registry: S::registry_ref,
             reader: S::config_reader,
+            rebuild: Self::new,
         })
     }
 }
 
 impl<S: 'static> ConfigurationWatch<S> {
+    pub fn rebuild(
+        &self,
+        state: &S,
+    ) -> Result<Self> {
+        (self.rebuild)(state)
+    }
+
     /// Reading can add or remove dependencies even if schema validation fails.
     /// Keep the single watcher in sync so a correction triggers another try.
     pub fn refresh_sources(
@@ -92,7 +105,9 @@ impl<S: 'static> ConfigurationWatch<S> {
         state: &S,
     ) -> Result<()> {
         let Some(watcher) = self.watcher.as_mut() else { return Ok(()) };
-        for (owner, provider) in (self.registry)(state).provider_entries() {
+        for (owner, provider) in
+            (self.registry)(state).configuration_entries()?
+        {
             let Some(configurable) = provider.as_configurable() else {
                 continue;
             };
@@ -100,7 +115,8 @@ impl<S: 'static> ConfigurationWatch<S> {
                 let reader = (self.reader)(state);
                 let mut sources = reader.sources_for(configurable)?;
                 if provider.as_environmental().is_some() {
-                    sources.extend(reader.program_sources(owner)?);
+                    sources
+                        .extend(reader.program_sources((*provider).type_id())?);
                 }
                 watcher.update_owner_paths(owner, sources)?;
             }
@@ -142,7 +158,7 @@ impl<S: 'static> ConfigurationWatch<S> {
         &mut self,
         state: &S,
         changes: Vec<ConfigurationChanged>,
-    ) -> Result<Vec<Arc<dyn Provider<S>>>> {
+    ) -> Result<Vec<Arc<dyn Component<S>>>> {
         let all = changes.is_empty()
             || changes.iter().any(|event| event.owner.is_none());
         let paths: Vec<_> = changes
@@ -163,8 +179,18 @@ impl<S: 'static> ConfigurationWatch<S> {
                 &paths
             }));
         }
+        // An explicit invalidation may address a ready service or its wrapper.
+        // Both select the same actual configuration owner.
+        for owner in &mut owners {
+            if let Some(component) =
+                (self.registry)(state).resolve_component(*owner)
+                && let Some(config) = component.as_configurable()
+            {
+                *owner = config.type_id();
+            }
+        }
         let entries: Vec<_> = (self.registry)(state)
-            .lifecycle_entries()?
+            .configuration_entries()?
             .into_iter()
             .filter(|(owner, provider)| {
                 owners.contains(owner)

@@ -6,7 +6,7 @@ use tokio::task::{Id, JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error};
 
-use crate::registry::{Error, Provider, Registry, Result, Runnable};
+use crate::registry::{Component, Error, Registry, Result, Runnable};
 use crate::service::{
     RunContext, ServiceCommand, ServiceManager, ServiceManagerError,
     ServiceSnapshot, ServiceStartPolicy, ServiceStatus,
@@ -19,7 +19,7 @@ use crate::{HasRegistry, Register};
 /// Native file watching is only an invalidation source, not a prerequisite.
 async fn apply_configured_reload<S: 'static>(
     reader: Option<&congif::ConfigReader>,
-    provider: &dyn Provider<S>,
+    provider: &dyn Component<S>,
     reloadable: &dyn crate::Reloadable<S>,
     state: &S,
     config_prepared: bool,
@@ -54,6 +54,10 @@ async fn apply_configured_reload<S: 'static>(
 #[path = "../tests/runtime/config_reload.rs"]
 mod config_reload_tests;
 
+#[cfg(all(test, feature = "registry", feature = "config-watch"))]
+#[path = "../tests/runtime/preparation.rs"]
+mod preparation_tests;
+
 struct ServiceExit {
     name: &'static str,
     generation: u64,
@@ -67,7 +71,7 @@ struct TaskIdentity {
 }
 
 struct ServiceEntry<S> {
-    provider: Arc<dyn Provider<S>>,
+    provider: Arc<dyn Component<S>>,
     runnable: Arc<dyn Runnable<S>>,
     status: ServiceStatus,
     generation: u64,
@@ -173,11 +177,16 @@ impl<S: HasRegistry + 'static> Runtime<S> {
         Ok(())
     }
 
-    #[cfg(not(feature = "config-watch"))]
+    /// Register services and this runtime's manager, without preparing
+    /// configuration or installing watches. Watching is an explicit opt-in
+    /// through `watch_configurations`, independent of service registration.
     pub fn with_services<R: Register<S>>(
         self,
         state: &S,
     ) -> Result<Self> {
+        if self.state.is_some() {
+            return Err(Error::msg("register services before spawning them"));
+        }
         self.register_services::<R>(state)?;
         Ok(self)
     }
@@ -194,7 +203,7 @@ impl<S: HasRegistry + congif::HasConfigReader> Runtime<S> {
         if self.state.is_some() {
             return Err(Error::msg("configure services before spawning them"));
         }
-        let providers = state.registry_ref().lifecycle_entries()?;
+        let providers = state.registry_ref().configuration_entries()?;
         let owners: Vec<_> = providers
             .iter()
             .filter_map(|(_, provider)| provider.as_configurable())
@@ -205,12 +214,52 @@ impl<S: HasRegistry + congif::HasConfigReader> Runtime<S> {
         }
         // Programs are declared from the applied configuration, so their
         // environments are prepared once every owner has been configured.
-        prepare_programs(state.config_reader(), &providers)?;
+        prepare_programs(
+            state.config_reader(),
+            &state.registry_ref().lifecycle_entries()?,
+        )?;
         #[cfg(feature = "config-watch")]
         if let Some(watching) = self.configuration.as_mut() {
             watching.refresh_sources(state)?;
         }
         self.config_reader = Some(S::config_reader);
+        Ok(())
+    }
+
+    /// Prepare configuration, then boot in dependency order before admitting
+    /// runnable work. Preparation components may publish complete services.
+    /// Their config owner remains the same; it is not parsed or configured a
+    /// second time merely because a ready service exposes it.
+    pub async fn prepare(
+        &mut self,
+        state: &S,
+    ) -> Result<()> {
+        let declared: std::collections::HashSet<_> = state
+            .registry_ref()
+            .configuration_entries()?
+            .into_iter()
+            .map(|(owner, _)| owner)
+            .collect();
+        self.configure(state).await?;
+        state.registry_ref().boot_all(state).await?;
+        for (owner, component) in
+            state.registry_ref().configuration_entries()?
+        {
+            if !declared.contains(&owner) {
+                return Err(Error::msg(format!(
+                    "component '{}' published an undeclared config owner during boot; declare configuration in its preparation component",
+                    component.name(),
+                )));
+            }
+        }
+        prepare_programs(
+            state.config_reader(),
+            &state.registry_ref().lifecycle_entries()?,
+        )?;
+        #[cfg(feature = "config-watch")]
+        if let Some(watching) = self.configuration.as_ref() {
+            self.configuration = Some(watching.rebuild(state)?);
+        }
         Ok(())
     }
 }
@@ -219,7 +268,7 @@ impl<S: HasRegistry + congif::HasConfigReader> Runtime<S> {
 /// provider among `providers`, from their applied configurations.
 fn prepare_programs<S: 'static>(
     reader: &congif::ConfigReader,
-    providers: &[(std::any::TypeId, Arc<dyn Provider<S>>)],
+    providers: &[(std::any::TypeId, Arc<dyn Component<S>>)],
 ) -> Result<()> {
     for (owner, provider) in providers {
         if let Some(environmental) = provider.as_environmental() {
@@ -234,24 +283,6 @@ fn prepare_programs<S: 'static>(
 
 #[cfg(feature = "config-watch")]
 impl<S: HasRegistry + crate::HasEvents + crate::HasConfigReader> Runtime<S> {
-    /// Register services and prepare automatic config watching before boot.
-    /// Requires the application's EventBus when `config-watch` is selected.
-    pub fn with_services<R: Register<S>>(
-        mut self,
-        state: &S,
-    ) -> Result<Self> {
-        if self.state.is_some() {
-            return Err(Error::msg("register services before spawning them"));
-        }
-        self.register_services::<R>(state)?;
-        // Source discovery now includes all completed registrations. Keep
-        // the previous watcher alive until its replacement is prepared.
-        self.configuration =
-            Some(crate::watcher::ConfigurationWatch::new(state)?);
-        self.config_reader = Some(S::config_reader);
-        Ok(self)
-    }
-
     /// Prepare common file watches and event subscription after registration,
     /// before boot reads config. The existing runtime control loop consumes
     /// notifications; no separate task, future or Application join is needed.
@@ -988,394 +1019,5 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::RwLock;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::time::Duration;
-
-    use async_trait::async_trait;
-
-    use super::*;
-    use crate::{HasRegistry, Reloadable, RunContext, ServiceStartPolicy};
-
-    #[derive(Clone)]
-    struct TestState(Arc<TestStateInner>);
-
-    struct TestStateInner {
-        shutdown: CancellationToken,
-        registry: Registry<TestState>,
-        #[cfg(feature = "events")]
-        events: crate::ProcessEventBus,
-    }
-
-    impl TestState {
-        fn new() -> Self {
-            Self(Arc::new(TestStateInner {
-                shutdown: CancellationToken::new(),
-                registry: Registry::new(),
-                #[cfg(feature = "events")]
-                events: crate::ProcessEventBus::new(),
-            }))
-        }
-    }
-
-    impl SharedState for TestState {
-        fn shutdown_token(&self) -> CancellationToken {
-            self.0.shutdown.clone()
-        }
-    }
-
-    impl HasRegistry for TestState {
-        fn registry_ref(&self) -> &Registry<Self> {
-            &self.0.registry
-        }
-    }
-
-    #[cfg(feature = "events")]
-    impl crate::HasEvents for TestState {
-        fn events(&self) -> &crate::ProcessEventBus {
-            &self.0.events
-        }
-    }
-
-    struct ManagedCounter {
-        active: AtomicBool,
-        starts: AtomicU64,
-        stops: AtomicU64,
-        reloads: AtomicU64,
-        fail_reload: AtomicBool,
-    }
-
-    impl ManagedCounter {
-        fn new() -> Self {
-            Self {
-                active: AtomicBool::new(false),
-                starts: AtomicU64::new(0),
-                stops: AtomicU64::new(0),
-                reloads: AtomicU64::new(0),
-                fail_reload: AtomicBool::new(false),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Provider<TestState> for ManagedCounter {
-        fn name(&self) -> &'static str {
-            "counter"
-        }
-
-        fn as_reloadable(&self) -> Option<&dyn Reloadable<TestState>> {
-            Some(self)
-        }
-
-        fn as_runnable(
-            self: Arc<Self>
-        ) -> Option<Arc<dyn Runnable<TestState>>> {
-            Some(self)
-        }
-    }
-
-    #[async_trait]
-    impl Reloadable<TestState> for ManagedCounter {
-        async fn reload(
-            &self,
-            _state: &TestState,
-        ) -> Result<()> {
-            self.reloads.fetch_add(1, Ordering::SeqCst);
-            if self.fail_reload.swap(false, Ordering::SeqCst) {
-                return Err(Error::msg("configured reload failure"));
-            }
-            Ok(())
-        }
-    }
-
-    #[async_trait]
-    impl Runnable<TestState> for ManagedCounter {
-        async fn run(
-            self: Arc<Self>,
-            _state: TestState,
-            context: RunContext,
-        ) -> Result<()> {
-            self.starts.fetch_add(1, Ordering::SeqCst);
-            self.active.store(true, Ordering::SeqCst);
-            context.cancelled().await;
-            self.active.store(false, Ordering::SeqCst);
-            self.stops.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    async fn wait_for(
-        counter: &ManagedCounter,
-        starts: u64,
-        stops: u64,
-    ) {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while counter.starts.load(Ordering::SeqCst) != starts
-                || counter.stops.load(Ordering::SeqCst) != stops
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("managed counter did not reach expected generation");
-    }
-
-    #[tokio::test]
-    async fn manager_owns_stop_start_and_restart_generations() {
-        let state = TestState::new();
-        let counter = Arc::new(ManagedCounter::new());
-        let mut runtime = Runtime::<TestState>::default();
-        let manager = runtime.manager();
-
-        state
-            .registry_ref()
-            .insert(manager.clone())
-            .expect("manager registration")
-            .insert(counter.clone())
-            .expect("counter registration");
-        runtime
-            .spawn_all(state.registry_ref(), state.clone())
-            .expect("runtime initialization");
-
-        let runtime_state = state.clone();
-        let runtime_task = tokio::spawn(async move {
-            let result = runtime.wait_until_shutdown(&runtime_state).await;
-            (runtime, result)
-        });
-
-        wait_for(&counter, 1, 0).await;
-        let stopped = manager.stop("counter").await.expect("stop counter");
-        assert_eq!(stopped.status(), ServiceStatus::Stopped);
-        assert!(!counter.active.load(Ordering::SeqCst));
-
-        let started = manager.start("counter").await.expect("start counter");
-        assert_eq!(started.generation(), 2);
-        wait_for(&counter, 2, 1).await;
-
-        let restarted =
-            manager.restart("counter").await.expect("restart counter");
-        assert_eq!(restarted.generation(), 3);
-        wait_for(&counter, 3, 2).await;
-
-        let reloaded = manager.reload("counter").await.expect("reload counter");
-        assert_eq!(reloaded.status(), ServiceStatus::Running);
-        assert_eq!(reloaded.generation(), 3);
-        assert_eq!(reloaded.reload_revision(), 1);
-        assert_eq!(reloaded.last_reload_error(), None);
-        assert_eq!(counter.reloads.load(Ordering::SeqCst), 1);
-
-        counter.fail_reload.store(true, Ordering::SeqCst);
-        assert!(manager.reload("counter").await.is_err());
-        let snapshots =
-            manager.list().await.expect("list services after failed reload");
-        let failed_reload = snapshots
-            .iter()
-            .find(|snapshot| snapshot.name() == "counter")
-            .expect("counter snapshot");
-        assert_eq!(failed_reload.status(), ServiceStatus::Running);
-        assert_eq!(failed_reload.reload_revision(), 2);
-        assert_eq!(
-            failed_reload.last_reload_error(),
-            Some("reload of 'counter' failed: configured reload failure")
-        );
-
-        state.initiate_shutdown();
-        let (mut runtime, result) =
-            runtime_task.await.expect("runtime task join");
-        result.expect("runtime shutdown");
-        runtime.drain().await.expect("runtime drain");
-        wait_for(&counter, 3, 3).await;
-    }
-
-    #[tokio::test]
-    async fn interrupted_boot_submits_one_cancelled_initial_generation() {
-        let state = TestState::new();
-        let counter = Arc::new(ManagedCounter::new());
-        state
-            .registry_ref()
-            .insert(counter.clone())
-            .expect("counter registration");
-        state.0.shutdown.cancel();
-
-        let mut runtime = Runtime::<TestState>::default();
-        assert_eq!(
-            runtime.spawn_all(state.registry_ref(), state.clone()).unwrap(),
-            1
-        );
-        runtime.drain().await.unwrap();
-
-        assert_eq!(counter.starts.load(Ordering::SeqCst), 1);
-        assert_eq!(counter.stops.load(Ordering::SeqCst), 1);
-        assert!(!counter.active.load(Ordering::SeqCst));
-    }
-
-    struct PolicyService {
-        name: &'static str,
-        policy: RwLock<ServiceStartPolicy>,
-        starts: AtomicU64,
-    }
-
-    impl PolicyService {
-        fn new(
-            name: &'static str,
-            policy: ServiceStartPolicy,
-        ) -> Self {
-            Self {
-                name,
-                policy: RwLock::new(policy),
-                starts: AtomicU64::new(0),
-            }
-        }
-
-        fn set_policy(
-            &self,
-            policy: ServiceStartPolicy,
-        ) {
-            *self.policy.write().expect("policy lock") = policy;
-        }
-    }
-
-    #[async_trait]
-    impl Provider<TestState> for PolicyService {
-        fn name(&self) -> &'static str {
-            self.name
-        }
-
-        fn as_runnable(
-            self: Arc<Self>
-        ) -> Option<Arc<dyn Runnable<TestState>>> {
-            Some(self)
-        }
-    }
-
-    #[async_trait]
-    impl Runnable<TestState> for PolicyService {
-        fn start_policy(
-            &self,
-            _state: &TestState,
-        ) -> ServiceStartPolicy {
-            *self.policy.read().expect("policy lock")
-        }
-
-        async fn run(
-            self: Arc<Self>,
-            _state: TestState,
-            context: RunContext,
-        ) -> Result<()> {
-            self.starts.fetch_add(1, Ordering::SeqCst);
-            context.cancelled().await;
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn start_policy_controls_initial_and_explicit_generations() {
-        {
-            let state = TestState::new();
-            let manual = Arc::new(PolicyService::new(
-                "manual",
-                ServiceStartPolicy::Manual,
-            ));
-            let mut runtime = Runtime::<TestState>::default();
-            let manager = runtime.manager();
-
-            state
-                .registry_ref()
-                .insert(manager.clone())
-                .expect("manager registration")
-                .insert(manual.clone())
-                .expect("manual registration");
-            assert_eq!(
-                runtime.spawn_all(state.registry_ref(), state.clone()).unwrap(),
-                1
-            );
-            assert!(runtime.join_set.is_empty());
-            assert_eq!(manual.starts.load(Ordering::SeqCst), 0);
-
-            let runtime_state = state.clone();
-            let runtime_task = tokio::spawn(async move {
-                let result = runtime.wait_until_shutdown(&runtime_state).await;
-                (runtime, result)
-            });
-
-            let snapshots = manager.list().await.expect("list manual service");
-            assert_eq!(snapshots.len(), 1);
-            assert_eq!(snapshots[0].status(), ServiceStatus::Stopped);
-            assert_eq!(snapshots[0].start_policy(), ServiceStartPolicy::Manual);
-
-            manual.set_policy(ServiceStartPolicy::Unavailable);
-            assert!(matches!(
-                manager.start("manual").await,
-                Err(ServiceManagerError::Unavailable(name)) if name == "manual"
-            ));
-            manual.set_policy(ServiceStartPolicy::Manual);
-            manager
-                .start("manual")
-                .await
-                .expect("manual service starts explicitly");
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while manual.starts.load(Ordering::SeqCst) != 1 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("manual service did not start");
-
-            state.initiate_shutdown();
-            let (mut runtime, result) =
-                runtime_task.await.expect("runtime task join");
-            result.expect("runtime shutdown");
-            runtime.drain().await.expect("runtime drain");
-        }
-
-        {
-            let state = TestState::new();
-            let unavailable = Arc::new(PolicyService::new(
-                "unavailable",
-                ServiceStartPolicy::Unavailable,
-            ));
-            let mut runtime = Runtime::<TestState>::default();
-            let manager = runtime.manager();
-
-            state
-                .registry_ref()
-                .insert(manager.clone())
-                .expect("manager registration")
-                .insert(unavailable.clone())
-                .expect("unavailable registration");
-            assert_eq!(
-                runtime.spawn_all(state.registry_ref(), state.clone()).unwrap(),
-                1
-            );
-            assert!(runtime.join_set.is_empty());
-            assert_eq!(unavailable.starts.load(Ordering::SeqCst), 0);
-
-            let runtime_state = state.clone();
-            let runtime_task = tokio::spawn(async move {
-                let result = runtime.wait_until_shutdown(&runtime_state).await;
-                (runtime, result)
-            });
-
-            let snapshots =
-                manager.list().await.expect("list unavailable service");
-            assert_eq!(snapshots.len(), 1);
-            assert_eq!(snapshots[0].status(), ServiceStatus::Stopped);
-            assert_eq!(
-                snapshots[0].start_policy(),
-                ServiceStartPolicy::Unavailable
-            );
-            assert!(matches!(
-                manager.start("unavailable").await,
-                Err(ServiceManagerError::Unavailable(name)) if name == "unavailable"
-            ));
-            assert_eq!(unavailable.starts.load(Ordering::SeqCst), 0);
-
-            state.initiate_shutdown();
-            let (mut runtime, result) =
-                runtime_task.await.expect("runtime task join");
-            result.expect("runtime shutdown");
-            runtime.drain().await.expect("runtime drain");
-        }
-    }
-}
+#[path = "../tests/runtime/management.rs"]
+mod tests;

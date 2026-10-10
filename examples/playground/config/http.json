@@ -1,3 +1,6 @@
 {
-  "listen": "${HTTP_LISTEN}"
+  "listen": "${HTTP_LISTEN}",
+  "max_connections": $HTTP_MAX_CONNECTIONS,
+  "acquire_timeout": "1000ms",
+  "graceful_timeout": "100ms"
 }

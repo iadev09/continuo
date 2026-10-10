@@ -2,20 +2,25 @@ use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
+mod bootable;
+mod component;
 mod error;
 mod finalizable;
 mod order;
 pub mod priority;
-mod provider;
 mod register;
 mod reload;
 mod runnable;
 mod validation;
 
+pub use bootable::Bootable;
+pub use component::Component;
 pub use error::{BoxError, Error, Result, StdError};
 pub use finalizable::{Finalizable, FinalizeFailure, FinalizeOutcome};
-pub use order::ProviderOrder;
-pub use provider::Provider;
+pub use order::ComponentOrder;
+// Source-compatible names for the existing lifecycle contract; not a second API.
+pub use Component as Provider;
+pub use ComponentOrder as ProviderOrder;
 pub use register::Register;
 pub use reload::{ReloadFailure, ReloadOutcome, ReloadState, Reloadable};
 pub use runnable::Runnable;
@@ -54,10 +59,34 @@ impl<S: 'static> Registry<S> {
         }
     }
 
-    /// Register a provider into the registry.
+    /// Store a shared value for typed dependency injection only.
     ///
-    /// This accepts `Arc<P>` where `P: Provider`. The service is stored as a
-    /// type-erased `Arc<dyn Provider>` but continues to point to the same underlying
+    /// No lifecycle trait is required or discovered. Use `register` for an
+    /// object that is also a lifecycle participant, or `register_lifecycle`
+    /// for an orchestration object that need not be resolved by consumers.
+    pub fn insert<T>(
+        &self,
+        item: Arc<T>,
+    ) -> Result<&Self>
+    where
+        T: Any + Send + Sync,
+    {
+        let mut values =
+            self.by_type.write().expect("registry by_type lock poisoned");
+        let type_id = TypeId::of::<T>();
+        if values.contains_key(&type_id) {
+            return Err(Error::DuplicateProvider {
+                type_name: std::any::type_name::<T>(),
+            });
+        }
+        values.insert(type_id, item);
+        Ok(self)
+    }
+
+    /// Register one shared component for both DI and lifecycle orchestration.
+    ///
+    /// This accepts `Arc<P>` where `P: Component`. The service is stored as a
+    /// type-erased `Arc<dyn Component>` but continues to point to the same underlying
     /// allocation (no new allocation is created).
     ///
     /// If another service with the same concrete type is already registered,
@@ -86,10 +115,10 @@ impl<S: 'static> Registry<S> {
     ///
     /// ```ignore
     /// registry
-    ///     .insert(dns.clone())?
-    ///     .insert(ipc.clone())?;
+    ///     .register(dns.clone())?
+    ///     .register(ipc.clone())?;
     /// ```
-    pub fn insert<P>(
+    pub fn register<P>(
         &self,
         item: Arc<P>,
     ) -> Result<&Self>
@@ -98,9 +127,11 @@ impl<S: 'static> Registry<S> {
     {
         let type_id = TypeId::of::<P>();
         let any: Arc<dyn Any + Send + Sync> = item.clone();
+        let mut providers =
+            self.providers.write().expect("registry providers lock poisoned");
         let mut by_type =
             self.by_type.write().expect("registry by_type lock poisoned");
-        if by_type.contains_key(&type_id) {
+        if by_type.contains_key(&type_id) || providers.contains_key(&type_id) {
             return Err(Error::DuplicateProvider {
                 type_name: std::any::type_name::<P>(),
             });
@@ -109,10 +140,36 @@ impl<S: 'static> Registry<S> {
         drop(by_type);
 
         let it: Arc<dyn Provider<S>> = item;
-        self.providers
+        providers.insert(type_id, it);
+        self.registration_order
             .write()
-            .expect("registry providers lock poisoned")
-            .insert(type_id, it);
+            .expect("registry order lock poisoned")
+            .push(type_id);
+        *self
+            .lifecycle_order
+            .write()
+            .expect("registry lifecycle order lock poisoned") = None;
+        Ok(self)
+    }
+
+    /// Retain an ordered lifecycle participant without making it a DI value.
+    ///
+    /// This is useful for a preparation wrapper: it owns configuration and
+    /// boot, then publishes complete services with `insert` or `register`.
+    /// It is not returned by `resolve`, unless explicitly inserted separately.
+    pub fn register_lifecycle<C: Component<S>>(
+        &self,
+        component: Arc<C>,
+    ) -> Result<&Self> {
+        let type_id = TypeId::of::<C>();
+        let mut components =
+            self.providers.write().expect("registry providers lock poisoned");
+        if components.contains_key(&type_id) {
+            return Err(Error::DuplicateProvider {
+                type_name: std::any::type_name::<C>(),
+            });
+        }
+        components.insert(type_id, component);
         self.registration_order
             .write()
             .expect("registry order lock poisoned")
@@ -138,7 +195,7 @@ impl<S: 'static> Registry<S> {
     ) -> Result<&Self>
     where
         I: ?Sized + Send + Sync + 'static,
-        P: Provider<S> + 'static,
+        P: Any + Send + Sync,
     {
         let concrete = self.resolve::<P>().ok_or_else(|| {
             Error::msg(format!(
@@ -168,7 +225,7 @@ impl<S: 'static> Registry<S> {
         f: impl FnOnce(&T) -> R,
     ) -> Option<R>
     where
-        T: Provider<S> + 'static,
+        T: Any + Send + Sync,
     {
         let typed = self.resolve::<T>()?;
         Some(f(typed.as_ref()))
@@ -184,7 +241,7 @@ impl<S: 'static> Registry<S> {
     /// Returns `None` if the type is not registered.
     pub fn resolve<T>(&self) -> Option<Arc<T>>
     where
-        T: Provider<S> + 'static,
+        T: Any + Send + Sync,
     {
         let any = self
             .by_type
@@ -213,6 +270,43 @@ impl<S: 'static> Registry<S> {
             .into_iter()
             .map(|entry| (entry.type_id, entry.provider))
             .collect()
+    }
+
+    /// Resolve lifecycle metadata without requiring a DI binding.
+    pub fn resolve_component(
+        &self,
+        type_id: TypeId,
+    ) -> Option<Arc<dyn Component<S>>> {
+        self.resolve_provider(type_id)
+    }
+
+    pub fn components(&self) -> Vec<Arc<dyn Component<S>>> {
+        self.providers()
+    }
+
+    pub fn component_entries(&self) -> Vec<(TypeId, Arc<dyn Component<S>>)> {
+        self.provider_entries()
+    }
+
+    /// Configuration identity is independent of the component exposing it.
+    /// A preparation wrapper and its ready service may expose the same owner;
+    /// retain the last contribution (the ready service), in lifecycle order.
+    /// Congif's owner identity addresses reading, watching and acknowledgement.
+    pub(crate) fn configuration_entries(
+        &self
+    ) -> Result<Vec<KeyedProvider<S>>> {
+        let entries = self.lifecycle_entries()?;
+        let mut seen = HashSet::new();
+        let mut owners = Vec::new();
+        for (_, component) in entries.into_iter().rev() {
+            let Some(config) = component.as_configurable() else { continue };
+            let owner = config.type_id();
+            if seen.insert(owner) {
+                owners.push((owner, component));
+            }
+        }
+        owners.reverse();
+        Ok(owners)
     }
 
     /// Resolve a trait-object capability bound with `bind_dyn`.
@@ -258,7 +352,8 @@ impl<S: 'static> Registry<S> {
 
     /// Return the cached lifecycle plan, building it once if needed.
     ///
-    /// The plan is invalidated on `insert()`. Normal lifecycle phases reuse
+    /// The plan is invalidated on lifecycle registration. DI insertion does
+    /// not change it. Normal lifecycle phases reuse
     /// the same known list, so reload is a boot emulation over the same
     /// provider order instead of a second ordering universe.
     fn lifecycle_plan(&self) -> Result<Vec<Arc<dyn Provider<S>>>> {
@@ -383,7 +478,7 @@ impl<S: 'static> Registry<S> {
             match provider.validate(state) {
                 Ok(()) => outcome.validated_count += 1,
                 Err(error) => outcome.failures.push(ValidationFailure {
-                    provider: name,
+                    component: name,
                     error: error.into_validate(name),
                 }),
             }
@@ -397,16 +492,10 @@ impl<S: 'static> Registry<S> {
     ) -> Result<()> {
         let mut booted: HashSet<TypeId> = HashSet::new();
 
-        // The plan is recomputed each pass rather than materialised once.
-        // `insert` takes `&self`, so a provider's `boot` can register another
-        // one — and a plan taken before the pass would never contain it. Such a
-        // provider used to be validated and finalized but never booted, with
-        // nothing said about it.
-        //
-        // A late arrival is booted on the next pass, which is after providers
-        // that a fresh plan would have ordered behind it. That is the honest
-        // limit of registering during boot, and it is still an order better
-        // than never booting at all.
+        // A preparation component can publish new lifecycle participants.
+        // Replan after each boot so newly declared dependencies are honored
+        // before booting another component. Already completed hooks are not
+        // rerun; dependencies must be declared before their consumer boots.
         loop {
             let mut progressed = false;
 
@@ -416,6 +505,7 @@ impl<S: 'static> Registry<S> {
                 }
                 progressed = true;
 
+                let Some(bootable) = provider.as_bootable() else { continue };
                 let name = provider.name();
                 // Boot is a sequence of silent blocking steps, and when one
                 // of them takes seconds the log shows a gap with nothing in
@@ -424,13 +514,16 @@ impl<S: 'static> Registry<S> {
                 // turns that gap into an answer.
                 tracing::debug!("⏳ booting {name}");
                 let started = std::time::Instant::now();
-                if let Err(e) = provider.boot(state).await {
+                if let Err(e) = bootable.boot(state).await {
                     return Err(e.into_boot(name));
                 }
                 tracing::debug!(
                     "✅ {name} booted in {} ms",
                     started.elapsed().as_millis()
                 );
+                // A constructor can publish new lifecycle participants. Replan
+                // before booting any dependent from the old plan.
+                break;
             }
 
             if !progressed {
@@ -457,7 +550,7 @@ impl<S: 'static> Registry<S> {
             match finalizable.finalize(state).await {
                 Ok(()) => outcome.finalized_count += 1,
                 Err(error) => outcome.failures.push(FinalizeFailure {
-                    provider: name,
+                    component: name,
                     error: error.into_finalize(name),
                 }),
             }
@@ -527,9 +620,10 @@ where
         let providers = self.lifecycle_plan()?;
         let reader = state.reload_config_reader();
         if let Some(reader) = reader {
-            let owners: Vec<_> = providers
+            let config_entries = self.configuration_entries()?;
+            let owners: Vec<_> = config_entries
                 .iter()
-                .filter_map(|provider| provider.as_configurable())
+                .filter_map(|(_, provider)| provider.as_configurable())
                 .collect();
             reader.prepare_owners(&owners).await?;
             // A reload re-reads program environments as it re-reads
@@ -570,7 +664,7 @@ where
                 match result {
                     Ok(()) => outcome.reloaded_count += 1,
                     Err(error) => outcome.failures.push(ReloadFailure {
-                        provider: name,
+                        component: name,
                         error: error.into_reload(name),
                     }),
                 }

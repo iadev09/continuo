@@ -114,11 +114,11 @@ fn lifecycle_order_uses_type_dependencies() {
     let registry = Registry::<TestState>::new();
 
     registry
-        .insert(Arc::new(ApiProvider))
+        .register(Arc::new(ApiProvider))
         .expect("api registration should succeed")
-        .insert(Arc::new(CacheProvider))
+        .register(Arc::new(CacheProvider))
         .expect("cache registration should succeed")
-        .insert(Arc::new(DbProvider))
+        .register(Arc::new(DbProvider))
         .expect("database registration should succeed");
 
     let outcome = registry.validate_all(&state).expect("validation should run");
@@ -135,9 +135,9 @@ fn duplicate_provider_registration_is_rejected_without_replacement() {
     let original = Arc::new(ApiProvider);
 
     registry
-        .insert(original.clone())
+        .register(original.clone())
         .expect("first registration should succeed");
-    let error = match registry.insert(Arc::new(ApiProvider)) {
+    let error = match registry.register(Arc::new(ApiProvider)) {
         Err(error) => error,
         Ok(_) => panic!("duplicate registration must be rejected"),
     };
@@ -159,13 +159,13 @@ fn lifecycle_order_supports_before_edges_and_diagnostics() {
     let registry = Registry::<TestState>::new();
 
     registry
-        .insert(Arc::new(ApiProvider))
+        .register(Arc::new(ApiProvider))
         .expect("api registration should succeed")
-        .insert(Arc::new(MetricsProvider))
+        .register(Arc::new(MetricsProvider))
         .expect("metrics registration should succeed")
-        .insert(Arc::new(CacheProvider))
+        .register(Arc::new(CacheProvider))
         .expect("cache registration should succeed")
-        .insert(Arc::new(DbProvider))
+        .register(Arc::new(DbProvider))
         .expect("database registration should succeed");
 
     let names = registry.lifecycle_names().expect("plan should build");
@@ -184,9 +184,9 @@ fn validate_all_retains_provider_failures_and_continues() {
     let state = TestState::default();
     let registry = Registry::<TestState>::new();
     registry
-        .insert(Arc::new(FailsValidation))
+        .register(Arc::new(FailsValidation))
         .expect("failing validator should register")
-        .insert(Arc::new(DbProvider))
+        .register(Arc::new(DbProvider))
         .expect("successful validator should register");
 
     let outcome =
@@ -196,7 +196,7 @@ fn validate_all_retains_provider_failures_and_continues() {
     assert_eq!(outcome.validated_count(), 1);
     assert_eq!(outcome.failed_count(), 1);
     let failure = &outcome.failures()[0];
-    assert_eq!(failure.provider(), "fails-validation");
+    assert_eq!(failure.component(), "fails-validation");
     assert!(matches!(
         failure.error(),
         Error::Validate { name: "fails-validation", .. }
@@ -236,6 +236,13 @@ impl Provider<TestState> for ConsoleLogger {
         "console-logger"
     }
 
+    fn as_bootable(&self) -> Option<&dyn Bootable<TestState>> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl Bootable<TestState> for ConsoleLogger {
     async fn boot(
         &self,
         state: &TestState,
@@ -251,6 +258,13 @@ impl Provider<TestState> for FileLogger {
         "file-logger"
     }
 
+    fn as_bootable(&self) -> Option<&dyn Bootable<TestState>> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl Bootable<TestState> for FileLogger {
     async fn boot(
         &self,
         state: &TestState,
@@ -266,7 +280,7 @@ async fn bind_dyn_resolves_trait_object_and_allows_replacement() {
     let registry = Registry::<TestState>::new();
 
     registry
-        .insert(Arc::new(ConsoleLogger))
+        .register(Arc::new(ConsoleLogger))
         .expect("console logger should register");
     registry
         .bind_dyn::<dyn LogSink, ConsoleLogger>(|logger| logger)
@@ -276,7 +290,9 @@ async fn bind_dyn_resolves_trait_object_and_allows_replacement() {
         registry.resolve_dyn::<dyn LogSink>().expect("LogSink should be bound");
     assert_eq!(sink.line(), "console");
 
-    registry.insert(Arc::new(FileLogger)).expect("file logger should register");
+    registry
+        .register(Arc::new(FileLogger))
+        .expect("file logger should register");
     registry
         .bind_dyn::<dyn LogSink, FileLogger>(|logger| logger)
         .expect("dyn binding replacement should succeed");
@@ -305,16 +321,23 @@ impl Provider<TestState> for BootRecorder {
         ProviderOrder::new().after::<BootDependency>()
     }
 
+    fn as_bootable(&self) -> Option<&dyn Bootable<TestState>> {
+        Some(self)
+    }
+
+    fn as_finalizable(&self) -> Option<&dyn Finalizable<TestState>> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl Bootable<TestState> for BootRecorder {
     async fn boot(
         &self,
         state: &TestState,
     ) -> Result<()> {
         state.seen.lock().expect("test log poisoned").push("boot-recorder");
         Ok(())
-    }
-
-    fn as_finalizable(&self) -> Option<&dyn Finalizable<TestState>> {
-        Some(self)
     }
 }
 
@@ -335,16 +358,23 @@ impl Provider<TestState> for BootDependency {
         "boot-dependency"
     }
 
+    fn as_bootable(&self) -> Option<&dyn Bootable<TestState>> {
+        Some(self)
+    }
+
+    fn as_finalizable(&self) -> Option<&dyn Finalizable<TestState>> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl Bootable<TestState> for BootDependency {
     async fn boot(
         &self,
         state: &TestState,
     ) -> Result<()> {
         state.seen.lock().expect("test log poisoned").push("boot-dependency");
         Ok(())
-    }
-
-    fn as_finalizable(&self) -> Option<&dyn Finalizable<TestState>> {
-        Some(self)
     }
 }
 
@@ -369,9 +399,9 @@ async fn boot_and_finalize_share_lifecycle_plan() {
     let registry = Registry::<TestState>::new();
 
     registry
-        .insert(Arc::new(BootRecorder))
+        .register(Arc::new(BootRecorder))
         .expect("boot recorder should register")
-        .insert(Arc::new(BootDependency))
+        .register(Arc::new(BootDependency))
         .expect("boot dependency should register");
 
     registry.boot_all(&state).await.expect("boot should succeed");
@@ -423,9 +453,9 @@ fn lifecycle_order_rejects_cycles() {
     let registry = Registry::<TestState>::new();
 
     registry
-        .insert(Arc::new(CycleA))
+        .register(Arc::new(CycleA))
         .expect("cycle A should register")
-        .insert(Arc::new(CycleB))
+        .register(Arc::new(CycleB))
         .expect("cycle B should register");
 
     let err =
@@ -529,9 +559,9 @@ async fn reload_all_retains_provider_failures_and_continues() {
     let state = TestState::default();
     let registry = Registry::<TestState>::new();
     registry
-        .insert(Arc::new(FailsReload))
+        .register(Arc::new(FailsReload))
         .expect("failing reloader should register")
-        .insert(Arc::new(Reloads))
+        .register(Arc::new(Reloads))
         .expect("successful reloader should register");
 
     let outcome =
@@ -541,7 +571,7 @@ async fn reload_all_retains_provider_failures_and_continues() {
     assert_eq!(outcome.reloaded_count(), 1);
     assert_eq!(outcome.failed_count(), 1);
     let failure = &outcome.failures()[0];
-    assert_eq!(failure.provider(), "fails-reload");
+    assert_eq!(failure.component(), "fails-reload");
     assert!(matches!(
         failure.error(),
         Error::Reload { name: "fails-reload", .. }
@@ -557,9 +587,9 @@ async fn finalize_all_retains_provider_failures_and_continues() {
     let state = TestState::default();
     let registry = Registry::<TestState>::new();
     registry
-        .insert(Arc::new(Finalizes))
+        .register(Arc::new(Finalizes))
         .expect("successful finalizer should register")
-        .insert(Arc::new(FailsFinalize))
+        .register(Arc::new(FailsFinalize))
         .expect("failing finalizer should register");
 
     let outcome = registry
@@ -571,7 +601,7 @@ async fn finalize_all_retains_provider_failures_and_continues() {
     assert_eq!(outcome.finalized_count(), 1);
     assert_eq!(outcome.failed_count(), 1);
     let failure = &outcome.failures()[0];
-    assert_eq!(failure.provider(), "fails-finalize");
+    assert_eq!(failure.component(), "fails-finalize");
     assert!(matches!(
         failure.error(),
         Error::Finalize { name: "fails-finalize", .. }

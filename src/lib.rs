@@ -6,7 +6,7 @@
 //! Pull this crate into any Rust project with multiple services; bring your
 //! own state type, implement [`state::SharedState`] and optionally
 //! [`registry::ReloadState`] on it, then use [`registry::Registry`] with the
-//! [`registry::Provider`] / [`registry::Reloadable`] /
+//! [`registry::Component`] / [`registry::Bootable`] / [`registry::Reloadable`] /
 //! [`registry::Runnable`] / [`registry::Finalizable`] traits.
 //!
 //! The error model (`registry::Error`, `registry::BoxError`, `registry::Result`)
@@ -15,6 +15,8 @@
 //! share this error type.
 #[cfg(feature = "events")]
 pub mod events;
+#[cfg(feature = "fleet")]
+pub mod fleet;
 #[cfg(feature = "support")]
 pub mod gate;
 #[cfg(feature = "support")]
@@ -26,19 +28,20 @@ pub mod state;
 #[cfg(feature = "config-watch")]
 mod watcher;
 
-pub use congif::Configurable;
+pub use congif::{ConfigObserver, Configurable};
 #[cfg(feature = "events")]
-pub use events::{Event, ProcessEventBus, ShutdownInitiated};
+pub use events::{Event, ProcessEventBus, ReloadRequired, ShutdownInitiated};
+#[cfg(feature = "fleet")]
+pub use fleet::{Dispatch, Dispatched, Scope, Scoped};
 #[cfg(feature = "support")]
 pub use gate::{Gate, GateDrainOutcome, Permit};
 #[cfg(feature = "support")]
 pub use guard::{Guard, GuardGroup};
-pub use registry::Register;
 pub use registry::{
-    BoxError, Error, Finalizable, FinalizeFailure, FinalizeOutcome, Provider,
-    ProviderOrder, Registry, ReloadFailure, ReloadOutcome, ReloadState,
-    Reloadable, Result, Runnable, StdError, ValidationFailure,
-    ValidationOutcome,
+    Bootable, BoxError, Component, ComponentOrder, Error, Finalizable,
+    FinalizeFailure, FinalizeOutcome, Provider, ProviderOrder, Register,
+    Registry, ReloadFailure, ReloadOutcome, ReloadState, Reloadable, Result,
+    Runnable, StdError, ValidationFailure, ValidationOutcome,
 };
 pub use runtime::Runtime;
 pub use service::{

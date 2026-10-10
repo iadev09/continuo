@@ -16,7 +16,8 @@ exclude = ["/Cargo.lock", "/justfile", "/rustfmt.toml", "/.idea/**"]
 
 [features]
 default = ["registry"]
-full = ["registry", "support", "events","config-watch"]
+full = ["registry", "support", "events","config-watch", "fleet"]
+fleet = ["dep:serde"]
 events = ["dep:dashmap"]
 config-watch = ["events", "registry", "congif/watch"]
 registry = []
@@ -29,6 +30,7 @@ all-features = true
 
 [dependencies]
 async-trait = "0.1"
+serde = { version = "1", features = ["derive"], optional = true }
 congif = { path = "../congif" }
 dashmap = { version = "6", optional = true }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
@@ -37,14 +39,15 @@ tracing = "0.1"
 
 [dev-dependencies]
 continuo = { path = ".", features = ["full"] }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 axum = "0.8"
-dotenvy = "0.15"
-congif = { path = "../congif", features = ["json", "watch"] }
+dotenw = { path = "../dotenw" }
+congif = { path = "../congif", features = ["json", "toml", "watch"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 futures-util = "0.3"
+humantime-serde = "1"
 tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal"] }
 
 [[example]]

@@ -1,37 +1,72 @@
 //! Shared application state and its runtime capabilities.
-use async_trait::async_trait;
-use continuo::{
-    Error, HasRegistry, Registry, ReloadState, Result, ServiceManager,
-    ServiceSnapshot, SharedState,
-};
+use super::counter::Counter;
+use congif::HasConfigReader;
 use continuo::{HasEvents, ProcessEventBus};
+use continuo::{HasRegistry, Registry, Result, SharedState};
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::Mutex;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub struct AppState(Arc<Inner>);
 
 struct Inner {
+    config: super::config::ApplicationConfig,
     reader: Arc<congif::ConfigReader>,
-    variables: congif::Variables,
+    environment: dotenw::EnvHandle,
     shutdown: CancellationToken,
-    registry: Registry<AppState>,
+    registry: Arc<Registry<AppState>>,
     events: ProcessEventBus,
+    counter: Arc<Counter>,
+    counter_updates: watch::Sender<CounterView>,
+    by_client: Mutex<HashMap<SocketAddr, u64>>,
+}
+
+/// Web presentation state, not part of the counter's number.
+#[derive(Clone, serde::Serialize)]
+pub struct CounterView {
+    pub value: u64,
+    pub increment: u64,
+    pub active: bool,
+    pub page_revision: u64,
 }
 
 impl AppState {
-    pub fn new() -> Result<Self> {
-        let env_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("examples/playground/.env");
-        let variables = super::config::variables(&env_path)?;
-        let mut reader = congif::ConfigReader::new();
-        reader.register("json", congif::parsers::JsonParser)?;
+    // Keep the capability trait inside this module. Callers need only AppState.
+    pub fn config<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> congif::Result<Option<T>> {
+        self.get_config(key)
+    }
+
+    pub async fn new(environments: dotenw::EnvStore) -> Result<Self> {
+        let reader = congif::ConfigReader::new()
+            .with_environment_store(environments)
+            .with_builtin_parsers()?;
+        let environment = super::config::environment(&reader, ".env", None)?;
+        let config =
+            super::config::ApplicationConfig::read(&reader, &environment)
+                .await?;
         Ok(Self(Arc::new(Inner {
+            config,
             reader: Arc::new(reader),
-            variables,
+            environment,
             shutdown: CancellationToken::new(),
-            registry: Registry::default(),
+            registry: Arc::new(Registry::default()),
             events: ProcessEventBus::new(),
+            counter: Arc::new(Counter::default()),
+            counter_updates: watch::channel(CounterView {
+                value: 0,
+                increment: 0,
+                active: false,
+                page_revision: 0,
+            })
+            .0,
+            by_client: Mutex::new(HashMap::new()),
         })))
     }
 
@@ -39,22 +74,60 @@ impl AppState {
         &self.0.reader
     }
 
-    pub fn variables(&self) -> &congif::Variables {
-        &self.0.variables
+    pub fn counter(&self) -> &Arc<Counter> {
+        &self.0.counter
     }
 
-    /// All demo reload triggers use the runtime owner. Config preparation
-    /// failures are logged before application; service revisions describe
-    /// actual attempts to apply prepared settings.
-    pub async fn reload_counter(&self) -> Result<ServiceSnapshot> {
-        let manager = self
-            .registry_ref()
-            .resolve::<ServiceManager>()
-            .ok_or_else(|| Error::msg("service manager not registered"))?;
-        manager
-            .reload("counter")
-            .await
-            .map_err(|error| Error::msg(error.to_string()))
+    pub fn counter_updates(&self) -> &watch::Sender<CounterView> {
+        &self.0.counter_updates
+    }
+
+    pub fn hit(
+        &self,
+        counter: &Counter,
+        client: Option<SocketAddr>,
+        reload_page: bool,
+    ) -> Option<(u64, u64)> {
+        let mut result = None;
+        let mut clients = self.0.by_client.lock().expect("client map poisoned");
+        self.0.counter_updates.send_if_modified(|view| {
+            if !view.active {
+                return false;
+            }
+            view.value = counter.add(view.increment);
+            let yours = client.map_or(0, |client| {
+                let yours = clients.entry(client).or_insert(0);
+                *yours = yours.saturating_add(view.increment);
+                *yours
+            });
+            if reload_page {
+                view.page_revision = view.page_revision.wrapping_add(1);
+            }
+            result = Some((view.value, yours));
+            true
+        });
+        result
+    }
+
+    pub fn request_page_reload(&self) {
+        self.0.counter_updates.send_modify(|view| {
+            view.page_revision = view.page_revision.wrapping_add(1);
+        });
+    }
+
+    pub fn application_config(&self) -> &super::config::ApplicationConfig {
+        &self.0.config
+    }
+
+    pub fn environment(
+        &self,
+        source: impl AsRef<std::path::Path>,
+    ) -> Result<dotenw::EnvHandle> {
+        super::config::environment(
+            self.reader(),
+            source,
+            Some(&self.0.environment),
+        )
     }
 }
 
@@ -79,12 +152,5 @@ impl HasEvents for AppState {
 impl continuo::HasConfigReader for AppState {
     fn config_reader(&self) -> &congif::ConfigReader {
         self.reader()
-    }
-}
-
-#[async_trait]
-impl ReloadState for AppState {
-    async fn reload(&self) -> Result<()> {
-        Ok(())
     }
 }

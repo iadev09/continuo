@@ -1,24 +1,30 @@
-//! Run: cargo run --example playground --features config-watch
-//! Open http://127.0.0.1:3000/.
+//! Run: cargo run --example playground
+//! Select an environment: cargo run --example playground -- --environment local
+//! The active listening address is printed at startup.
 
 mod app;
-use app::{Application, CounterService, HttpService, SignalService};
+use app::{
+    Application, CounterService, HttpService, OtherService, ReloadService,
+    SignalService,
+};
 
-#[tokio::main]
-async fn main() -> continuo::Result<()> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .try_init()
-        .map_err(|error| {
-            continuo::Error::msg(format!(
-                "could not initialize logging: {error}"
-            ))
-        })?;
+fn main() -> continuo::Result<()> {
+    // SAFETY: this executable owns startup; no runtime threads exist yet.
+    let environments = unsafe { app::environment()? };
 
-    Application::new()?
-        .with_services::<(CounterService, HttpService, SignalService)>()?
-        .run()
-        .await
+    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(
+        async {
+            Application::new(environments)
+                .await?
+                .with_services::<(
+                    CounterService,
+                    OtherService,
+                    HttpService,
+                    ReloadService,
+                    SignalService,
+                )>()?
+                .run()
+                .await
+        },
+    )
 }

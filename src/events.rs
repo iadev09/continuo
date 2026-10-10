@@ -150,9 +150,8 @@ impl Default for ProcessEventBus {
 // =====================================================================
 // Built-in events
 //
-// Continuo only ships the shutdown marker used by runtimes that want a
-// push-style notification alongside their cancellation token. Consumers define
-// their own event types in their own domain modules.
+// Shared lifecycle markers; publishing and handling belong to applications.
+// Consumers define additional event types in their own domain modules.
 // =====================================================================
 
 /// Process-wide marker for runtimes that publish shutdown initiation alongside
@@ -160,3 +159,9 @@ impl Default for ProcessEventBus {
 #[derive(Clone, Debug)]
 pub struct ShutdownInitiated;
 impl Event for ShutdownInitiated {}
+
+/// Application-owned reload request. This crate neither emits nor handles it.
+/// The application defines the reload scope and execution policy.
+#[derive(Clone, Debug)]
+pub struct ReloadRequired;
+impl Event for ReloadRequired {}

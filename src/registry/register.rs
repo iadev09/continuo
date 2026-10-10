@@ -2,12 +2,13 @@ use super::Result;
 
 /// Static, application-owned service registration.
 ///
-/// Implementations construct providers and insert their shared instances into
-/// the application's registry. No `Default` constructor is required. This is
+/// Implementations compose DI values and lifecycle components in the
+/// application's registry. They may register a preparation component instead
+/// of constructing an empty operational service. No `Default` is required. This is
 /// not configuration or boot: dependency state is prepared in later phases.
 /// `S` is application-owned and need not implement a Continuo state trait.
 /// A registration failure stops a tuple; already completed registrations are
-/// retained, not rolled back. Dependency order belongs to provider lifecycle,
+/// retained, not rolled back. Dependency order belongs to component lifecycle,
 /// not to this declaration-order registration step.
 pub trait Register<S> {
     fn register(state: &S) -> Result<()>;

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use super::SignalService;
-use congif::{ConfigReader, parsers::JsonParser};
+use congif::ConfigReader;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -11,8 +11,7 @@ fn fixture(name: &str) -> PathBuf {
 
 #[tokio::test]
 async fn signal_commands_follow_the_typed_configuration() {
-    let mut reader = ConfigReader::new();
-    reader.register("json", JsonParser).unwrap();
+    let reader = ConfigReader::new().with_builtin_parsers().unwrap();
     let service = SignalService::new(fixture("valid.json"));
     let config = reader.prepare(&service).await.unwrap();
     assert_eq!(
@@ -23,8 +22,7 @@ async fn signal_commands_follow_the_typed_configuration() {
 
 #[tokio::test]
 async fn invalid_signal_candidates_preserve_the_published_mapping() {
-    let mut reader = ConfigReader::new();
-    reader.register("json", JsonParser).unwrap();
+    let reader = ConfigReader::new().with_builtin_parsers().unwrap();
     let valid = reader
         .prepare(&SignalService::new(fixture("valid.json")))
         .await

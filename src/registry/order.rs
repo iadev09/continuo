@@ -2,16 +2,16 @@ use std::any::TypeId;
 
 /// Type-based lifecycle ordering hints.
 ///
-/// Numeric priorities still provide a coarse tie-breaker. `ProviderOrder`
-/// adds explicit relationships between provider concrete types, so code can
-/// say "run me before `T`" without relying on magic numbers or provider names.
+/// Numeric priorities still provide a coarse tie-breaker. `ComponentOrder`
+/// adds explicit relationships between lifecycle component types, so code can
+/// say "prepare me before `T`" without relying on magic numbers or names.
 #[derive(Clone, Debug, Default)]
-pub struct ProviderOrder {
+pub struct ComponentOrder {
     before: Vec<TypeId>,
     after: Vec<TypeId>,
 }
 
-impl ProviderOrder {
+impl ComponentOrder {
     pub fn new() -> Self {
         Self::default()
     }

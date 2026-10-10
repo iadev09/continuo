@@ -1,0 +1,6 @@
+{
+  "listen": "192.0.2.1:3000",
+  "max_connections": 2,
+  "acquire_timeout": "1000ms",
+  "graceful_timeout": "100ms"
+}

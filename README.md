@@ -10,8 +10,8 @@
 
 # Runtime service composition for Rust
 
-Register services once. Resolve the same shared instances by Rust type.
-Run, reload and stop them through an explicit lifecycle.
+Compose services once. Inject shared values by Rust type.
+Manage execution and cleanup through a separate, explicit lifecycle.
 
 Continuo supplies the registry and runtime, not an application framework.
 Your application owns its state, configuration, transports and domain code.
@@ -25,8 +25,10 @@ Your application owns its state, configuration, transports and domain code.
 ## An application can be this small
 
 ~~~rust
-Application::new()?
-    .with_services::<(CounterService, HttpService, SignalService)>()?
+// Capture the startup environment before starting runtime threads.
+let environments = unsafe { app::environment()? };
+Application::new(environments).await?
+    .with_services::<(CounterService, OtherService, HttpService, ReloadService, SignalService)>()?
     .run()
     .await
 ~~~
@@ -36,16 +38,33 @@ This is the entry point of the [playground](examples/playground/main.rs).
 puts a small application API on top of Continuo. Registration and lifecycle
 orchestration stay behind that API, rather than being repeated in `main.rs`.
 
-The three services demonstrate the same model in different roles:
+The services demonstrate different responsibilities:
 
-- **CounterService** accepts hits, restores its saved value on start and saves
+- **CounterService** accepts hits, restores its saved value during boot and saves
   it on stop. Its increment comes from configuration.
 - **HttpService** serves the playground and streams live updates with SSE.
   Reloading its configuration can replace the listening address.
 - **SignalService** maps configured process signals to counter hits and reloads.
   Ctrl+C initiates application shutdown.
 
-All three are typed providers, configurable, reloadable and runnable.
+`OtherService` observes the same source through its own config declaration;
+it has no long-running work and therefore implements no `Runnable`.
+`ReloadService` consumes application reload commands.
+
+The [counter](examples/playground/app/counter.rs) is only a number. It has no
+configuration, files, HTTP or lifecycle traits; `insert` makes it a plain DI
+value. The existing services implement `Register` and their lifecycle
+capabilities directly, without separate registration objects.
+
+`CounterService` demonstrates runtime activation, config application and
+persistence around that number. Its finite `Bootable` hook restores the value;
+each run generation admits hits and saves on stop. Web editing belongs to
+[handlers](examples/playground/app/handlers.rs), while client statistics and SSE
+presentation belong to [application state](examples/playground/app/state.rs).
+HTTP injects the same counter handle into its routes. HTTP and signals consume
+the reader's validated settings when a generation starts, retain operational
+settings in that generation, and hand replacements to the running loop.
+No service needs `OnceLock` or an empty initialization hook.
 
 ### Try the playground
 
@@ -63,37 +82,49 @@ save and a change submitted by the page.
 
 ~~~text
 examples/playground/
-├── main.rs          # logging and application entry point
+├── main.rs          # one environment call and application entry point
 ├── app.rs           # application composition and lifecycle
 ├── app/
 │   ├── state.rs     # shared state and capabilities
 │   ├── config.rs    # configuration types and environment input
-│   ├── providers.rs
-│   ├── providers/   # counter, HTTP, signals and live updates
+│   ├── environment.rs # startup environment and diagnostics
+│   ├── services.rs
+│   ├── counter.rs  # ordinary number; no runtime or web dependency
+│   ├── services/   # direct lifecycle integrations and live resource handoff
 │   └── handlers.rs
 ├── config/          # counter.json, http.json and signals.json
 ├── web/             # HTML, CSS and JavaScript
 └── storage/         # persisted counter state
 ~~~
 
-The HTTP configuration uses `"${HTTP_LISTEN}"`. The example reads its `.env`
-and lets process environment values override it. That environment file is
-not watched; configuration files are.
+The HTTP JSON configuration uses `"$HTTP_LISTEN"`. dotenw captures the process
+environment at startup and prepares the example's base and service-specific
+environment snapshots. `--environment NAME` selects the declared environment;
+the default is `production`. Configuration watching belongs to the runtime.
 
 ## Build the services underneath
 
 | Part | Responsibility |
 | --- | --- |
-| `Registry<S>` | Shared provider instances, typed resolution and lifecycle ordering |
-| `Register<S>` | Type-owned construction and registration |
-| `Provider<S>` | Identity, dependencies and optional lifecycle capabilities |
+| `Registry<S>` | Separate DI bindings and ordered lifecycle registrations |
+| `Register<S>` | Static application composition; may register several objects |
+| `Component<S>` | Lifecycle identity, dependencies and capability exposure |
+| `Bootable<S>` | Finite preparation; may publish fully initialized services |
 | `Runtime<S>` | Runnable generations, control commands and shutdown |
 | `ServiceManager` | A control handle for that runtime |
 | Congif | Configuration reading, validation and snapshot publication |
 
 ### Resolve by type
 
-Application code asks for the service it needs, not its construction recipe:
+Application code asks for the service it needs, not its construction recipe.
+Ordinary values need only `Any + Send + Sync`; no lifecycle trait is required:
+
+~~~rust
+registry.insert(Arc::new(settings))?; // DI only
+let settings = registry.resolve::<Settings>();
+~~~
+
+For the prepared playground service:
 
 ~~~rust
 let counter = state
@@ -104,7 +135,7 @@ let counter = state
 
 Resolution returns an `Arc<CounterService>` pointing to the registered instance.
 It does not construct another counter. Missing types return `None`; inserting
-a second provider of the same concrete type is an error.
+a second DI value of the same concrete type is an error.
 
 A provider can expose an interface without creating another instance.
 `bind_dyn` binds an interface to an existing concrete provider, and
@@ -125,31 +156,50 @@ inspect a concrete provider without taking an owned handle.
 A service does not need `Default`. It can take paths, settings or dependencies
 from application state when it builds its instance.
 
-The playground counter registers itself with both its configuration path
-and its persistence path:
+The playground binds its ordinary counter and registers its lifecycle
+integration. `CounterService::register` follows this shape:
 
 ~~~rust
-impl Register<AppState> for CounterService {
-    fn register(state: &AppState) -> continuo::Result<()> {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("examples/playground");
-
-        state.registry_ref().insert(Arc::new(Self::new(
-            root.join("config/counter.json"),
-            root.join("storage/counter.json"),
-        )))?;
-        Ok(())
-    }
-}
+state.reader().bind_environment::<Self>(
+    state.environment(&state.application_config().counter.env_file)?,
+)?;
+state.registry_ref().insert(state.counter().clone())?; // plain Counter
+state.registry_ref().register(Arc::new(Self::new(
+    state.application_config().counter.config_path.clone(),
+    config::root().join("storage/counter.json"),
+    state.counter().clone(),
+    state.counter_updates().clone(),
+)))?;
 ~~~
+
+The [complete service](examples/playground/app/services/counter.rs) exposes
+only its needed capabilities. No separate registration struct or second
+provider lifecycle is involved.
+
+These registration operations have distinct meanings:
+
+| Operation | DI lookup | Lifecycle |
+| --- | --- | --- |
+| `insert(Arc<T>)` | Yes; no `Component` bound | No |
+| `register(Arc<T>)` | Yes | Yes; `T: Component<S>` |
+| `register_lifecycle(Arc<T>)` | No | Yes; `T: Component<S>` |
+
+Migration: `Provider` and `ProviderOrder` remain trait/type aliases for existing
+implementations. Old lifecycle calls to `insert` must become `register`;
+`insert` no longer enrolls a value in lifecycle orchestration implicitly.
+Every component must declare its diagnostic `name`. Preparation implements
+`Bootable::boot` and is exposed through `Component::as_bootable`; there is no
+boot hook on `Component`, including when using the `Provider` alias.
+Failure reports identify the participant through `component()`.
 
 Tuples compose registrations in declaration order. Each tuple supports up to
 eight members; nested tuples compose larger sets. A registration error stops
 that sequence without undoing providers already registered.
 
 `Runtime::with_services` invokes those registrations and installs its own
-`ServiceManager`. With `config-watch` enabled, it also prepares configuration
-watching. It does not boot the services.
+`ServiceManager`. It does not prepare configuration, install watching or boot
+the services. Enabling `config-watch` does not change its state requirements
+or registration behavior.
 
 ### Keep application state yours
 
@@ -172,11 +222,13 @@ See the complete [playground state](examples/playground/app/state.rs).
 
 ### Expose only the lifecycle hooks you need
 
-Every registered service implements `Provider<S>`. Additional traits opt that
-same instance into additional work:
+Only lifecycle participants implement `Component<S>`. Their capability hooks
+can expose themselves or separate objects. Injected services need not implement
+it, and `Runnable`, `Reloadable`, `Finalizable` and `Bootable` do not inherit it.
 
-| Trait | Capability exposed by `Provider` |
+| Trait | Capability exposed by `Component` |
 | --- | --- |
+| `Bootable<S>` | `as_bootable` |
 | `Configurable` | `as_configurable` |
 | `Environmental` | `as_environmental` |
 | `Reloadable<S>` | `as_reloadable` |
@@ -187,24 +239,26 @@ A provider may have no running task at all. A runnable may be reloadable or
 not. Implementing a capability also requires exposing it through its
 corresponding `as_*` method.
 
-`Provider::boot` prepares dependencies and resources; `validate` checks the
-prepared provider. `Runnable::run` owns its long-lived work. `Reloadable::reload`
-applies a change; `Finalizable::finalize` performs final cleanup.
+`Bootable::boot` prepares dependencies and resources; `Component::validate`
+checks readiness. `Runnable::run` owns its work and graceful drain.
+`Reloadable::reload` applies a change; `Finalizable::finalize` releases prepared,
+non-running resources. A finalizer does not require a runnable or DI binding.
+The existing `Component::boot` hook remains for source compatibility; when
+`as_bootable` is present, only that capability is called.
 
 Dependencies use Rust types:
 
 ~~~rust
-fn order(&self) -> continuo::ProviderOrder {
-    continuo::ProviderOrder::new()
+fn order(&self) -> continuo::ComponentOrder {
+    continuo::ComponentOrder::new()
         .after::<CounterService>()
-        .after::<ServiceManager>()
         .after::<SignalService>()
 }
 ~~~
 
 This is the playground HTTP provider's order. Boot, validation and reload
-follow the dependency plan. Finalization reverses it. Missing dependencies and
-cycles are errors; priorities provide tie-breaks, not replacements for declared
+follow the dependency plan. Finalization reverses it. Cycles are errors;
+ordering hints for absent types are ignored. Priorities provide tie-breaks, not replacements for declared
 dependencies. Run priority controls spawn order separately.
 
 ### Configure once, reload through the runtime
@@ -226,6 +280,15 @@ without a native watcher or the `config-watch` feature. A configurable service
 cannot silently reload stale configuration when no reader has been bound;
 that request returns an error. Watching only supplies automatic invalidations.
 
+`Runtime::prepare` configures the declared owners and boots the dependency
+plan. A wrapper must declare its configuration before boot; its newly created
+service can expose the same owner without another read or startup callback.
+Publishing an undeclared configuration owner during boot is rejected rather
+than allowing an unconfigured service to run. Preparation does not spawn tasks
+or validate readiness. Applications with readiness checks call `validate_all`
+before `spawn_all`; this playground needs only config validation and fallible
+boot construction, so it does not install empty readiness hooks.
+
 A configurable component declares its configuration type and one source.
 Congif reads and validates the batch before invoking startup callbacks:
 
@@ -245,30 +308,33 @@ impl Configurable for CounterService {
         }
     }
 
-    async fn configure(
-        &self,
-        config: &Self::Config,
-    ) -> congif::Result<()> {
-        // Apply the prepared candidate without reading its source again.
-        self.apply_candidate(config).await
+    async fn configure(&self, config: &CounterConfig) -> congif::Result<()> {
+        self.apply_config(config);
+        Ok(())
     }
 
     // validate_config rejects an increment of zero.
 }
 ~~~
 
+The startup `configure` callback is optional. Sources consumed directly when a
+generation starts, such as the playground's HTTP settings, need no empty apply
+hook. Congif retains their validated snapshots.
+
 Implement `congif::ConfigObserver::config_changed(&Self::Config)` to apply the
 new typed candidate without reading sources again. Owners returning `None`
 are still configurable and manually reloadable, but are not watched.
 
-The [full implementation](examples/playground/app/providers/counter.rs)
-includes validation and receives prepared candidates through this observer.
+The [counter lifecycle integration](examples/playground/app/services/counter.rs)
+owns this configuration and applies typed candidates directly to the
+playground's display settings. The number itself does not know configuration
+exists. Watching addresses the config owner, independently of DI.
 
 Congif owns parsers, reads and configuration snapshots. Providers own their
 schema, validation and runtime application. Snapshots are indexed by owner
 type, so two owners can use the same configuration type independently.
 
-With `config-watch` enabled:
+With `config-watch` enabled and `Runtime::watch_configurations` called:
 
 1. The runtime installs watches for owners exposing a config observer.
 2. Congif reports a changed source; the affected owners are resolved from the registry.
@@ -301,9 +367,10 @@ its working listener. A rejected bind leaves the old address serving. A
 successful replacement drains the old listener, including SSE connections,
 and reports the new address in the console.
 
-For manual registry composition, `Runtime::watch_configurations` installs
-watching explicitly. `ConfigurationChanged::of::<Owner>()` can also notify the
-runtime through the typed event bus.
+`Runtime::watch_configurations` installs watching explicitly after registration
+and before preparation, whether using `with_services` or manual composition.
+`ConfigurationChanged::of::<Owner>()` can also notify the runtime through the
+typed event bus.
 
 ### Control live services
 

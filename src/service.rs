@@ -1,11 +1,8 @@
 use std::fmt;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-
-use crate::Provider;
 
 const COMMAND_CAPACITY: usize = 64;
 
@@ -300,15 +297,5 @@ impl ServiceManager {
         let name = name.into();
         self.stop(name.clone()).await?;
         self.start(name).await
-    }
-}
-
-#[async_trait]
-impl<S> Provider<S> for ServiceManager
-where
-    S: Send + Sync + 'static,
-{
-    fn name(&self) -> &'static str {
-        "service-manager"
     }
 }

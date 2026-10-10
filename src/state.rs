@@ -50,6 +50,13 @@ use crate::Registry;
 pub trait SharedState: Clone + Send + Sync + 'static {
     fn shutdown_token(&self) -> CancellationToken;
 
+    /// Role hosted by this process, supplied by the application adapter.
+    /// The default combines all roles, preserving single-process behavior.
+    #[cfg(feature = "fleet")]
+    fn process_scope(&self) -> crate::fleet::Scope {
+        crate::fleet::Scope::Any
+    }
+
     fn initiate_shutdown(&self) {
         self.shutdown_token().cancel();
     }
@@ -80,8 +87,5 @@ pub trait HasEvents: SharedState {
     fn events(&self) -> &ProcessEventBus;
 }
 
-/// The application's common configuration reader and snapshot catalog.
 #[cfg(feature = "config-watch")]
-pub trait HasConfigReader: SharedState {
-    fn config_reader(&self) -> &congif::ConfigReader;
-}
+pub use congif::HasConfigReader;

@@ -1,12 +1,18 @@
 //! Application composition and lifecycle; the executable only launches it.
 
 mod config;
+mod counter;
+mod environment;
+mod events;
 mod handlers;
-mod providers;
+mod services;
 mod state;
 
 use continuo::{Error, HasRegistry, Register, Result, Runtime};
-pub use providers::{CounterService, HttpService, SignalService};
+pub use environment::environment;
+pub use services::{
+    CounterService, HttpService, OtherService, ReloadService, SignalService,
+};
 use state::AppState;
 
 pub struct Application {
@@ -15,8 +21,8 @@ pub struct Application {
 }
 
 impl Application {
-    pub fn new() -> Result<Self> {
-        let state = AppState::new()?;
+    pub async fn new(environments: dotenw::EnvStore) -> Result<Self> {
+        let state = AppState::new(environments).await?;
         let runtime = Runtime::<AppState>::default();
         Ok(Self { state, runtime })
     }
@@ -29,23 +35,17 @@ impl Application {
     pub async fn run(self) -> Result<()> {
         let Self { state, mut runtime } = self;
         let registry = state.registry_ref();
-        registry.boot_all(&state).await?;
-        let validation = registry.validate_all(&state)?;
-        for failure in validation.failures() {
-            eprintln!(
-                "validation failed for {}: {}",
-                failure.provider(),
-                failure.error()
-            );
-        }
-        if !validation.is_valid() {
-            return Err(Error::msg(format!(
-                "{} provider validation(s) failed",
-                validation.failed_count()
-            )));
-        }
-
+        runtime.watch_configurations(&state)?;
+        runtime.prepare(&state).await?;
         runtime.spawn_all(registry, state.clone())?;
+
+        // Read a required config value using dot notation.
+        let increment = state
+            .config::<usize>("counter.increment")?
+            .ok_or_else(|| Error::msg("counter.increment is not configured"))?;
+
+        println!("Counter hit increments by {increment}");
+
         let runtime_result = runtime.wait_until_shutdown(&state).await;
         runtime.drain().await?;
         runtime_result?;
@@ -54,7 +54,7 @@ impl Application {
         for failure in finalized.failures() {
             eprintln!(
                 "finalize failed for {}: {}",
-                failure.provider(),
+                failure.component(),
                 failure.error()
             );
         }

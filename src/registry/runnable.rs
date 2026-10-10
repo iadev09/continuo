@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::{Provider, Result};
+use super::Result;
 
 /// Capability trait for providers that produce a long-running runtime task.
 ///
 /// `run()` is the ONLY place in the lifecycle for long-running work
 /// (accept loops, listeners, periodic tickers). It must NOT appear in
-/// `register()` or `Provider::boot()`.
+/// `register()` or `Bootable::boot()`.
 ///
 /// The supplied [`crate::RunContext`] belongs to one live service generation.
 /// Observe its cancellation instead of only the process shutdown token: the
@@ -16,7 +16,7 @@ use super::{Provider, Result};
 /// shutdown.
 ///
 #[async_trait]
-pub trait Runnable<S>: Provider<S> {
+pub trait Runnable<S>: Send + Sync + 'static {
     /// Declare the service's current activation policy.
     ///
     /// The default is [`crate::ServiceStartPolicy::Automatic`] because

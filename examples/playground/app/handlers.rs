@@ -1,5 +1,5 @@
 use super::{
-    providers::{CounterService, SignalService},
+    services::{CounterService, SignalService},
     state::AppState,
 };
 use axum::extract::{ConnectInfo, Form, State};
@@ -8,31 +8,67 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use continuo::{ServiceManager, ServiceSnapshot};
+use continuo::{HasEvents, ReloadRequired, ServiceManager, ServiceSnapshot};
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+pub async fn read_config(
+    State(state): State<AppState>
+) -> axum::response::Response {
+    let settings = (|| -> congif::Result<_> {
+        let listen = state.config::<SocketAddr>("http.listen")?;
+        let increment = state.config::<u64>("counter.increment")?;
+        let missing = state.config::<String>("counter.missing")?;
+        Ok(
+            serde_json::json!({ "http": { "listen": listen }, "counter": { "increment": increment }, "missing": missing }),
+        )
+    })();
+    match settings {
+        Ok(settings) => Json(settings).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"message": error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 pub async fn counter_events(
-    Extension(counter): Extension<Arc<CounterService>>,
+    State(state): State<AppState>,
     Extension(cancel): Extension<tokio_util::sync::CancellationToken>,
 ) -> impl IntoResponse {
-    let receiver = counter.subscribe();
+    let receiver = state.counter_updates().subscribe();
+    let addresses =
+        state.events().subscribe::<super::events::ServerAddressChanged>();
     let stream = futures_util::stream::unfold(
-        (receiver, true, cancel),
-        |(mut receiver, first, cancel)| async move {
+        (receiver, addresses, true, cancel),
+        |(mut receiver, mut addresses, first, cancel)| async move {
+            // Address moves must win over the old generation's drain signal.
+            if let Ok(change) = addresses.try_recv() {
+                let event = Event::default()
+                    .event("server-address-changed")
+                    .json_data(change);
+                return Some((event, (receiver, addresses, false, cancel)));
+            }
             if cancel.is_cancelled() {
                 return None;
             }
             if !first {
                 tokio::select! {
+                    biased;
+                    change = addresses.recv() => {
+                        let Ok(change) = change else { return None };
+                        let event = Event::default().event("server-address-changed").json_data(change);
+                        return Some((event, (receiver, addresses, false, cancel)));
+                    }
                     _ = cancel.cancelled() => return None,
                     result = receiver.changed() => if result.is_err() { return None; },
                 }
             }
             let snapshot = receiver.borrow_and_update().clone();
             let event = Event::default().json_data(snapshot);
-            Some((event, (receiver, false, cancel)))
+            Some((event, (receiver, addresses, false, cancel)))
         },
     );
     Sse::new(stream)
@@ -64,7 +100,7 @@ async fn asset(
 }
 
 pub async fn index(
-    Extension(counter): Extension<Arc<CounterService>>,
+    State(state): State<AppState>,
     Extension(manager): Extension<Arc<ServiceManager>>,
     Extension(signals): Extension<Arc<SignalService>>,
 ) -> std::result::Result<Html<String>, (StatusCode, String)> {
@@ -83,11 +119,16 @@ pub async fn index(
     let page = tokio::fs::read_to_string(path).await.map_err(|error| {
         (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
     })?;
-    let json = counter.config_json().map_err(|error| {
-        (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
-    })?;
+    let json =
+        state.reader().snapshot::<CounterService>().map_err(|error| {
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+        })?;
+    let json =
+        serde_json::to_string_pretty(json.as_ref()).map_err(|error| {
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+        })?;
     let (reload_command, hit_command) =
-        signals.commands().map_err(|error| {
+        signals.commands(state.reader()).map_err(|error| {
             (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
         })?;
     Ok(Html(
@@ -99,11 +140,14 @@ pub async fn index(
 }
 
 pub async fn hit(
-    ConnectInfo(client): ConnectInfo<SocketAddr>,
-    Extension(counter): Extension<Arc<CounterService>>,
+    ConnectInfo(super::services::PeerAddress(client)): ConnectInfo<
+        super::services::PeerAddress,
+    >,
+    State(state): State<AppState>,
+    Extension(counter): Extension<Arc<super::counter::Counter>>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    match counter.hit(client) {
+    match state.hit(&counter, Some(client), false) {
         Some((value, yours)) if wants_json(&headers) => Json(serde_json::json!({
             "message": "Hit added", "value": value, "yours": yours,
         })).into_response(),
@@ -132,7 +176,7 @@ pub async fn update_config(
     headers: HeaderMap,
     Form(form): Form<ConfigForm>,
 ) -> axum::response::Response {
-    match counter.update_config(state.reader(), &form.json).await {
+    match save_counter_config(state.reader(), &counter, &form.json).await {
         Ok(()) if wants_json(&headers) => Json(serde_json::json!({"message":"Configuration saved; watcher will apply it."})).into_response(),
         Ok(()) => Redirect::to("/").into_response(),
         Err(error) if wants_json(&headers) => (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"message":error.to_string()}))).into_response(),
@@ -315,12 +359,28 @@ fn control_error(message: String) -> (StatusCode, Html<String>) {
 }
 
 pub async fn reload(State(app): State<AppState>) -> Redirect {
-    match app.reload_counter().await {
-        Ok(snapshot) => println!(
-            "http: /reload - counter reloaded (revision {})",
-            snapshot.reload_revision()
-        ),
-        Err(error) => println!("http: /reload failed: {error}"),
-    }
+    app.events().emit(ReloadRequired);
+    tracing::info!("http: application reload requested");
     Redirect::to("/")
+}
+
+pub(super) async fn save_counter_config(
+    reader: &congif::ConfigReader,
+    service: &CounterService,
+    json: &str,
+) -> continuo::Result<()> {
+    let path = congif::Configurable::source(service).path;
+    let candidate = reader
+        .parse_for::<CounterService>(congif::ConfigSource {
+            path: &path,
+            bytes: json.as_bytes(),
+        })
+        .await?;
+    congif::Configurable::validate_config(service, &candidate)?;
+    let bytes = serde_json::to_vec_pretty(&candidate)?;
+    tokio::task::spawn_blocking(move || {
+        super::config::atomic_write(&path, &bytes)
+    })
+    .await??;
+    Ok(())
 }

@@ -1,15 +1,15 @@
 use super::Error;
 
-/// One provider failure retained by a full validation pass.
+/// One component failure retained by a full validation pass.
 #[derive(Debug)]
 pub struct ValidationFailure {
-    pub(super) provider: &'static str,
+    pub(super) component: &'static str,
     pub(super) error: Error,
 }
 
 impl ValidationFailure {
-    pub fn provider(&self) -> &'static str {
-        self.provider
+    pub fn component(&self) -> &'static str {
+        self.component
     }
 
     pub fn error(&self) -> &Error {
@@ -21,13 +21,13 @@ impl ValidationFailure {
     }
 }
 
-/// Result of validating every provider in lifecycle order.
+/// Result of validating every component in lifecycle order.
 ///
 /// The outer [`super::Result`] returned by [`super::Registry::validate_all`] is reserved for
-/// lifecycle-plan failures. Individual provider failures are retained here so
+/// lifecycle-plan failures. Individual component failures are retained here so
 /// callers can report the complete invalid configuration in one pass.
 #[derive(Debug, Default)]
-#[must_use = "provider validation failures are reported through ValidationOutcome"]
+#[must_use = "component validation failures are reported through ValidationOutcome"]
 pub struct ValidationOutcome {
     pub(super) validated_count: usize,
     pub(super) failures: Vec<ValidationFailure>,

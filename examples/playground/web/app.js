@@ -9,7 +9,7 @@ function syncControls() {
     const selected = (action === 'start' && counterRunning === true)
       || (action === 'stop' && counterRunning === false);
     const unavailable = counterRunning === null || selected
-      || (['hit', 'restart'].includes(action) && counterRunning === false);
+      || (['hit', 'restart', 'reload'].includes(action) && counterRunning === false);
     button.disabled = unavailable || button.dataset.busy === 'true';
     if (action === 'start' || action === 'stop') button.setAttribute('aria-pressed', String(selected));
   });
@@ -87,14 +87,37 @@ document.querySelector('#refresh-services')?.addEventListener('click', async eve
 });
 const initialCounter = document.querySelector('[data-service="counter"] [data-field="status"]');
 if (initialCounter) setCounterState(initialCounter.textContent.trim() === 'running');
-if (document.querySelector('#count')) {
-const events = new EventSource('/counter/events');
 const live = document.querySelector('#live');
+const events = new EventSource('/counter/events');
 let pageRevision = null;
-events.onopen = () => { live.textContent = '● Live · counter updates connected'; };
-events.onerror = () => { live.textContent = '○ Connection lost · reconnecting'; };
-events.onmessage = event => {
-  const view = JSON.parse(event.data);
+let pendingAddress = null;
+let addressDeadline = null;
+let pageLeaving = false;
+function moveToNewAddress(reason) {
+  if (pageLeaving || !pendingAddress) return;
+  pageLeaving = true;
+  clearTimeout(addressDeadline);
+  events.close();
+  console.info(`Server address changed · ${reason}`);
+  window.location.replace(pendingAddress);
+}
+function addressChanged(change) {
+  const destination = new URL(`http://${change.to}`);
+  const current = new URL(window.location.href);
+  if (!['0.0.0.0', '[::]'].includes(destination.hostname)) {
+    current.hostname = destination.hostname;
+  }
+  current.port = destination.port;
+  pendingAddress = current.href;
+  clearTimeout(addressDeadline);
+  if (change.graceful_timeout !== null) {
+    const grace = change.graceful_timeout;
+    const delay = grace.secs * 1000 + grace.nanos / 1e6;
+    addressDeadline = setTimeout(() => moveToNewAddress('server graceful delay'), delay);
+  }
+}
+function counterChanged(view) {
+  if (!document.querySelector('#count')) return;
   if (pageRevision !== null && pageRevision !== view.page_revision) {
     window.location.reload();
     return;
@@ -108,6 +131,21 @@ events.onmessage = event => {
   badge.textContent = view.active ? 'Running' : 'Stopped';
   badge.classList.toggle('neutral', !view.active);
   count.animate([{opacity:.45},{opacity:1}], {duration:180});
-};
-window.addEventListener('pagehide', () => events.close());
 }
+events.onopen = () => { if (live) live.textContent = '● Live · counter updates connected'; };
+events.onerror = () => {
+  if (pendingAddress) {
+    // EventSource cannot distinguish clean EOF from a network interruption.
+    // A prior typed address event authorizes the move in either case.
+    moveToNewAddress('old SSE disconnected');
+  } else if (live) {
+    live.textContent = '○ Connection lost · reconnecting';
+  }
+};
+events.addEventListener('server-address-changed', event => addressChanged(JSON.parse(event.data)));
+events.onmessage = event => counterChanged(JSON.parse(event.data));
+window.addEventListener('pagehide', () => {
+  pageLeaving = true;
+  clearTimeout(addressDeadline);
+  events.close();
+});

@@ -1,8 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use continuo::{
-    Error, HasRegistry, Provider, Register, Registry, Result, Runtime,
-    ServiceManager,
+    Error, HasRegistry, Register, Registry, Result, Runtime, ServiceManager,
 };
 
 type State = Mutex<Vec<u8>>;
@@ -49,10 +48,6 @@ struct AppState {
     registry: Arc<Registry<Self>>,
     capacity: usize,
     shutdown: tokio_util::sync::CancellationToken,
-    #[cfg(feature = "config-watch")]
-    events: continuo::ProcessEventBus,
-    #[cfg(feature = "config-watch")]
-    reader: Arc<congif::ConfigReader>,
 }
 
 impl continuo::SharedState for AppState {
@@ -67,30 +62,12 @@ impl HasRegistry for AppState {
     }
 }
 
-#[cfg(feature = "config-watch")]
-impl continuo::HasEvents for AppState {
-    fn events(&self) -> &continuo::ProcessEventBus {
-        &self.events
-    }
-}
-
-#[cfg(feature = "config-watch")]
-impl continuo::HasConfigReader for AppState {
-    fn config_reader(&self) -> &congif::ConfigReader {
-        &self.reader
-    }
-}
-
 #[test]
 fn runtime_registers_its_manager_and_service_types_without_boot() {
     let state = AppState {
         registry: Arc::new(Registry::default()),
         capacity: 7,
         shutdown: tokio_util::sync::CancellationToken::new(),
-        #[cfg(feature = "config-watch")]
-        events: continuo::ProcessEventBus::new(),
-        #[cfg(feature = "config-watch")]
-        reader: Arc::new(congif::ConfigReader::new()),
     };
     let runtime =
         Runtime::default().with_services::<(CacheService,)>(&state).unwrap();
@@ -111,9 +88,6 @@ struct CacheService {
     capacity: usize,
 }
 
-#[async_trait::async_trait]
-impl Provider<AppState> for CacheService {}
-
 impl Register<AppState> for CacheService {
     fn register(state: &AppState) -> Result<()> {
         state.registry.insert(Arc::new(Self { capacity: state.capacity }))?;
@@ -127,10 +101,6 @@ fn registration_constructs_and_resolves_one_shared_instance_without_boot() {
         registry: Arc::new(Registry::default()),
         capacity: 7,
         shutdown: tokio_util::sync::CancellationToken::new(),
-        #[cfg(feature = "config-watch")]
-        events: continuo::ProcessEventBus::new(),
-        #[cfg(feature = "config-watch")]
-        reader: Arc::new(congif::ConfigReader::new()),
     };
     <(CacheService,)>::register(&state).unwrap();
     let first = state.registry.resolve::<CacheService>().unwrap();

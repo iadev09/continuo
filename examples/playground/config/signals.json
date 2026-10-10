@@ -1,4 +1,4 @@
 {
   "reload": "HUP",
-  "hit": "USR2"
+  "hit": "USR1"
 }
