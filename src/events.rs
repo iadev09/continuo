@@ -45,7 +45,7 @@
 //! ```
 
 use std::any::{Any, TypeId};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use dashmap::DashMap;
 use tokio::sync::broadcast;
@@ -71,6 +71,46 @@ pub trait Event: Clone + Send + Sync + 'static {}
 pub struct ProcessEventBus {
     channels: Arc<DashMap<TypeId, Box<dyn Any + Send + Sync>>>,
     capacity: usize,
+}
+
+type EventFilter<E> = Box<dyn Fn(&E) -> bool + Send + Sync>;
+
+struct FilteredSender<E: Event> {
+    accepts: EventFilter<E>,
+    sender: broadcast::Sender<E>,
+}
+
+struct Channel<E: Event> {
+    sender: broadcast::Sender<E>,
+    // Ordinary typed channels never allocate or lock a filtered subscriber list.
+    filtered: OnceLock<Mutex<Vec<FilteredSender<E>>>>,
+}
+
+impl<E: Event> Channel<E> {
+    fn new(capacity: usize) -> Self {
+        let (sender, _) = broadcast::channel(capacity);
+        Self { sender, filtered: OnceLock::new() }
+    }
+
+    fn emit(
+        &self,
+        event: E,
+    ) {
+        if let Some(filtered) = self.filtered.get() {
+            let mut subscribers =
+                filtered.lock().expect("event filters lock poisoned");
+            subscribers.retain(|subscriber| {
+                if subscriber.sender.receiver_count() == 0 {
+                    return false;
+                }
+                if (subscriber.accepts)(&event) {
+                    let _ = subscriber.sender.send(event.clone());
+                }
+                true
+            });
+        }
+        let _ = self.sender.send(event);
+    }
 }
 
 impl ProcessEventBus {
@@ -100,9 +140,9 @@ impl ProcessEventBus {
         );
 
         if let Some(entry) = self.channels.get(&key)
-            && let Some(sender) = entry.downcast_ref::<broadcast::Sender<E>>()
+            && let Some(channel) = entry.downcast_ref::<Arc<Channel<E>>>()
         {
-            let _ = sender.send(event);
+            channel.emit(event);
         }
         // No subscribers (or no channel registered) → drop silently.
     }
@@ -113,26 +153,63 @@ impl ProcessEventBus {
     /// receiver sees only events emitted AFTER it subscribed —
     /// no replay of historical events.
     pub fn subscribe<E: Event>(&self) -> broadcast::Receiver<E> {
-        let key = TypeId::of::<E>();
+        self.channel::<E>().sender.subscribe()
+    }
 
-        if let Some(entry) = self.channels.get(&key)
-            && let Some(sender) = entry.downcast_ref::<broadcast::Sender<E>>()
-        {
-            return sender.subscribe();
-        }
+    /// Subscribe to matching values of `E`, filtering before queue admission.
+    ///
+    /// The receiver has the same capacity and lag/closure semantics as an
+    /// ordinary subscription, but rejected events consume no slots. Publication
+    /// applies the predicate synchronously; no task, forwarding queue or polling
+    /// loop is started. Predicates must be cheap, non-blocking and must not
+    /// publish or subscribe through this bus. Mutable selection may be captured
+    /// through shared state; selection is evaluated when an event is emitted.
+    ///
+    /// Only events emitted after registration are eligible. Dropping the receiver
+    /// stops delivery; the next publication or filtered registration releases
+    /// its predicate. Dropping the last bus closes all receivers.
+    pub fn subscribe_filtered<E: Event>(
+        &self,
+        accepts: impl Fn(&E) -> bool + Send + Sync + 'static,
+    ) -> broadcast::Receiver<E> {
+        self.subscribe_filtered_with_capacity(self.capacity, accepts)
+    }
 
-        // Slow path: create the channel for this type. Race with
-        // another subscriber is harmless — `entry().or_insert_with`
-        // gives us a single winner; both end up with the same
-        // `Sender` clone.
-        let entry = self.channels.entry(key).or_insert_with(|| {
-            let (sender, _) = broadcast::channel::<E>(self.capacity);
-            Box::new(sender) as Box<dyn Any + Send + Sync>
-        });
-        entry
-            .downcast_ref::<broadcast::Sender<E>>()
-            .expect("channel for TypeId is always Sender<E>")
-            .subscribe()
+    /// A filtered subscription with a consumer-owned backlog bound.
+    ///
+    /// This changes only this receiver, not ordinary typed channels or other
+    /// subscribers. As with Tokio broadcast, capacity must be positive and at
+    /// most `usize::MAX / 2`; storage rounds up to the next power of two.
+    /// No earlier publications are replayed.
+    pub fn subscribe_filtered_with_capacity<E: Event>(
+        &self,
+        capacity: usize,
+        accepts: impl Fn(&E) -> bool + Send + Sync + 'static,
+    ) -> broadcast::Receiver<E> {
+        let (sender, receiver) = broadcast::channel(capacity);
+        let channel = self.channel::<E>();
+        let mut subscribers = channel
+            .filtered
+            .get_or_init(Mutex::default)
+            .lock()
+            .expect("event filters lock poisoned");
+        subscribers
+            .retain(|subscriber| subscriber.sender.receiver_count() != 0);
+        subscribers.push(FilteredSender { accepts: Box::new(accepts), sender });
+        receiver
+    }
+
+    fn channel<E: Event>(&self) -> Arc<Channel<E>> {
+        let entry =
+            self.channels.entry(TypeId::of::<E>()).or_insert_with(|| {
+                Box::new(Arc::new(Channel::<E>::new(self.capacity)))
+                    as Box<dyn Any + Send + Sync>
+            });
+        Arc::clone(
+            entry
+                .downcast_ref::<Arc<Channel<E>>>()
+                .expect("channel for TypeId is always Channel<E>"),
+        )
     }
 
     /// Number of registered event types (one channel per type).

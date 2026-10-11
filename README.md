@@ -486,6 +486,18 @@ Events are delivered only to existing subscribers. Channels are bounded and
 receivers must handle lag. The bus is neither storage nor a cross-process
 queue.
 
+`subscribe_filtered::<E>(predicate)` uses the same bounded receiver contract,
+but evaluates the predicate synchronously during publication, before queue
+admission. Rejected events cannot consume that subscription's capacity or cause
+its lag. The predicate may read a shared selection, but must be cheap,
+non-blocking and must not re-enter the bus. No forwarding task or polling loop
+is created; only subsequent matching publications are delivered. Dropped
+receivers are removed on the next publication or filtered registration.
+`subscribe_filtered_with_capacity::<E>(capacity, predicate)` lets a consumer
+declare its own backlog bound without resizing other channels. Capacity is a
+positive count of retained events, not event types; Tokio rounds storage up to
+the next power of two. Matching overflow still reports lag.
+
 ## Admission control
 
 Requires the `support` feature. `Gate` provides admission control for a
