@@ -33,7 +33,7 @@ pub use congif::{ConfigObserver, Configurable};
 #[cfg(feature = "events")]
 pub use events::{Event, ProcessEventBus, ReloadRequired, ShutdownInitiated};
 #[cfg(feature = "fleet")]
-pub use fleet::{Dispatch, Dispatched, Scope, Scoped};
+pub use fleet::{Dispatch, DispatchPolicy, Dispatched, Scope, Scoped};
 #[cfg(feature = "support")]
 pub use gate::{Gate, GateDrainOutcome, Permit};
 #[cfg(feature = "support")]

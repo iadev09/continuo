@@ -2,9 +2,11 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroU16;
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::{AnyRunnable, Result, RunContext, SharedState};
+use crate::{AnyRunnable, Error, Result, RunContext, SharedState};
 
 use super::{Scope, Scoped};
 
@@ -31,6 +33,59 @@ impl Dispatch {
     pub const fn is_controller_driven(self) -> bool {
         matches!(self, Self::One | Self::Pool)
     }
+
+    /// Validate an explicitly declared lease policy. `Each` uses no lease.
+    pub fn validate_policy(
+        self,
+        policy: Option<DispatchPolicy>,
+    ) -> Result<()> {
+        if self.is_controller_driven() {
+            policy
+                .ok_or_else(|| {
+                    Error::msg("dispatch one/pool requires dispatch_policy")
+                })?
+                .validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Service-owned execution capacity and lease timing, independent of transport.
+/// No duration is inferred. `One` uses one slot; only `Pool` uses `capacity`.
+/// Adapters implement coordination, not configuration ownership.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DispatchPolicy {
+    pub capacity: NonZeroU16,
+    #[serde(with = "humantime_serde")]
+    pub lease_ttl: Duration,
+    #[serde(with = "humantime_serde")]
+    pub renewal_interval: Duration,
+}
+
+impl DispatchPolicy {
+    /// Check the declared timing before a controller accepts ownership.
+    pub fn validate(&self) -> Result<()> {
+        if self.lease_ttl.is_zero() {
+            return Err(Error::msg("dispatch lease_ttl must be nonzero"));
+        }
+        if self.renewal_interval.is_zero()
+            || self.renewal_interval >= self.lease_ttl
+        {
+            return Err(Error::msg(
+                "dispatch renewal_interval must be nonzero and shorter than lease_ttl",
+            ));
+        }
+        if tokio::time::Instant::now()
+            .checked_add(self.renewal_interval)
+            .is_none()
+        {
+            return Err(Error::msg(
+                "dispatch renewal_interval exceeds the runtime clock",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Declares selection within a scope; execution adapters apply the policy.
@@ -43,17 +98,27 @@ impl Dispatch {
 /// Continuo does not implement those mechanisms. Absence means `Dispatch::Each`.
 pub trait Dispatched: Scoped {
     fn dispatch(&self) -> Dispatch;
+
+    /// Policy captured for a runnable generation, usually from prepared config.
+    /// `Each` needs none. Lease-based adapters require an explicit policy for
+    /// `One`/`Pool`; omission is a validation error, not a fallback to `Each`.
+    /// This optional method does not impose lease semantics on other adapters,
+    /// such as a task manager that owns its own coordination policy.
+    fn dispatch_policy(&self) -> Option<DispatchPolicy> {
+        None
+    }
 }
 
 /// Identity and placement of one locally managed controller generation.
-/// Pool capacity and lease policy belong to the adapter's configuration;
-/// neither is inferred from the number of registered components.
+/// The service supplies its policy; the adapter must retain this snapshot for
+/// the generation, including drain. Config reload cannot mutate active leases.
 #[derive(Clone, Copy, Debug)]
 pub struct DispatchRequest {
     pub name: &'static str,
     pub generation: u64,
     pub scope: Scope,
     pub dispatch: Dispatch,
+    pub policy: Option<DispatchPolicy>,
 }
 
 /// Local execution capability handed to a fleet controller.

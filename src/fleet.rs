@@ -1,4 +1,4 @@
-//! Fleet placement vocabulary, independent of execution and timing.
+//! Fleet placement contracts, independent of execution engines and transports.
 
 use serde::{Deserialize, Serialize};
 
@@ -52,7 +52,8 @@ pub trait Scoped {
 
 pub mod dispatch;
 pub use dispatch::{
-    Dispatch, DispatchRequest, Dispatched, Dispatcher, ServiceExecution,
+    Dispatch, DispatchPolicy, DispatchRequest, Dispatched, Dispatcher,
+    ServiceExecution,
 };
 
 #[cfg(test)]

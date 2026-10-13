@@ -17,7 +17,7 @@ exclude = ["/Cargo.lock", "/justfile", "/rustfmt.toml", "/.idea/**"]
 [features]
 default = ["registry"]
 full = ["registry", "support", "events", "config", "config-watch", "fleet"]
-fleet = ["dep:serde"]
+fleet = ["dep:serde", "dep:humantime-serde"]
 events = ["dep:dashmap"]
 # Typed configuration through Congif: `Configurable`, `Component::as_configurable`,
 # reload acknowledgement; with `registry`, `Runtime::configure` / `prepare`.
@@ -35,6 +35,7 @@ all-features = true
 [dependencies]
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"], optional = true }
+humantime-serde = { version = "1", optional = true }
 congif = { version = "0.1", path = "../congif", optional = true }
 dashmap = { version = "6", optional = true }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }

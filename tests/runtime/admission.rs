@@ -265,9 +265,12 @@ async fn initial_fleet_admission_validates_once_and_restart_revalidates() {
     impl Dispatcher<State> for Adapter {
         fn validate(
             &self,
-            _: &DispatchRequest,
+            request: &DispatchRequest,
             _: &State,
         ) -> Result<()> {
+            // This adapter owns policy itself; the optional hook is not a
+            // new requirement on every existing Dispatched implementation.
+            assert!(request.policy.is_none());
             if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
                 Ok(())
             } else {

@@ -518,6 +518,13 @@ executions to a `Dispatcher<S>` installed with `Runtime::with_dispatcher`.
 Without a dispatcher those policies are rejected rather than executed as
 `Each`. Membership, leases and transport are the adapter's responsibility.
 
+`Dispatched::dispatch_policy()` optionally supplies the service's prepared
+`DispatchPolicy`: pool capacity, lease TTL and renewal interval. `Each` needs
+no policy; a lease-based adapter rejects `One`/`Pool` without one. The runtime
+passes the value in `DispatchRequest` and each generation keeps its own
+immutable snapshot. The type is transport-neutral data, not an Orbit dependency.
+Task managers may retain their own task-level policy and controller.
+
 ## Playground
 
 `examples/playground` is a complete application: an HTTP server with

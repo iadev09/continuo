@@ -485,6 +485,7 @@ where
                                 generation: 1,
                                 scope: placement.scope(),
                                 dispatch: placement.dispatch(),
+                                policy: placement.dispatch_policy(),
                             },
                             &state,
                         )?;
@@ -577,6 +578,7 @@ where
                     generation,
                     scope: placement.scope(),
                     dispatch: placement.dispatch(),
+                    policy: placement.dispatch_policy(),
                 };
                 let dispatcher = self.dispatcher.clone().ok_or_else(|| {
                     Error::msg(format!(
