@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{Id, JoinError, JoinSet};
@@ -77,6 +78,9 @@ struct ServiceEntry<S> {
     component: Arc<dyn AnyComponent<S>>,
     runnable: Arc<dyn AnyRunnable<S>>,
     status: ServiceStatus,
+    active_executions: Arc<AtomicU64>,
+    #[cfg(feature = "fleet")]
+    dispatch: crate::fleet::Dispatch,
     generation: u64,
     cancellation: Option<CancellationToken>,
     last_error: Option<String>,
@@ -95,6 +99,9 @@ impl<S: 'static> ServiceEntry<S> {
         ServiceSnapshot {
             name,
             status: self.status,
+            active_executions: self.active_executions.load(Ordering::SeqCst),
+            #[cfg(feature = "fleet")]
+            dispatch: self.dispatch,
             start_policy: self.runnable.start_policy(state),
             reloadable: self.component.as_reloadable().is_some(),
             generation: self.generation,
@@ -503,12 +510,21 @@ where
         for (entry, bound) in runnables {
             let name = entry.name;
             let automatic = bound.is_some();
+            #[cfg(feature = "fleet")]
+            let dispatch = entry
+                .component
+                .as_dispatched()
+                .map(|placement| placement.dispatch())
+                .unwrap_or_default();
             self.services.insert(
                 name,
                 ServiceEntry {
                     component: entry.component,
                     runnable: entry.runnable,
                     status: ServiceStatus::Stopped,
+                    active_executions: Arc::new(AtomicU64::new(0)),
+                    #[cfg(feature = "fleet")]
+                    dispatch,
                     generation: 0,
                     cancellation: None,
                     last_error: None,
@@ -603,6 +619,17 @@ where
         service.generation = generation;
         service.status = ServiceStatus::Running;
         service.last_error = None;
+        // A fresh census belongs only to this generation. Delayed cleanup of
+        // an aborted predecessor must not decrement its successor's count.
+        service.active_executions = Arc::new(AtomicU64::new(0));
+        let active_executions = service.active_executions.clone();
+        #[cfg(feature = "fleet")]
+        {
+            service.dispatch = dispatch
+                .as_ref()
+                .map(|(_, request)| request.dispatch)
+                .unwrap_or_default();
+        }
 
         let generation = service.generation;
         let cancellation = state.shutdown_token().child_token();
@@ -618,16 +645,20 @@ where
                         .run(
                             request,
                             crate::fleet::ServiceExecution::new(
-                                runnable, state,
+                                runnable, state, active_executions,
                             ),
                             context,
                         )
                         .await
                 } else {
+                    let _execution = crate::service::ExecutionGuard::enter(&active_executions);
                     runnable.run(state, context).await
                 };
                 #[cfg(not(feature = "fleet"))]
-                let result = runnable.run(state, context).await;
+                let result = {
+                    let _execution = crate::service::ExecutionGuard::enter(&active_executions);
+                    runnable.run(state, context).await
+                };
                 let result = result.map_err(|e| e.into_run(name));
                 ServiceExit { name, generation, result }
             }

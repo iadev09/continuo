@@ -525,6 +525,13 @@ passes the value in `DispatchRequest` and each generation keeps its own
 immutable snapshot. The type is transport-neutral data, not an Orbit dependency.
 Task managers may retain their own task-level policy and controller.
 
+`ServiceSnapshot::status()` describes the generation controller, not slot
+ownership. `active_executions()` counts actual runnable futures, including
+draining executions until they return. With `fleet`, `dispatch()` reports the
+generation's placement choice. A running `One`/`Pool` controller with zero
+executions is waiting. The census is generation-owned and is decremented on
+return, error, panic or future cancellation; it does not claim protocol readiness.
+
 ## Playground
 
 `examples/playground` is a complete application: an HTTP server with

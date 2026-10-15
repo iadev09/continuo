@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU16;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use crate::{AnyRunnable, Error, Result, RunContext, SharedState};
@@ -131,11 +132,16 @@ pub struct DispatchRequest {
 pub struct ServiceExecution<S> {
     runnable: Arc<dyn AnyRunnable<S>>,
     state: S,
+    active_executions: Arc<AtomicU64>,
 }
 
 impl<S: Clone> Clone for ServiceExecution<S> {
     fn clone(&self) -> Self {
-        Self { runnable: self.runnable.clone(), state: self.state.clone() }
+        Self {
+            runnable: self.runnable.clone(),
+            state: self.state.clone(),
+            active_executions: self.active_executions.clone(),
+        }
     }
 }
 
@@ -148,8 +154,9 @@ impl<S: SharedState> ServiceExecution<S> {
     pub(crate) fn new(
         runnable: Arc<dyn AnyRunnable<S>>,
         state: S,
+        active_executions: Arc<AtomicU64>,
     ) -> Self {
-        Self { runnable, state }
+        Self { runnable, state, active_executions }
     }
 
     /// Run an owned local execution until its runnable has fully returned.
@@ -157,6 +164,8 @@ impl<S: SharedState> ServiceExecution<S> {
         &self,
         context: RunContext,
     ) -> Result<()> {
+        let _execution =
+            crate::service::ExecutionGuard::enter(&self.active_executions);
         self.runnable.clone().run(self.state.clone(), context).await
     }
 }

@@ -1,5 +1,6 @@
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -109,6 +110,10 @@ impl fmt::Display for ServiceStatus {
 pub struct ServiceSnapshot {
     pub(crate) name: &'static str,
     pub(crate) status: ServiceStatus,
+    /// Actual runnable futures, excluding the coordinating controller.
+    pub(crate) active_executions: u64,
+    #[cfg(feature = "fleet")]
+    pub(crate) dispatch: crate::fleet::Dispatch,
     pub(crate) start_policy: ServiceStartPolicy,
     pub(crate) reloadable: bool,
     pub(crate) generation: u64,
@@ -124,6 +129,17 @@ impl ServiceSnapshot {
 
     pub fn status(&self) -> ServiceStatus {
         self.status
+    }
+
+    /// Includes executions draining after cancellation, until their future ends.
+    /// This is execution evidence, not protocol-specific readiness.
+    pub fn active_executions(&self) -> u64 {
+        self.active_executions
+    }
+
+    #[cfg(feature = "fleet")]
+    pub fn dispatch(&self) -> crate::fleet::Dispatch {
+        self.dispatch
     }
 
     pub fn start_policy(&self) -> ServiceStartPolicy {
@@ -152,6 +168,23 @@ impl ServiceSnapshot {
 
     pub fn last_reload_error(&self) -> Option<&str> {
         self.last_reload_error.as_deref()
+    }
+}
+
+/// Generation-owned execution census. Drop accounts for errors, panic and abort
+/// without making a coordinating future look like an actual runnable execution.
+pub(crate) struct ExecutionGuard(Arc<AtomicU64>);
+
+impl ExecutionGuard {
+    pub(crate) fn enter(count: &Arc<AtomicU64>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count.clone())
+    }
+}
+
+impl Drop for ExecutionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

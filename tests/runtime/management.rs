@@ -286,8 +286,10 @@ async fn manager_owns_stop_start_and_restart_generations() {
     });
 
     wait_for(&counter, 1, 0).await;
+    assert_eq!(manager.list().await.unwrap()[0].active_executions(), 1);
     let stopped = manager.stop("counter").await.expect("stop counter");
     assert_eq!(stopped.status(), ServiceStatus::Stopped);
+    assert_eq!(stopped.active_executions(), 0);
     assert!(!counter.active.load(Ordering::SeqCst));
 
     let started = manager.start("counter").await.expect("start counter");
@@ -300,6 +302,7 @@ async fn manager_owns_stop_start_and_restart_generations() {
 
     let reloaded = manager.reload("counter").await.expect("reload counter");
     assert_eq!(reloaded.status(), ServiceStatus::Running);
+    assert_eq!(reloaded.active_executions(), 1);
     assert_eq!(reloaded.generation(), 3);
     assert_eq!(reloaded.reload_revision(), 1);
     assert_eq!(reloaded.last_reload_error(), None);
@@ -325,6 +328,7 @@ async fn manager_owns_stop_start_and_restart_generations() {
     result.expect("runtime shutdown");
     runtime.drain().await.expect("runtime drain");
     wait_for(&counter, 3, 3).await;
+    assert_eq!(runtime.snapshots()[0].active_executions(), 0);
 }
 
 #[tokio::test]
