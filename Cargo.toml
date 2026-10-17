@@ -36,7 +36,7 @@ all-features = true
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"], optional = true }
 humantime-serde = { version = "1", optional = true }
-congif = { version = "0.1", path = "../congif", optional = true }
+congif = { version = "0.0.1", optional = true }
 dashmap = { version = "6", optional = true }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-util = "0.7"
@@ -46,8 +46,8 @@ tracing = "0.1"
 continuo = { path = ".", features = ["full"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 axum = "0.8"
-dotenw = { version = "0.1", path = "../dotenw" }
-congif = { version = "0.1", path = "../congif", features = ["json", "toml", "watch"] }
+dotenw = "0.0.1"
+congif = { version = "0.0.1", features = ["json", "toml", "watch"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
