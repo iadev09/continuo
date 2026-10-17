@@ -593,7 +593,7 @@ examples/playground/
 ## Features
 
 ~~~toml
-continuo = { version = "0.8", features = ["config-watch"] }
+continuo = { version = "0.9", features = ["config-watch"] }
 ~~~
 
 | Feature | Enables |
