@@ -740,7 +740,7 @@ fn order_component_entries<S: 'static>(
     let mut indegree = vec![0usize; nodes];
 
     let mut add_edge = |from: usize, to: usize| {
-        if from != to && outgoing[from].insert(to) {
+        if outgoing[from].insert(to) {
             indegree[to] += 1;
         }
     };
