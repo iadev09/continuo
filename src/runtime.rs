@@ -1165,11 +1165,17 @@ where
     /// Each runnable owns its protocol-level graceful drain inside its future;
     /// this layer imposes no implicit deadline.
     pub async fn drain(&mut self) -> Result<()> {
+        let mut first_error = None;
         while let Some(joined) = self.join_set.join_next_with_id().await {
-            self.complete_join(joined)?;
+            if let Err(error) = self.complete_join(joined) {
+                error!(%error, "runnable failed during graceful drain");
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
         debug!("runtime drained remaining runnable tasks");
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 }
 
