@@ -162,13 +162,11 @@ impl Gate {
         let start = tokio::time::Instant::now();
 
         loop {
-            // Claiming the slot is `try_enter`'s job rather than a second
-            // implementation here. This loop used to read the count and *then*
-            // take a permit, which is two operations: every task that read
-            // `max - 1` took one, so the gate admitted more than the limit it
-            // exists to enforce — under exactly the load that makes it matter.
-            // `try_enter` increments first and gives the slot back if it was
-            // not there, which is the only shape that is safe without a lock.
+            // Register before checking capacity: notify_waiters does not retain
+            // releases for futures created after the release.
+            let released = self.inner.released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
             match self.try_enter() {
                 Ok(permit) => return Ok(permit),
                 Err(Error::AtCapacity) => {
@@ -199,7 +197,7 @@ impl Gate {
                 _ = self.inner.graceful.notified() => {
                     return Err(Error::ShuttingDown);
                 }
-                _ = self.inner.released.notified() => {
+                _ = &mut released => {
                     // A connection was released, loop again to try acquiring.
                     continue;
                 }
