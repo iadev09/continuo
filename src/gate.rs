@@ -6,8 +6,8 @@
 //! module is not tied to HTTP; it lifts that operational shape into a small
 //! runtime primitive that any service loop can use.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{Notify, watch};
@@ -28,13 +28,21 @@ struct Inner {
     graceful: NotifyOnce,
     shutdown: NotifyOnce,
     released: Notify,
-    count: AtomicUsize,
+    admission: Mutex<Admission>,
     all_done: NotifyOnce,
     /// Grace period for shutdown: NANOS_NONE = None (infinite), otherwise nanoseconds
     grace_period_nanos: AtomicU64,
     /// Timeout for acquiring connection slot when at max_connections (during normal operation)
     acquire_timeout: Duration,
     max_count: Option<usize>,
+}
+
+// Closing admission and counting accepted permits share one linearization point.
+// Refused entrants never change the count observed by drain.
+#[derive(Debug, Default)]
+struct Admission {
+    closed: bool,
+    count: usize,
 }
 
 /// Why a [`Gate`] refused a permit.
@@ -89,7 +97,7 @@ impl Gate {
             graceful: NotifyOnce::default(),
             shutdown: NotifyOnce::default(),
             released: Notify::new(),
-            count: AtomicUsize::new(0),
+            admission: Mutex::new(Admission::default()),
             all_done: NotifyOnce::default(),
             grace_period_nanos: AtomicU64::new(NANOS_NONE),
             acquire_timeout,
@@ -109,7 +117,7 @@ impl Gate {
 
     /// Get the number of connections.
     pub fn count(&self) -> usize {
-        self.inner.count.load(Ordering::Acquire)
+        self.inner.admission.lock().expect("gate admission lock poisoned").count
     }
 
     /// Admission capacity; None means unlimited.
@@ -128,7 +136,6 @@ impl Gate {
     /// This does **not** imply a forced/Hard shutdown signal.
     ///
     /// `None` means indefinite grace period (critical tasks mode).
-    /// Lock-free write using atomic operation.
     pub fn graceful_shutdown(
         &self,
         duration: Option<Duration>,
@@ -136,7 +143,15 @@ impl Gate {
         let nanos = duration.map_or(NANOS_NONE, |d| d.as_nanos() as u64);
         self.inner.grace_period_nanos.store(nanos, Ordering::Release);
 
+        let mut admission =
+            self.inner.admission.lock().expect("gate admission lock poisoned");
+        admission.closed = true;
+        let empty = admission.count == 0;
+        drop(admission);
         self.inner.graceful.notify_waiters();
+        if empty {
+            self.inner.all_done.notify_waiters();
+        }
     }
 
     pub fn is_shutting_down(&self) -> bool {
@@ -215,30 +230,19 @@ impl Gate {
     ///
     /// [`enter`]: Self::enter
     pub fn try_enter(&self) -> Result<Permit, Error> {
-        if self.inner.graceful.is_notified() {
+        let mut admission =
+            self.inner.admission.lock().expect("gate admission lock poisoned");
+        if admission.closed {
             return Err(Error::ShuttingDown);
         }
-
-        // Take the slot first and give it back if it was not there. Reading
-        // the count and then incrementing is two operations with a window
-        // between them, and every task in that window sees room that is
-        // already spoken for.
-        //
-        // The count can therefore sit above `max` for as long as a rejected
-        // task takes to back out. That is a property of `count()` as an
-        // observation, not of admission: `prev >= max` is what decides, and
-        // only one task per slot can read a `prev` below it.
-        if let Some(max) = self.inner.max_count {
-            let prev = self.inner.count.fetch_add(1, Ordering::AcqRel);
-            if prev >= max {
-                self.inner.count.fetch_sub(1, Ordering::AcqRel);
-                return Err(Error::AtCapacity);
-            }
-        } else {
-            self.inner.count.fetch_add(1, Ordering::AcqRel);
+        if self.inner.max_count.is_some_and(|max| admission.count >= max)
+            || admission.count == usize::MAX
+        {
+            return Err(Error::AtCapacity);
         }
+        admission.count += 1;
+        drop(admission);
 
-        // The slot was already counted above; construct the permit directly.
         Ok(Permit { gate: self.clone() })
     }
 
@@ -260,11 +264,11 @@ impl Gate {
     ///
     /// [`graceful_shutdown`]: Self::graceful_shutdown
     pub async fn wait_all_done(&self) -> GateDrainOutcome {
-        if self.inner.count.load(Ordering::Acquire) == 0 {
+        if self.count() == 0 {
             return GateDrainOutcome::Drained;
         }
 
-        // Lock-free read of grace period
+        // Read the declared grace period
         let deadline = self.grace_period();
 
         match deadline {
@@ -308,13 +312,20 @@ impl Permit {
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        let count = self.gate.inner.count.fetch_sub(1, Ordering::AcqRel) - 1;
-
-        if count == 0 && self.gate.inner.graceful.is_notified() {
+        let mut admission = self
+            .gate
+            .inner
+            .admission
+            .lock()
+            .expect("gate admission lock poisoned");
+        admission.count -= 1;
+        let count = admission.count;
+        let closed = admission.closed;
+        drop(admission);
+        if count == 0 && closed {
             self.gate.inner.all_done.notify_waiters();
         }
 
-        // permit isn't dropped yet.
         if let Some(max_count) = self.gate.inner.max_count
             && count < max_count
         {

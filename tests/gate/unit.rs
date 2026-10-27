@@ -47,9 +47,7 @@ async fn elapsed_grace_period_reports_forced_drain() {
 /// window between the two got one. Against the load-then-increment version
 /// this reaches 5 live permits against a max of 4 within a few rounds.
 ///
-/// It counts live permits rather than `count()`, because `count()` is
-/// briefly above the limit by design — a rejected task increments before it
-/// learns there was no room.
+/// Count only accepted permits; rejected entrants never affect drain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn enter_never_admits_more_than_max() {
     use std::sync::Arc;
@@ -88,4 +86,41 @@ async fn enter_never_admits_more_than_max() {
             "gate held {observed} permits at once against max 4"
         );
     }
+}
+
+#[tokio::test]
+async fn shutdown_drains_accepted_work_and_rejects_waiting_threads() {
+    use std::future::Future;
+    use std::sync::{Arc, Barrier};
+    use std::task::{Context, Waker};
+
+    let gate = Gate::new(Some(1), Duration::ZERO);
+    let permit = gate.try_enter().unwrap();
+    // Refusal cannot contribute a temporary permit to the drain count.
+    assert!(matches!(gate.try_enter(), Err(Error::AtCapacity)));
+    assert_eq!(gate.count(), 1);
+    let ready = Arc::new(Barrier::new(2));
+    let proceed = Arc::new(Barrier::new(2));
+    let entrant = {
+        let gate = gate.clone();
+        let ready = ready.clone();
+        let proceed = proceed.clone();
+        std::thread::spawn(move || {
+            ready.wait();
+            proceed.wait();
+            assert!(matches!(gate.try_enter(), Err(Error::ShuttingDown)));
+        })
+    };
+    ready.wait();
+    gate.graceful_shutdown(None);
+    let mut drain = Box::pin(gate.wait_all_done());
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(drain.as_mut().poll(&mut cx).is_pending());
+    drop(permit);
+    assert_eq!(drain.await, GateDrainOutcome::Drained);
+    // Even an entrant already scheduled before closure cannot create work
+    // after the completed drain boundary.
+    proceed.wait();
+    entrant.join().unwrap();
+    assert_eq!(gate.count(), 0);
 }
