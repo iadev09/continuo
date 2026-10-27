@@ -6,7 +6,6 @@
 //! module is not tied to HTTP; it lifts that operational shape into a small
 //! runtime primitive that any service loop can use.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,9 +13,6 @@ use tokio::sync::{Notify, watch};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
-
-/// Sentinel value for AtomicU64 representing None (infinite grace period)
-const NANOS_NONE: u64 = u64::MAX;
 
 #[derive(Clone, Debug)]
 pub struct Gate {
@@ -30,8 +26,6 @@ struct Inner {
     released: Notify,
     admission: Mutex<Admission>,
     all_done: NotifyOnce,
-    /// Grace period for shutdown: NANOS_NONE = None (infinite), otherwise nanoseconds
-    grace_period_nanos: AtomicU64,
     /// Timeout for acquiring connection slot when at max_connections (during normal operation)
     acquire_timeout: Duration,
     max_count: Option<usize>,
@@ -43,6 +37,7 @@ struct Inner {
 struct Admission {
     closed: bool,
     count: usize,
+    grace_period: Option<Duration>,
 }
 
 /// Why a [`Gate`] refused a permit.
@@ -99,20 +94,19 @@ impl Gate {
             released: Notify::new(),
             admission: Mutex::new(Admission::default()),
             all_done: NotifyOnce::default(),
-            grace_period_nanos: AtomicU64::new(NANOS_NONE),
             acquire_timeout,
             max_count,
         };
         Self { inner: Arc::new(inner) }
     }
 
-    /// Returns the current grace period duration (if any).
-    /// Lock-free read using atomic operation.
+    /// Returns the complete caller-declared grace period (`None` is indefinite).
     pub fn grace_period(&self) -> Option<Duration> {
-        match self.inner.grace_period_nanos.load(Ordering::Acquire) {
-            NANOS_NONE => None,
-            nanos => Some(Duration::from_nanos(nanos)),
-        }
+        self.inner
+            .admission
+            .lock()
+            .expect("gate admission lock poisoned")
+            .grace_period
     }
 
     /// Get the number of connections.
@@ -140,11 +134,9 @@ impl Gate {
         &self,
         duration: Option<Duration>,
     ) {
-        let nanos = duration.map_or(NANOS_NONE, |d| d.as_nanos() as u64);
-        self.inner.grace_period_nanos.store(nanos, Ordering::Release);
-
         let mut admission =
             self.inner.admission.lock().expect("gate admission lock poisoned");
+        admission.grace_period = duration;
         admission.closed = true;
         let empty = admission.count == 0;
         drop(admission);

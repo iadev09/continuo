@@ -124,3 +124,22 @@ async fn shutdown_drains_accepted_work_and_rejects_waiting_threads() {
     entrant.join().unwrap();
     assert_eq!(gate.count(), 0);
 }
+
+#[test]
+fn grace_period_preserves_full_duration_range() {
+    let gate = Gate::new(None, Duration::ZERO);
+    assert_eq!(gate.grace_period(), None);
+    for duration in [
+        Duration::ZERO,
+        super::default_acquire_timeout(),
+        Duration::from_nanos(u64::MAX - 1),
+        Duration::from_nanos(u64::MAX),
+        Duration::from_nanos(u64::MAX) + Duration::from_nanos(1),
+        Duration::MAX,
+    ] {
+        gate.graceful_shutdown(Some(duration));
+        assert_eq!(gate.grace_period(), Some(duration));
+    }
+    gate.graceful_shutdown(None);
+    assert_eq!(gate.grace_period(), None);
+}
