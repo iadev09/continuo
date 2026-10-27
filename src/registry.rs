@@ -556,11 +556,10 @@ impl<S: 'static> Registry<S> {
         Ok(outcome)
     }
 
-    pub async fn reload_one(
+    fn reload_target(
         &self,
         name: &str,
-        state: &S,
-    ) -> Result<()> {
+    ) -> Result<Arc<dyn AnyComponent<S>>> {
         let Some(component) = self
             .components()
             .into_iter()
@@ -571,6 +570,19 @@ impl<S: 'static> Registry<S> {
                 name
             )));
         };
+
+        Ok(component)
+    }
+
+    /// Invoke only the component reload hook, without preparing or acknowledging
+    /// configuration. Callers own those steps. Use [`Self::reload_one`] with a
+    /// [`ReloadState`] for a configuration-aware reload transaction.
+    pub async fn reload_hook_one(
+        &self,
+        name: &str,
+        state: &S,
+    ) -> Result<()> {
+        let component = self.reload_target(name)?;
 
         let Some(reloadable) = component.as_reloadable() else {
             return Err(Error::msg(format!(
@@ -591,6 +603,60 @@ impl<S> Registry<S>
 where
     S: ReloadState + 'static,
 {
+    /// Prepare the addressed owner's configuration, invoke its reload hook,
+    /// and acknowledge only successful application. Failed candidates remain
+    /// available for retry. The application-wide `ReloadState::reload` hook is
+    /// reserved for broadcasts; this operation affects only the named component.
+    /// States without a config reader retain lifecycle-only behavior.
+    pub async fn reload_one(
+        &self,
+        name: &str,
+        state: &S,
+    ) -> Result<()> {
+        let component = self.reload_target(name)?;
+
+        let Some(reloadable) = component.as_reloadable() else {
+            return Err(Error::msg(format!(
+                "reload_by_name: component '{}' is not reloadable",
+                name
+            )));
+        };
+
+        #[cfg(feature = "config")]
+        let reader = state.reload_config_reader();
+        #[cfg(feature = "config")]
+        let prepared = if let (Some(reader), Some(owner)) =
+            (reader, component.as_configurable())
+        {
+            reader.prepare_owners(&[owner]).await?;
+            reader.prepared_config(owner)
+        } else {
+            None
+        };
+        #[cfg(feature = "config")]
+        if let (Some(reader), Some(environmental)) =
+            (reader, component.as_environmental())
+        {
+            let owner = (*component).type_id();
+            reader.prepare_programs(
+                owner,
+                environmental.program_environments(),
+            )?;
+            reader.refresh_programs(owner)?;
+        }
+
+        let component_name = component.name();
+        reloadable
+            .reload(state)
+            .await
+            .map_err(|error| error.into_reload(component_name))?;
+        #[cfg(feature = "config")]
+        if let (Some(reader), Some(prepared)) = (reader, prepared) {
+            reader.confirm_applied(prepared).await?;
+        }
+        Ok(())
+    }
+
     /// Reload every reloadable component, in lifecycle order.
     ///
     /// # Not atomic, and not cancel-safe

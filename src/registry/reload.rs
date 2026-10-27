@@ -4,8 +4,8 @@ use super::{Error, Result};
 
 #[async_trait]
 pub trait ReloadState: Send + Sync + Sized + 'static {
-    /// Optional configuration catalog for explicit broadcast reloads.
-    /// The registry prepares all owners before calling application/component
+    /// Optional configuration catalog for explicit targeted and broadcast reloads.
+    /// The registry prepares the addressed owners before calling application/component
     /// hooks, and acknowledges each candidate only after successful application.
     /// States without configuration retain the ordinary lifecycle-only path.
     #[cfg(feature = "config")]

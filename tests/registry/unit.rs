@@ -759,3 +759,18 @@ async fn finalize_all_retains_component_failures_and_continues() {
         "finalize of 'fails-finalize' failed: finalize rejected"
     );
 }
+
+#[tokio::test]
+async fn targeted_reload_without_configuration_keeps_lifecycle_behavior() {
+    let state = TestState::default();
+    let registry = Registry::<TestState>::new();
+    registry.register(Arc::new(Reloads)).unwrap();
+    registry.register(Arc::new(FailsReload)).unwrap();
+    registry.reload_one("reloads", &state).await.unwrap();
+    registry.reload_hook_one("reloads", &state).await.unwrap();
+    assert!(registry.reload_one("missing", &state).await.is_err());
+    assert!(matches!(
+        registry.reload_one("fails-reload", &state).await,
+        Err(Error::Reload { name: "fails-reload", .. })
+    ));
+}

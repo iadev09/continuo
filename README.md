@@ -444,6 +444,11 @@ Two hooks apply configuration changes. They are distinct:
 - `Reloadable::reload` is a lifecycle command issued by the manager,
   `reload_one` or `reload_all`. The component applies the prepared snapshot;
   Continuo acknowledges the candidate to Congif after the hook succeeds.
+  Registry commands obtain the catalog from `ReloadState::reload_config_reader`.
+  `reload_one` requires `ReloadState` and prepares only the addressed owner;
+  it does not invoke the application-wide `ReloadState::reload` hook.
+  Callers that manage preparation and acknowledgement themselves can use
+  `reload_hook_one`, which requires no `ReloadState` and invokes only the hook.
 - `ConfigObserver::config_changed` is a typed notification carrying the new
   `Config`. With `config-watch` it is invoked for a changed source.
 

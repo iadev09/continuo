@@ -50,7 +50,7 @@ impl ReloadService {
                         component.as_configurable().and_then(|owner| {
                             state.reader().prepared_config(owner)
                         });
-                    registry.reload_one(name, state).await?;
+                    registry.reload_hook_one(name, state).await?;
                     if let Some(candidate) = candidate {
                         state.reader().confirm_applied(candidate).await?;
                     }

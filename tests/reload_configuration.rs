@@ -147,3 +147,60 @@ async fn broadcast_prepares_before_hooks_and_acknowledges_only_success() {
             .is_empty()
     );
 }
+
+// Exercise the reload transaction directly: no boot, runnable or native watcher.
+#[tokio::test]
+async fn targeted_prepares_before_hooks_and_acknowledges_only_success() {
+    let state = State::default();
+    let registry = Registry::new();
+    let settings = Arc::new(Settings::default());
+    state
+        .reader
+        .register(atomic_parser::AtomicParser(settings.candidate.clone()))
+        .unwrap();
+    registry.register(settings.clone()).unwrap();
+    settings.candidate.store(1, Ordering::Relaxed);
+    registry.reload_one("settings", &state).await.unwrap();
+    assert_eq!(settings.applied.load(Ordering::Relaxed), 1);
+    assert!(
+        state
+            .reader
+            .prepare_changed_owners(&[settings.as_ref()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    settings.candidate.store(2, Ordering::Relaxed);
+    settings.reject_preparation.store(true, Ordering::Relaxed);
+    assert!(registry.reload_one("settings", &state).await.is_err());
+    assert_eq!(state.reloads.load(Ordering::Relaxed), 0);
+    assert_eq!(*state.reader.snapshot::<Settings>().unwrap(), 1);
+    assert_eq!(settings.applied.load(Ordering::Relaxed), 1);
+
+    settings.reject_preparation.store(false, Ordering::Relaxed);
+    settings.reject_application.store(true, Ordering::Relaxed);
+    assert!(registry.reload_one("settings", &state).await.is_err());
+    assert_eq!(settings.applied.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        state
+            .reader
+            .prepare_changed_owners(&[settings.as_ref()])
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    settings.reject_application.store(false, Ordering::Relaxed);
+    registry.reload_one("settings", &state).await.unwrap();
+    assert_eq!(settings.applied.load(Ordering::Relaxed), 2);
+    assert!(
+        state
+            .reader
+            .prepare_changed_owners(&[settings.as_ref()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
