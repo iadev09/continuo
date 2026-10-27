@@ -143,3 +143,41 @@ fn grace_period_preserves_full_duration_range() {
     gate.graceful_shutdown(None);
     assert_eq!(gate.grace_period(), None);
 }
+
+#[tokio::test]
+async fn closure_invalidates_an_admission_snapshot() {
+    use std::sync::atomic::Ordering;
+
+    let gate = Gate::new(None, Duration::ZERO);
+    // An entrant has read capacity but has not committed its CAS yet.
+    let observed = gate.inner.admission.load(Ordering::Acquire);
+    gate.graceful_shutdown(None);
+    assert_eq!(gate.wait_all_done().await, GateDrainOutcome::Drained);
+    assert!(
+        gate.inner
+            .admission
+            .compare_exchange(
+                observed,
+                observed + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+    );
+    assert!(matches!(gate.try_enter(), Err(Error::ShuttingDown)));
+    assert_eq!(gate.count(), 0);
+}
+
+#[test]
+fn full_counter_cannot_overflow_into_the_closure_bit() {
+    use std::sync::atomic::Ordering;
+
+    let gate = Gate::new(None, Duration::ZERO);
+    gate.inner.admission.store(super::COUNT_MASK, Ordering::Release);
+    assert!(matches!(gate.try_enter(), Err(Error::AtCapacity)));
+    assert_eq!(gate.count(), super::COUNT_MASK);
+    assert!(!gate.is_shutting_down());
+    gate.graceful_shutdown(None);
+    assert_eq!(gate.count(), super::COUNT_MASK);
+    assert!(gate.is_shutting_down());
+}

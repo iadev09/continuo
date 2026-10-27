@@ -6,6 +6,7 @@
 //! module is not tied to HTTP; it lifts that operational shape into a small
 //! runtime primitive that any service loop can use.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,21 +25,21 @@ struct Inner {
     graceful: NotifyOnce,
     shutdown: NotifyOnce,
     released: Notify,
-    admission: Mutex<Admission>,
+    // The high bit closes admission; remaining bits count accepted permits.
+    // One CAS makes acceptance atomic with respect to closure.
+    admission: AtomicUsize,
+    grace_period: Mutex<Option<Duration>>,
     all_done: NotifyOnce,
     /// Timeout for acquiring connection slot when at max_connections (during normal operation)
     acquire_timeout: Duration,
     max_count: Option<usize>,
 }
 
-// Closing admission and counting accepted permits share one linearization point.
-// Refused entrants never change the count observed by drain.
-#[derive(Debug, Default)]
-struct Admission {
-    closed: bool,
-    count: usize,
-    grace_period: Option<Duration>,
-}
+// One bit represents closure in the same atomic word as the permit count.
+// It is state encoding, not an operator-selectable capacity or policy.
+const CLOSED: usize = 1 << (usize::BITS - 1);
+// Masking the closure bit recovers the accepted-permit count without a lock.
+const COUNT_MASK: usize = CLOSED - 1;
 
 /// Why a [`Gate`] refused a permit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,7 +83,8 @@ pub enum GateDrainOutcome {
 impl Gate {
     /// Create a new gate with optional max connections and acquire timeout.
     ///
-    /// - `max_count`: Maximum concurrent connections (None = unlimited)
+    /// - `max_count`: Maximum concurrent connections (None = no configured limit).
+    ///   The counter supports up to `isize::MAX` concurrent permits.
     /// - `acquire_timeout`: How long to wait for a slot when at capacity
     pub fn new(
         max_count: Option<usize>,
@@ -92,7 +94,8 @@ impl Gate {
             graceful: NotifyOnce::default(),
             shutdown: NotifyOnce::default(),
             released: Notify::new(),
-            admission: Mutex::new(Admission::default()),
+            admission: AtomicUsize::new(0),
+            grace_period: Mutex::new(None),
             all_done: NotifyOnce::default(),
             acquire_timeout,
             max_count,
@@ -102,16 +105,16 @@ impl Gate {
 
     /// Returns the complete caller-declared grace period (`None` is indefinite).
     pub fn grace_period(&self) -> Option<Duration> {
-        self.inner
-            .admission
-            .lock()
-            .expect("gate admission lock poisoned")
+        *self
+            .inner
             .grace_period
+            .lock()
+            .expect("gate grace period lock poisoned")
     }
 
     /// Get the number of connections.
     pub fn count(&self) -> usize {
-        self.inner.admission.lock().expect("gate admission lock poisoned").count
+        self.inner.admission.load(Ordering::Acquire) & COUNT_MASK
     }
 
     /// Admission capacity; None means unlimited.
@@ -134,20 +137,20 @@ impl Gate {
         &self,
         duration: Option<Duration>,
     ) {
-        let mut admission =
-            self.inner.admission.lock().expect("gate admission lock poisoned");
-        admission.grace_period = duration;
-        admission.closed = true;
-        let empty = admission.count == 0;
-        drop(admission);
+        *self
+            .inner
+            .grace_period
+            .lock()
+            .expect("gate grace period lock poisoned") = duration;
+        let previous = self.inner.admission.fetch_or(CLOSED, Ordering::AcqRel);
         self.inner.graceful.notify_waiters();
-        if empty {
+        if previous & COUNT_MASK == 0 {
             self.inner.all_done.notify_waiters();
         }
     }
 
     pub fn is_shutting_down(&self) -> bool {
-        self.inner.graceful.is_notified()
+        self.inner.admission.load(Ordering::Acquire) & CLOSED != 0
     }
 
     /// Wait for the **forced** (hard) shutdown signal. This does *not* fire for a clean drain.
@@ -169,11 +172,10 @@ impl Gate {
         let start = tokio::time::Instant::now();
 
         loop {
-            // Register before checking capacity: notify_waiters does not retain
-            // releases for futures created after the release.
+            // notify_waiters covers futures created before the release even
+            // before their first poll; enable() is unnecessary for this mode.
             let released = self.inner.released.notified();
             tokio::pin!(released);
-            released.as_mut().enable();
             match self.try_enter() {
                 Ok(permit) => return Ok(permit),
                 Err(Error::AtCapacity) => {
@@ -222,20 +224,27 @@ impl Gate {
     ///
     /// [`enter`]: Self::enter
     pub fn try_enter(&self) -> Result<Permit, Error> {
-        let mut admission =
-            self.inner.admission.lock().expect("gate admission lock poisoned");
-        if admission.closed {
-            return Err(Error::ShuttingDown);
+        let mut state = self.inner.admission.load(Ordering::Acquire);
+        loop {
+            if state & CLOSED != 0 {
+                return Err(Error::ShuttingDown);
+            }
+            let count = state & COUNT_MASK;
+            if self.inner.max_count.is_some_and(|max| count >= max)
+                || count == COUNT_MASK
+            {
+                return Err(Error::AtCapacity);
+            }
+            match self.inner.admission.compare_exchange_weak(
+                state,
+                state + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(Permit { gate: self.clone() }),
+                Err(current) => state = current,
+            }
         }
-        if self.inner.max_count.is_some_and(|max| admission.count >= max)
-            || admission.count == usize::MAX
-        {
-            return Err(Error::AtCapacity);
-        }
-        admission.count += 1;
-        drop(admission);
-
-        Ok(Permit { gate: self.clone() })
     }
 
     /// Wait until all permits are dropped, respecting the configured grace period.
@@ -304,17 +313,9 @@ impl Permit {
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        let mut admission = self
-            .gate
-            .inner
-            .admission
-            .lock()
-            .expect("gate admission lock poisoned");
-        admission.count -= 1;
-        let count = admission.count;
-        let closed = admission.closed;
-        drop(admission);
-        if count == 0 && closed {
+        let previous = self.gate.inner.admission.fetch_sub(1, Ordering::AcqRel);
+        let count = (previous & COUNT_MASK) - 1;
+        if count == 0 && previous & CLOSED != 0 {
             self.gate.inner.all_done.notify_waiters();
         }
 
@@ -370,10 +371,6 @@ impl Default for NotifyOnce {
 impl NotifyOnce {
     fn notify_waiters(&self) {
         self.tx.send_replace(true);
-    }
-
-    fn is_notified(&self) -> bool {
-        *self.rx.borrow()
     }
 
     async fn notified(&self) {
