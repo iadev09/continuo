@@ -603,11 +603,31 @@ impl<S> Registry<S>
 where
     S: ReloadState + 'static,
 {
+    async fn reconcile_reloaded(
+        &self,
+        component: &Arc<dyn AnyComponent<S>>,
+    ) -> Result<()> {
+        // Registries can be used without a runtime. Scope-excluded providers
+        // are configured but have no runnable entry in this process.
+        if component.clone().runnable().is_none() {
+            return Ok(());
+        }
+        if let Some(manager) = self.resolve::<crate::ServiceManager>() {
+            match manager.reconcile(component.name()).await {
+                Ok(_) | Err(crate::ServiceManagerError::NotFound(_)) => {}
+                Err(error) => return Err(Error::msg(error.to_string())),
+            }
+        }
+        Ok(())
+    }
+
     /// Prepare the addressed owner's configuration, invoke its reload hook,
     /// and acknowledge only successful application. Failed candidates remain
     /// available for retry. The application-wide `ReloadState::reload` hook is
     /// reserved for broadcasts; this operation affects only the named component.
     /// States without a config reader retain lifecycle-only behavior.
+    /// When a ServiceManager is registered, its command loop must be running:
+    /// successful application also reconciles runnable availability through it.
     pub async fn reload_one(
         &self,
         name: &str,
@@ -654,10 +674,13 @@ where
         if let (Some(reader), Some(prepared)) = (reader, prepared) {
             reader.confirm_applied(prepared).await?;
         }
+        self.reconcile_reloaded(&component).await?;
         Ok(())
     }
 
     /// Reload every reloadable component, in lifecycle order.
+    /// Successful runnable reloads reconcile availability through the registered
+    /// ServiceManager, if present; its command loop must be running.
     ///
     /// # Not atomic, and not cancel-safe
     ///
@@ -726,6 +749,7 @@ where
                     if let (Some(reader), Some(prepared)) = (reader, prepared) {
                         reader.confirm_applied(prepared).await?;
                     }
+                    self.reconcile_reloaded(&component).await?;
                     Ok::<(), Error>(())
                 }
                 .await;

@@ -83,6 +83,8 @@ struct ServiceEntry<S> {
     dispatch: crate::fleet::Dispatch,
     generation: u64,
     cancellation: Option<CancellationToken>,
+    applied_start_policy: ServiceStartPolicy,
+    start_after_drain: bool,
     last_error: Option<String>,
     reload_revision: u64,
     last_reload_error: Option<String>,
@@ -472,9 +474,8 @@ where
         let runnables = runnables
             .into_iter()
             .map(|entry| {
-                let bound = if entry.runnable.start_policy(&state)
-                    == ServiceStartPolicy::Automatic
-                {
+                let policy = entry.runnable.start_policy(&state);
+                let bound = if policy == ServiceStartPolicy::Automatic {
                     #[cfg(feature = "fleet")]
                     if let Some(placement) = entry.component.as_dispatched()
                         && placement.dispatch().is_controller_driven()
@@ -501,13 +502,13 @@ where
                 } else {
                     None
                 };
-                Ok((entry, bound))
+                Ok((entry, bound, policy))
             })
             .collect::<Result<Vec<_>>>()?;
 
         self.registry = Some(registry.shared());
         self.state = Some(state);
-        for (entry, bound) in runnables {
+        for (entry, bound, policy) in runnables {
             let name = entry.name;
             let automatic = bound.is_some();
             #[cfg(feature = "fleet")]
@@ -527,6 +528,8 @@ where
                     dispatch,
                     generation: 0,
                     cancellation: None,
+                    applied_start_policy: policy,
+                    start_after_drain: false,
                     last_error: None,
                     reload_revision: 0,
                     last_reload_error: None,
@@ -543,6 +546,43 @@ where
         }
 
         Ok(self.services.len())
+    }
+
+    fn reconcile_start_policy(
+        &mut self,
+        name: &'static str,
+    ) -> Result<ServiceSnapshot> {
+        let state = self.state.as_ref().expect("runtime state is initialized");
+        let service =
+            self.services.get_mut(name).expect("service is registered");
+        let policy = service.runnable.start_policy(state);
+        let enabling = service.applied_start_policy
+            == ServiceStartPolicy::Unavailable
+            && policy == ServiceStartPolicy::Automatic;
+        if policy == ServiceStartPolicy::Unavailable {
+            service.start_after_drain = false;
+            if service.status == ServiceStatus::Running {
+                service.status = ServiceStatus::Stopping;
+                if let Some(cancellation) = &service.cancellation {
+                    cancellation.cancel();
+                }
+            }
+        } else if enabling {
+            match service.status {
+                ServiceStatus::Stopped | ServiceStatus::Failed => {
+                    let snapshot = self.start_generation(name, false)?;
+                    self.services.get_mut(name).unwrap().applied_start_policy =
+                        policy;
+                    return Ok(snapshot);
+                }
+                ServiceStatus::Stopping => service.start_after_drain = true,
+                ServiceStatus::Running => {}
+            }
+        } else if policy == ServiceStartPolicy::Manual {
+            service.start_after_drain = false;
+        }
+        service.applied_start_policy = policy;
+        Ok(service.snapshot(name, state))
     }
 
     fn start_generation(
@@ -617,6 +657,7 @@ where
             )?,
         };
         service.generation = generation;
+        service.start_after_drain = false;
         service.status = ServiceStatus::Running;
         service.last_error = None;
         // A fresh census belongs only to this generation. Delayed cleanup of
@@ -775,6 +816,7 @@ where
                     .services
                     .get_mut(static_name)
                     .expect("service key just resolved");
+                service.start_after_drain = false;
                 match service.status {
                     ServiceStatus::Running => {
                         service.status = ServiceStatus::Stopping;
@@ -861,7 +903,19 @@ where
                 let result = match reload {
                     Ok(()) => {
                         service.last_reload_error = None;
-                        Ok(service.snapshot(static_name, &state))
+                        self.reconcile_start_policy(static_name).map_err(
+                            |error| {
+                                let message = error.to_string();
+                                self.services
+                                    .get_mut(static_name)
+                                    .unwrap()
+                                    .last_reload_error = Some(message.clone());
+                                ServiceManagerError::OperationFailed {
+                                    name,
+                                    message,
+                                }
+                            },
+                        )
                     }
                     Err(message) => {
                         service.last_reload_error = Some(message.clone());
@@ -870,6 +924,20 @@ where
                             message,
                         })
                     }
+                };
+                let _ = reply.send(result);
+            }
+            ServiceCommand::Reconcile { name, reply } => {
+                let result = match self.services.get_key_value(name.as_str()) {
+                    Some((&static_name, _)) => {
+                        self.reconcile_start_policy(static_name).map_err(
+                            |error| ServiceManagerError::OperationFailed {
+                                name,
+                                message: error.to_string(),
+                            },
+                        )
+                    }
+                    None => Err(ServiceManagerError::NotFound(name)),
                 };
                 let _ = reply.send(result);
             }
@@ -886,7 +954,8 @@ where
             }
             ServiceCommand::Start { reply, .. }
             | ServiceCommand::Stop { reply, .. }
-            | ServiceCommand::Reload { reply, .. } => {
+            | ServiceCommand::Reload { reply, .. }
+            | ServiceCommand::Reconcile { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
         }
@@ -944,6 +1013,25 @@ where
                     generation = exit.generation,
                     "runnable stopped"
                 );
+                let restart = std::mem::take(&mut service.start_after_drain)
+                    && service.runnable.start_policy(state)
+                        == ServiceStartPolicy::Automatic
+                    && !self.shutting_down
+                    && !state.is_shutting_down();
+                if restart
+                    && let Err(error) = self.start_generation(exit.name, false)
+                {
+                    // Deferred admission is still a reload operation. Report
+                    // failure on this service, not as a fatal runnable exit.
+                    let message = error.to_string();
+                    let service = self.services.get_mut(exit.name).unwrap();
+                    service.status = ServiceStatus::Failed;
+                    service.last_error = Some(message.clone());
+                    service.last_reload_error = Some(message);
+                    service.applied_start_policy =
+                        ServiceStartPolicy::Unavailable;
+                    error!(component = exit.name, %error, "reloaded service activation failed");
+                }
                 Ok(())
             }
             Err(error) => {
@@ -1186,3 +1274,7 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests/runtime/admission.rs"]
 mod admission_tests;
+
+#[cfg(test)]
+#[path = "../tests/runtime/reload_activation.rs"]
+mod reload_activation_tests;

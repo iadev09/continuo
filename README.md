@@ -360,11 +360,26 @@ manager.restart("listener").await?;
 - `start` creates a generation. It does not assert protocol readiness.
 - `stop` cancels the generation and waits for it to return.
 - `restart` performs `stop` followed by `start`.
-- `reload` retains the generation and advances a reload revision.
+- `reload` applies configuration, reconciles availability and advances a reload revision.
 
 A `Runnable` declares its `start_policy`: `Automatic`, `Manual`, or
 `Unavailable`, which also rejects explicit starts. Snapshots report status,
 policy, generation, reload revision and the most recent errors.
+
+A successful reload from `Unavailable` to `Automatic` starts the service,
+including a service disabled at process startup. Becoming `Unavailable`
+cancels the current generation through its normal graceful drain. Re-enabling
+while it drains queues one successor, which starts only after the old generation
+returns. An explicit stop clears that pending start. An unchanged policy never
+restarts an operator-stopped service, and `Manual` services remain explicit-start.
+Existing running generations keep their captured dispatch policy until drain.
+
+The same reconciliation follows `Registry::reload_one`, `Registry::reload_all`
+and runtime-managed configuration notifications. Registry reloads use the
+registered `ServiceManager` when present, so its runtime command loop must be
+running; registries without a manager remain usable independently. Scope-excluded
+components do not start in this process. Failed reloads do not reconcile policy.
+`reload_hook_one` remains a hook-only operation with no runtime management.
 
 Commands are applied by the runtime loop sequentially. A lifecycle hook
 invoked by that loop must not issue manager commands, since the reply would

@@ -7,16 +7,17 @@ use tokio_util::sync::CancellationToken;
 
 const COMMAND_CAPACITY: usize = 64;
 
-/// Initial activation policy for one registered runnable service.
+/// Activation policy for one registered runnable service.
 ///
 /// The runtime samples this policy after component boot and re-evaluates it for
-/// observation and explicit starts, so a component config reload changes the
-/// effective policy without duplicating it in the manager. It is independent
+/// observation, successful reloads and explicit starts. The provider owns the
+/// current policy; the runtime retains the last applied policy to detect
+/// availability transitions without undoing operator stops. It is independent
 /// from [`ServiceStatus`]: a manually started service is both `Manual` and
 /// `Running`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ServiceStartPolicy {
-    /// Start an initial generation when the runtime is initialized.
+    /// Start initially and when a successful reload changes Unavailable to Automatic.
     #[default]
     Automatic,
     /// Keep the service stopped initially, while allowing an explicit start.
@@ -246,6 +247,7 @@ pub(crate) enum ServiceCommand {
     Start { name: String, reply: SnapshotReply },
     Stop { name: String, reply: SnapshotReply },
     Reload { name: String, reply: SnapshotReply },
+    Reconcile { name: String, reply: SnapshotReply },
 }
 
 /// Cloneable control handle for runnable services owned by [`crate::Runtime`].
@@ -309,7 +311,7 @@ impl ServiceManager {
         result.await.map_err(|_| ServiceManagerError::RuntimeUnavailable)?
     }
 
-    /// Reload one runnable component without replacing its live generation.
+    /// Reload one runnable component and reconcile availability transitions.
     pub async fn reload(
         &self,
         name: impl Into<String>,
@@ -317,6 +319,20 @@ impl ServiceManager {
         let (reply, result) = oneshot::channel();
         self.commands
             .send(ServiceCommand::Reload { name: name.into(), reply })
+            .await
+            .map_err(|_| ServiceManagerError::RuntimeUnavailable)?;
+        result.await.map_err(|_| ServiceManagerError::RuntimeUnavailable)?
+    }
+
+    /// Reconcile a successfully applied external reload with its live generation.
+    /// Like other manager commands, this must not be awaited inside a runtime hook.
+    pub(crate) async fn reconcile(
+        &self,
+        name: &'static str,
+    ) -> Result<ServiceSnapshot, ServiceManagerError> {
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .send(ServiceCommand::Reconcile { name: name.into(), reply })
             .await
             .map_err(|_| ServiceManagerError::RuntimeUnavailable)?;
         result.await.map_err(|_| ServiceManagerError::RuntimeUnavailable)?
