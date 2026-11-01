@@ -34,10 +34,10 @@ impl Component<AppState> for OtherService {
     fn name(&self) -> &'static str {
         "DuplicateReaderService"
     }
-    fn as_configurable(&self) -> Option<&dyn congif::ConfigRegistration> {
+    fn as_reloadable(&self) -> Option<&dyn Reloadable<AppState>> {
         Some(self)
     }
-    fn as_reloadable(&self) -> Option<&dyn Reloadable<AppState>> {
+    fn as_configurable(&self) -> Option<&dyn congif::ConfigRegistration> {
         Some(self)
     }
 }
@@ -51,12 +51,6 @@ impl Configurable for OtherService {
             format: congif::Format::Json,
         }
     }
-    fn validate_config(
-        &self,
-        config: &CounterConfig,
-    ) -> congif::Result<()> {
-        config.validate()
-    }
     fn as_config_observer(
         &self
     ) -> Option<&dyn ConfigObserver<Config = CounterConfig>> {
@@ -68,6 +62,12 @@ impl Configurable for OtherService {
     ) -> congif::Result<()> {
         Self::report(config);
         Ok(())
+    }
+    fn validate_config(
+        &self,
+        config: &CounterConfig,
+    ) -> congif::Result<()> {
+        config.validate()
     }
 }
 
