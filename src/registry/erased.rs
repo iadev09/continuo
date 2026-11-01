@@ -151,6 +151,14 @@ impl<S: Send + Sync + 'static, C: Component<S>> AnyComponent<S> for C {
 /// dependencies. Fleet dispatch clones that bound execution, not the registry.
 #[async_trait]
 pub trait AnyRunnable<S>: Send + Sync + 'static {
+    /// Execution requirements for the next admitted generation.
+    fn execution_spec(
+        &self,
+        _state: &S,
+    ) -> crate::ExecutionSpec {
+        crate::ExecutionSpec::default()
+    }
+
     /// Resolve required dependencies before a generation is marked running.
     fn bind(
         self: Arc<Self>,
@@ -176,6 +184,13 @@ struct Unbound<S, D> {
 
 #[async_trait]
 impl<S: Send + Sync + 'static, D: Resolve<S>> AnyRunnable<S> for Unbound<S, D> {
+    fn execution_spec(
+        &self,
+        state: &S,
+    ) -> crate::ExecutionSpec {
+        self.runnable.execution_spec(state)
+    }
+
     fn bind(
         self: Arc<Self>,
         registry: &Registry<S>,
@@ -211,6 +226,13 @@ struct Bound<S, D> {
 
 #[async_trait]
 impl<S: Send + Sync + 'static, D: Resolve<S>> AnyRunnable<S> for Bound<S, D> {
+    fn execution_spec(
+        &self,
+        state: &S,
+    ) -> crate::ExecutionSpec {
+        self.runnable.execution_spec(state)
+    }
+
     fn bind(
         self: Arc<Self>,
         _: &Registry<S>,

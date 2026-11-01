@@ -21,6 +21,21 @@ use super::Result;
 /// whole-process shutdown.
 #[async_trait]
 pub trait Runnable<S, D = ()>: Send + Sync + 'static {
+    /// Executor placement and poll scheduling for the next generation.
+    ///
+    /// The default preserves ambient Tokio execution. Override only when an
+    /// installed execution driver implements the requested policy. This is
+    /// independent of `Component::run_priority`, which orders service starts.
+    /// The runtime samples and prepares this once at generation admission.
+    /// Placement applies only to `run`; configuration, boot, validation,
+    /// reload and provider finalization keep their lifecycle executor.
+    fn execution_spec(
+        &self,
+        _state: &S,
+    ) -> crate::ExecutionSpec {
+        crate::ExecutionSpec::default()
+    }
+
     /// Declare the service's current activation policy.
     ///
     /// The default is [`crate::ServiceStartPolicy::Automatic`]: exposing

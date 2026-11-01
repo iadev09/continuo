@@ -7,6 +7,7 @@ use tokio::task::{Id, JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error};
 
+use crate::execution::{ExecutionDriver, ExecutionPlan};
 #[cfg(feature = "registry")]
 use crate::registry::FinalizeOutcome;
 use crate::registry::{AnyComponent, AnyRunnable, Error, Registry, Result};
@@ -74,6 +75,11 @@ struct TaskIdentity {
     generation: u64,
 }
 
+struct AdmittedGeneration<S> {
+    runnable: Arc<dyn AnyRunnable<S>>,
+    execution: ExecutionPlan,
+}
+
 struct ServiceEntry<S> {
     component: Arc<dyn AnyComponent<S>>,
     runnable: Arc<dyn AnyRunnable<S>>,
@@ -130,6 +136,7 @@ pub struct Runtime<S> {
     shutting_down: bool,
     // Registrations recorded by `with_services`, applied by `register_services`.
     registrations: Vec<fn(&S) -> Result<()>>,
+    execution_driver: Option<Arc<dyn ExecutionDriver>>,
     // Configuration is a runtime capability, independent of native watching.
     #[cfg(feature = "config")]
     config_reader: Option<fn(&S) -> &congif::ConfigReader>,
@@ -152,6 +159,7 @@ impl<S> Default for Runtime<S> {
             commands,
             shutting_down: false,
             registrations: Vec::new(),
+            execution_driver: None,
             #[cfg(feature = "config")]
             config_reader: None,
             #[cfg(feature = "fleet")]
@@ -163,6 +171,23 @@ impl<S> Default for Runtime<S> {
 }
 
 impl<S> Runtime<S> {
+    /// Install the application adapter for non-default execution policies.
+    ///
+    /// Configure before submitting any runnable. Ambient/default generations
+    /// continue through ordinary Tokio spawning without consulting the driver.
+    pub fn with_execution_driver(
+        mut self,
+        driver: Arc<dyn ExecutionDriver>,
+    ) -> Result<Self> {
+        if self.state.is_some() {
+            return Err(Error::msg(
+                "install the execution driver before submitting runnables",
+            ));
+        }
+        self.execution_driver = Some(driver);
+        Ok(self)
+    }
+
     /// Return the control capability backed by this runtime.
     ///
     /// `with_services` registers this capability automatically. For manual
@@ -178,7 +203,7 @@ impl<S: HasRegistry + 'static> Runtime<S> {
     ///
     /// The whole lifecycle of an application without typed configuration:
     /// `boot_all`, `validate_all`, `spawn_all`, wait for shutdown, drain,
-    /// `finalize_all`.
+    /// `finalize_all`, then `finalize_execution`.
     pub async fn run(
         mut self,
         state: S,
@@ -193,7 +218,8 @@ impl<S: HasRegistry + 'static> Runtime<S> {
     /// Validates every component and refuses to start if any fails
     /// (`Error::Invalid` carries the whole outcome). Spawns the runnables,
     /// waits until shutdown is initiated or a runnable fails fatally, drains,
-    /// then finalizes. Finalization runs even after a failure, so named
+    /// then finalizes providers and execution owners, in that order.
+    /// Finalization runs even after a failure, so named
     /// resources are released; the failure is then returned and finalize
     /// failures are reported through `tracing`. On success the finalize
     /// outcome is returned for the caller to inspect.
@@ -217,7 +243,11 @@ impl<S: HasRegistry + 'static> Runtime<S> {
         };
         let drained = self.drain().await;
         let finalized = state.registry_ref().finalize_all(&state).await;
-        match outcome.and(drained) {
+        let execution_finalized = self.finalize_execution().await;
+        if let Err(error) = &execution_finalized {
+            error!(%error, "execution driver finalization failed");
+        }
+        match outcome.and(drained).and(execution_finalized) {
             Ok(()) => finalized,
             Err(failure) => {
                 match finalized {
@@ -498,7 +528,13 @@ where
                             &state,
                         )?;
                     }
-                    Some(entry.runnable.clone().bind(registry)?)
+                    let runnable = entry.runnable.clone().bind(registry)?;
+                    let execution = ExecutionPlan::prepare(
+                        entry.runnable.execution_spec(&state),
+                        self.execution_driver.as_deref(),
+                    )
+                    .map_err(|error| error.into_run(entry.name))?;
+                    Some(AdmittedGeneration { runnable, execution })
                 } else {
                     None
                 };
@@ -597,7 +633,7 @@ where
         &mut self,
         name: &'static str,
         allow_cancelled_parent: bool,
-        bound: Option<Arc<dyn AnyRunnable<S>>>,
+        bound: Option<AdmittedGeneration<S>>,
     ) -> Result<ServiceSnapshot> {
         let state =
             self.state.as_ref().cloned().ok_or_else(|| {
@@ -648,13 +684,21 @@ where
             }
             _ => None,
         };
-        let runnable = match bound {
-            Some(runnable) => runnable,
-            None => service.runnable.clone().bind(
-                self.registry.as_ref().ok_or_else(|| {
-                    Error::msg("service registry is not initialized")
-                })?,
-            )?,
+        let AdmittedGeneration { runnable, execution } = match bound {
+            Some(admitted) => admitted,
+            None => {
+                let runnable = service.runnable.clone().bind(
+                    self.registry.as_ref().ok_or_else(|| {
+                        Error::msg("service registry is not initialized")
+                    })?,
+                )?;
+                let execution = ExecutionPlan::prepare(
+                    service.runnable.execution_spec(&state),
+                    self.execution_driver.as_deref(),
+                )
+                .map_err(|error| error.into_run(name))?;
+                AdmittedGeneration { runnable, execution }
+            }
         };
         service.generation = generation;
         service.start_after_drain = false;
@@ -679,26 +723,34 @@ where
 
         let abort = self.join_set.spawn(
             async move {
-                let context = RunContext::new(cancellation);
-                #[cfg(feature = "fleet")]
-                let result = if let Some((dispatcher, request)) = dispatch {
-                    dispatcher
-                        .run(
-                            request,
-                            crate::fleet::ServiceExecution::new(
-                                runnable, state, active_executions,
-                            ),
-                            context,
-                        )
-                        .await
-                } else {
-                    let _execution = crate::service::ExecutionGuard::enter(&active_executions);
-                    runnable.run(state, context).await
+                let context = RunContext::with_execution(cancellation, execution);
+                let adapter = context.execution_executor().cloned()
+                    .map(|executor| (executor, context.clone()));
+                let task = async move {
+                    #[cfg(feature = "fleet")]
+                    if let Some((dispatcher, request)) = dispatch {
+                        dispatcher
+                            .run(
+                                request,
+                                crate::fleet::ServiceExecution::new(
+                                    runnable, state, active_executions,
+                                ),
+                                context,
+                            )
+                            .await
+                    } else {
+                        let _execution = crate::service::ExecutionGuard::enter(&active_executions);
+                        runnable.run(state, context).await
+                    }
+                    #[cfg(not(feature = "fleet"))]
+                    {
+                        let _execution = crate::service::ExecutionGuard::enter(&active_executions);
+                        runnable.run(state, context).await
+                    }
                 };
-                #[cfg(not(feature = "fleet"))]
-                let result = {
-                    let _execution = crate::service::ExecutionGuard::enter(&active_executions);
-                    runnable.run(state, context).await
+                let result = match adapter {
+                    Some((executor, context)) => executor.execute(Box::pin(task), context).await,
+                    None => task.await,
                 };
                 let result = result.map_err(|e| e.into_run(name));
                 ServiceExit { name, generation, result }
@@ -1244,6 +1296,11 @@ where
                 }
             }
         }
+        if let Some(driver) = &self.execution_driver
+            && let Err(error) = driver.drain().await
+        {
+            error!(%error, "execution driver failed during forced drain");
+        }
         debug!("runtime aborted and drained remaining runnable tasks");
     }
 
@@ -1262,8 +1319,31 @@ where
                 }
             }
         }
+        if let Some(driver) = &self.execution_driver
+            && let Err(error) = driver.drain().await
+        {
+            error!(%error, "execution driver failed during drain");
+            first_error.get_or_insert(error);
+        }
         debug!("runtime drained remaining runnable tasks");
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// Release executor owners after draining runnables and finalizing
+    /// providers. Manual lifecycle compositions must call this last: pooled
+    /// I/O resources can still depend on a shared executor during finalization.
+    /// No later runnable generation may be admitted.
+    pub async fn finalize_execution(&mut self) -> Result<()> {
+        if !self.join_set.is_empty() {
+            return Err(Error::msg(
+                "drain runnable tasks before finalizing execution",
+            ));
+        }
+        self.begin_shutdown();
+        if let Some(driver) = &self.execution_driver {
+            driver.finalize().await?;
+        }
+        Ok(())
     }
 }
 
@@ -1274,6 +1354,10 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests/runtime/admission.rs"]
 mod admission_tests;
+
+#[cfg(test)]
+#[path = "../tests/runtime/execution.rs"]
+mod execution_tests;
 
 #[cfg(test)]
 #[path = "../tests/runtime/reload_activation.rs"]

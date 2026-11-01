@@ -386,8 +386,8 @@ invoked by that loop must not issue manager commands, since the reply would
 require the loop that is waiting for the hook.
 
 `run` drives the whole lifecycle: `boot_all`, `validate_all`, `spawn_all`,
-wait for shutdown, `drain`, `finalize_all`. It refuses to start when
-validation fails and returns the finalize outcome for the caller to inspect.
+wait for shutdown, `drain`, `finalize_all`, `finalize_execution`. It refuses to
+start when validation fails and returns the finalize outcome for the caller to inspect.
 With `config-watch`, `serve` adds `watch_configurations` and `prepare` in
 front of the same sequence. `run_prepared` is the sequence after boot, for an
 application that prepares the registry itself. The individual steps stay
@@ -403,6 +403,51 @@ application; cleanup of partial preparation remains its responsibility.
 Continuo imposes no deadline; each runnable owns its
 graceful drain, and `Gate` supplies admission control and a caller-defined
 deadline where one is required.
+
+### Execution
+
+`Runnable::execution_spec` selects executor placement and poll scheduling for
+one generation. Its default keeps ordinary Tokio spawning without an adapter.
+This is separate from `run_priority`, which orders service starts.
+Placement applies only to the `run` future. Configuration, boot, validation,
+reload and provider finalization keep their existing lifecycle executor.
+
+Applications install an `ExecutionDriver` before runnable submission:
+
+~~~rust
+let runtime = Runtime::<AppState>::default().with_execution_driver(driver)?;
+~~~
+
+Return a typed specification from the runnable's `execution_spec` hook:
+
+~~~rust
+use continuo::{ExecutionDomain, ExecutionSpec, ExecutorSpec};
+
+struct Foreground;
+
+let execution = ExecutionSpec::default().with_executor(
+    ExecutorSpec::Shared(ExecutionDomain::of::<Foreground>()),
+);
+~~~
+
+Placement is `Inherit`, a typed `Shared` domain, or a `Dedicated` executor with
+declared thread topology. Scheduling is inherited, priority-based, or weighted.
+Continuo defines these requirements; the installed driver implements them and
+rejects unsupported combinations. It supplies no custom scheduler or runtime.
+Application-specific policies can convert into `ExecutionSpec` with `From`.
+
+The runtime prepares all initial automatic generations before spawning any.
+Each start or restart samples a new specification; reload does not move running
+work. `RunContext` retains the prepared adapter and cancellation scope, and
+`child()` preserves the execution policy. Custom poll scheduling does not
+automatically extend to arbitrary `tokio::spawn` calls.
+
+Shutdown drains runnable futures and driver-owned executions first. Provider
+finalization follows while shared executors remain alive for pooled I/O cleanup.
+Finally, `finalize_execution` releases executor owners. `run`, `run_prepared`
+and `serve` drive that sequence; manual compositions call the final step after
+`Registry::finalize_all`, including when provider cleanup reports failures.
+A targeted service stop or restart does not finalize shared executors.
 
 ## Errors
 

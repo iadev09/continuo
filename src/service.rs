@@ -53,6 +53,7 @@ impl fmt::Display for ServiceStartPolicy {
 #[derive(Clone, Debug)]
 pub struct RunContext {
     cancellation: CancellationToken,
+    execution: crate::execution::ExecutionPlan,
 }
 
 impl RunContext {
@@ -63,7 +64,39 @@ impl RunContext {
     /// component harnesses that drive one [`crate::Runnable`] directly while
     /// preserving the same cancellation contract.
     pub fn new(cancellation: CancellationToken) -> Self {
-        Self { cancellation }
+        Self { cancellation, execution: Default::default() }
+    }
+
+    pub(crate) fn with_execution(
+        cancellation: CancellationToken,
+        execution: crate::execution::ExecutionPlan,
+    ) -> Self {
+        Self { cancellation, execution }
+    }
+
+    /// Frozen requirements of this generation, not the next reload candidate.
+    pub fn execution_spec(&self) -> crate::ExecutionSpec {
+        self.execution.spec
+    }
+
+    /// Own a child cancellation scope with this generation's execution policy.
+    /// Cancelling the child does not cancel the parent or its other children.
+    pub fn child(&self) -> Self {
+        Self::with_execution(
+            self.cancellation.child_token(),
+            self.execution.clone(),
+        )
+    }
+
+    /// Prepared adapter for explicitly routing owned child work.
+    ///
+    /// `None` is ambient Tokio execution. Child owners must propagate this
+    /// capability when custom scheduling must cover their spawned work.
+    /// Merely holding the adapter does not intercept `tokio::spawn`.
+    pub fn execution_executor(
+        &self
+    ) -> Option<&Arc<dyn crate::PreparedExecution>> {
+        self.execution.executor.as_ref()
     }
 
     /// Completes when this service generation must stop.

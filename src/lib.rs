@@ -15,6 +15,7 @@
 //! share this error type.
 #[cfg(feature = "events")]
 pub mod events;
+pub mod execution;
 #[cfg(feature = "fleet")]
 pub mod fleet;
 #[cfg(feature = "support")]
@@ -32,6 +33,11 @@ mod watcher;
 pub use congif::{ConfigObserver, Configurable};
 #[cfg(feature = "events")]
 pub use events::{Event, ProcessEventBus, ReloadRequired, ShutdownInitiated};
+pub use execution::{
+    ExecutionDomain, ExecutionDriver, ExecutionFuture, ExecutionSpec,
+    ExecutorKind, ExecutorSpec, PollPriority, PreparedExecution,
+    SchedulingPolicy,
+};
 #[cfg(feature = "fleet")]
 pub use fleet::{Dispatch, DispatchPolicy, Dispatched, Scope, Scoped};
 #[cfg(feature = "support")]
