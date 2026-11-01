@@ -150,9 +150,9 @@ pub trait Component<S>: Any + Send + Sync {
     where
         S: Send + Sync + 'static,
     {
-        let name: Arc<str> = self.name().into();
-        self.as_runnable()
-            .map(|runnable| RunnableInstance::new(name, runnable))
+        self.clone()
+            .as_runnable()
+            .map(|runnable| RunnableInstance::new(self.name(), runnable))
             .into_iter()
             .collect()
     }
