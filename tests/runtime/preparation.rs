@@ -99,7 +99,7 @@ impl congif::ConfigObserver for Preparation {
 #[async_trait]
 impl Component<State> for Preparation {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "preparation"
     }
 
@@ -127,7 +127,7 @@ struct Ready(Preparation);
 #[async_trait]
 impl Component<State> for Ready {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "ready"
     }
     fn order(&self) -> ComponentOrder {

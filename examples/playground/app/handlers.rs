@@ -193,6 +193,7 @@ async fn list_services(
         Ok(services) if wants_json(&headers) => Json(serde_json::json!({
             "services": services.iter().map(|service| serde_json::json!({
                 "name": service.name(),
+                "component": service.component(),
                 "status": service.status().to_string(),
                 "generation": service.generation(),
                 "reload_revision": service.reload_revision(),

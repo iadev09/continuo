@@ -25,7 +25,7 @@ struct FailsValidation;
 #[async_trait]
 impl Component<TestState> for DbComponent {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "db"
     }
 
@@ -41,7 +41,7 @@ impl Component<TestState> for DbComponent {
 #[async_trait]
 impl Component<TestState> for CacheComponent {
     type Deps = (Arc<DbComponent>,);
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "cache"
     }
 
@@ -57,7 +57,7 @@ impl Component<TestState> for CacheComponent {
 #[async_trait]
 impl Component<TestState> for ApiComponent {
     type Deps = (Arc<CacheComponent>,);
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "api"
     }
 
@@ -73,7 +73,7 @@ impl Component<TestState> for ApiComponent {
 #[async_trait]
 impl Component<TestState> for MetricsComponent {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "metrics"
     }
 
@@ -93,7 +93,7 @@ impl Component<TestState> for MetricsComponent {
 #[async_trait]
 impl Component<TestState> for FailsValidation {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "fails-validation"
     }
 
@@ -166,7 +166,10 @@ fn lifecycle_order_supports_before_edges_and_diagnostics() {
         .expect("database registration should succeed");
 
     let names = registry.lifecycle_names().expect("plan should build");
-    assert_eq!(names, vec!["metrics", "db", "cache", "api"]);
+    assert_eq!(
+        names.iter().map(AsRef::as_ref).collect::<Vec<&str>>(),
+        vec!["metrics", "db", "cache", "api"]
+    );
 
     let outcome = registry.validate_all(&state).expect("validation should run");
     assert!(outcome.is_valid());
@@ -196,7 +199,7 @@ fn validate_all_retains_component_failures_and_continues() {
     assert_eq!(failure.component(), "fails-validation");
     assert!(matches!(
         failure.error(),
-        Error::Validate { name: "fails-validation", .. }
+        Error::Validate { name, .. } if name.as_ref() == "fails-validation"
     ));
     assert_eq!(
         failure.error().to_string(),
@@ -230,7 +233,7 @@ impl LogSink for FileLogger {
 #[async_trait]
 impl Component<TestState> for ConsoleLogger {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "console-logger"
     }
 
@@ -254,7 +257,7 @@ impl Bootable<TestState> for ConsoleLogger {
 #[async_trait]
 impl Component<TestState> for FileLogger {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "file-logger"
     }
 
@@ -315,7 +318,7 @@ struct BootDependency;
 #[async_trait]
 impl Component<TestState> for BootRecorder {
     type Deps = (Arc<BootDependency>,);
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "boot-recorder"
     }
 
@@ -356,7 +359,7 @@ impl Finalizable<TestState> for BootRecorder {
 #[async_trait]
 impl Component<TestState> for BootDependency {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "boot-dependency"
     }
 
@@ -432,7 +435,7 @@ struct Edge;
 
 impl Component<TestState> for Dns {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "dns"
     }
 
@@ -443,7 +446,7 @@ impl Component<TestState> for Dns {
 
 impl Component<TestState> for Edge {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "edge"
     }
 
@@ -462,7 +465,10 @@ fn targets_order_layers_without_naming_their_members() {
         .expect("dns should register");
 
     let names = registry.lifecycle_names().expect("plan should build");
-    assert_eq!(names, vec!["dns", "edge"]);
+    assert_eq!(
+        names.iter().map(AsRef::as_ref).collect::<Vec<&str>>(),
+        vec!["dns", "edge"]
+    );
 }
 
 struct MarkerCycle;
@@ -470,7 +476,7 @@ struct MarkerCycle;
 impl Component<TestState> for MarkerCycle {
     type Deps = ();
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "marker-cycle"
     }
 
@@ -493,7 +499,7 @@ struct NeedsAbsent;
 
 impl Component<TestState> for NeedsAbsent {
     type Deps = (Arc<Absent>,);
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "needs-absent"
     }
 
@@ -538,7 +544,9 @@ async fn missing_dependency_names_the_component_and_the_type() {
     registry.register(Arc::new(NeedsAbsent)).expect("should register");
 
     let error = registry.boot_all(&state).await.expect_err("boot must fail");
-    assert!(matches!(error, Error::Dependency { name: "needs-absent", .. }));
+    assert!(
+        matches!(error, Error::Dependency { ref name, .. } if name.as_ref() == "needs-absent")
+    );
     assert!(error.to_string().contains("Absent"));
 
     let entries =
@@ -549,7 +557,9 @@ async fn missing_dependency_names_the_component_and_the_type() {
         .bind(&registry)
         .err()
         .expect("activation must fail");
-    assert!(matches!(error, Error::Dependency { name: "needs-absent", .. }));
+    assert!(
+        matches!(error, Error::Dependency { ref name, .. } if name.as_ref() == "needs-absent")
+    );
 
     registry.insert(Arc::new(Absent)).expect("dependency should insert");
     entries[0]
@@ -570,7 +580,7 @@ struct CycleB;
 #[async_trait]
 impl Component<TestState> for CycleA {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "cycle-a"
     }
 
@@ -582,7 +592,7 @@ impl Component<TestState> for CycleA {
 #[async_trait]
 impl Component<TestState> for CycleB {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "cycle-b"
     }
 
@@ -617,7 +627,7 @@ struct FailsFinalize;
 #[async_trait]
 impl Component<TestState> for Finalizes {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "finalizes"
     }
 
@@ -639,7 +649,7 @@ impl Finalizable<TestState> for Finalizes {
 #[async_trait]
 impl Component<TestState> for FailsFinalize {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "fails-finalize"
     }
 
@@ -661,7 +671,7 @@ impl Finalizable<TestState> for FailsFinalize {
 #[async_trait]
 impl Component<TestState> for Reloads {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "reloads"
     }
 
@@ -683,7 +693,7 @@ impl Reloadable<TestState> for Reloads {
 #[async_trait]
 impl Component<TestState> for FailsReload {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "fails-reload"
     }
 
@@ -722,7 +732,7 @@ async fn reload_all_retains_component_failures_and_continues() {
     assert_eq!(failure.component(), "fails-reload");
     assert!(matches!(
         failure.error(),
-        Error::Reload { name: "fails-reload", .. }
+        Error::Reload { name, .. } if name.as_ref() == "fails-reload"
     ));
     assert_eq!(
         failure.error().to_string(),
@@ -752,7 +762,7 @@ async fn finalize_all_retains_component_failures_and_continues() {
     assert_eq!(failure.component(), "fails-finalize");
     assert!(matches!(
         failure.error(),
-        Error::Finalize { name: "fails-finalize", .. }
+        Error::Finalize { name, .. } if name.as_ref() == "fails-finalize"
     ));
     assert_eq!(
         failure.error().to_string(),
@@ -771,6 +781,6 @@ async fn targeted_reload_without_configuration_keeps_lifecycle_behavior() {
     assert!(registry.reload_one("missing", &state).await.is_err());
     assert!(matches!(
         registry.reload_one("fails-reload", &state).await,
-        Err(Error::Reload { name: "fails-reload", .. })
+        Err(Error::Reload { name, .. }) if name.as_ref() == "fails-reload"
     ));
 }

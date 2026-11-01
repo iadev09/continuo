@@ -63,7 +63,7 @@ impl Configurable for Settings {
 #[async_trait]
 impl Component<State> for Settings {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "settings"
     }
 

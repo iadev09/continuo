@@ -10,27 +10,23 @@
 
 # Continuo
 
-Typed service registry and lifecycle runtime for multi-service Rust
-applications.
+Typed runtime dependency injection and lifecycle management for multi-service
+Rust applications.
 
-Continuo resolves shared values by Rust type and drives registered components
-through an ordered lifecycle: boot, validation, execution, reload, drain and
-finalization. A component declares what it requires as a type; the registry
-resolves those requirements, derives the boot order from them and hands them
-to the component. Long-running work is owned by a runtime that starts, stops,
-restarts and reloads individual services while the process keeps running.
+Continuo resolves `Deps` from the live registry at runtime and injects the
+existing shared instances into components. It automatically derives dependency
+order from registered component requirements and drives boot, validation,
+execution, reload, drain and finalization. Long-running work is owned by a
+runtime that starts, stops, restarts and reloads individual services while the
+process keeps running.
 
-Continuo is a library, not a framework. It does not depend on an HTTP stack, a
-database or a configuration format, and it does not define the application's
-state type. The application implements one trait on its own state and retains
-ownership of everything else.
+Applications supply their own state through `SharedState`. HTTP stacks,
+databases and execution drivers belong to the application.
 
 ## Layout
 
-Composition and wiring are different concerns and live in different files.
-`main.rs` names the services and the inputs that can fail. `application.rs`
-holds the one type that turns those inputs into a state and hands the
-composition to `Runtime`.
+In the playground, `main.rs` selects services and inputs; `application.rs`
+builds the state and runs the composition through `Runtime`.
 
 ~~~rust
 // main.rs
@@ -78,16 +74,12 @@ impl Application {
 }
 ~~~
 
-`with_services` records; nothing is registered, read or started until `run`.
-The command line is the only input that can fail before that point, and it is
-resolved where it is read. `Environment` and `AppState` are the application's
-own types; the playground has a complete version of each.
+`with_services` records the composition; `run` applies it. `Application`,
+`Environment` and `AppState` are defined in the playground.
 
 ## Example
 
-The same shape written out explicitly in one file: the state, a plain value,
-a component with one dependency and one capability, and the call that runs
-it.
+A minimal composition with a shared value and one runnable component:
 
 ~~~rust
 use std::net::SocketAddr;
@@ -150,7 +142,7 @@ impl Register<AppState> for Listener {
 impl Component<AppState> for Listener {
     type Deps = (Arc<Settings>,);
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "listener"
     }
 
@@ -215,9 +207,7 @@ LISTEN=127.0.0.1:9000 cargo run
 
 ## Registry
 
-`Registry<S>` stores values resolvable by type and components participating
-in the lifecycle. Each registration call states which of the two an object
-joins.
+`Registry<S>` stores shared values and lifecycle components by type.
 
 | Call | Resolvable by type | Lifecycle participant |
 | --- | --- | --- |
@@ -228,27 +218,23 @@ joins.
 not construct instances. Registering a second value of the same concrete type
 is an error.
 
-`bind_dyn` binds a trait object to an already registered concrete value;
-`resolve_dyn` retrieves it. No second instance is created.
+`bind_dyn` exposes a registered value through a trait object;
+`resolve_dyn` retrieves the same instance.
 
 ~~~rust
 registry.bind_dyn::<dyn Logger, ConsoleLogger>(|logger| logger)?;
 let logger = registry.resolve_dyn::<dyn Logger>();
 ~~~
 
-`Register<S>` is a static registration function. An implementation builds its
-instance from the application state and registers it, so a service requires
-neither `Default` nor an empty constructor. Tuples compose registrations in
-declaration order, eight members per tuple, nested for larger sets.
+`Register<S>::register` constructs and registers a component using application
+state. Tuples compose registrations in declaration order, eight members per
+tuple, nested for larger sets.
 `Runtime::with_services::<(A, B)>()` records the composition; `run`, `serve`
 and `prepare` apply it, together with the runtime's `ServiceManager`, before
-anything boots. Recording cannot fail; registration errors surface where the
-registry is built.
+anything boots. Registration errors are returned when the composition is applied.
 
-Registration order is not dependency order. A `register` function that
-resolves another component reads a registry that may not contain it yet.
-Requirements are declared in `Component::Deps` and arrive resolved in `boot`
-and `run`.
+Declare requirements in `Component::Deps`; their resolved values arrive in
+`boot` and `run` after registration.
 
 ## Components
 
@@ -261,17 +247,18 @@ exposes only those it implements, either on itself or on a separate object.
 
 `Deps` is a tuple of what the component requires: `Arc<T>` for a value that
 must be registered, `Option<Arc<T>>` for one that may be absent, `()` for
-none. The registry resolves it before `boot` and before each run generation
-and passes the result in. A registered component named in `Deps` boots before
-the dependent. A missing dependency is one error naming the component and
-the missing type, raised before its boot hook or admitted run generation.
+none. Rust checks the dependency types; Continuo resolves their instances at
+runtime, before `boot` and before each admitted run generation, and passes
+them in. The registry also builds the dependency order at runtime: a registered
+component named in `Deps` boots before its dependent, without a separate
+ordering declaration. A missing dependency is one error naming the component
+and the missing type, raised before its boot hook or admitted run generation.
+`Option<Arc<T>>` adds an ordering edge when `T` is registered.
 
-Runnable discovery does not resolve dependencies. Process scope and activation
-policy are checked first; a manual or unavailable service can remain observable
-without resources it cannot use yet. All initial automatic generations are
-admitted before any task starts. Later starts and restarts bind the current DI
-handles before marking the generation running; fleet dispatch shares those bound
-handles across its slots. No registry lookup is added to the execution hot path.
+Process scope and activation policy are checked before dependency resolution.
+All initial automatic generations are admitted before any task starts. Each
+start or restart binds the current DI handles; execution uses those handles
+directly, including across fleet dispatch slots.
 
 ~~~rust
 impl Component<AppState> for Cache {
@@ -280,15 +267,9 @@ impl Component<AppState> for Cache {
 }
 ~~~
 
-A dependency is a requirement. A component that uses another service when it
-is present, and serves without it, does not declare it: it resolves the value
-at the point of use and answers accordingly. The HTTP service in the
-playground resolves the counter per request and returns 503 until it is
-registered; it declares no dependency on it.
-
 ### Ordering
 
-`order` places a component relative to a layer or a preparation component:
+Use `order` for additional preparation steps or groups:
 
 ~~~rust
 fn order(&self) -> ComponentOrder {
@@ -296,46 +277,75 @@ fn order(&self) -> ComponentOrder {
 }
 ~~~
 
-`Network` is a marker type that nothing registers. Such a type acts as a
-target: a node with no work of its own, complete once every component
-ordered `before` it has completed, and releasing every component ordered
-`after` it. A component can therefore follow the network layer without
-naming, or depending on, the components that make it up.
+An unregistered marker such as `Network` groups components ordered `before`
+and `after` it. All components before the marker complete before those after it.
 
 When boot publishes a plain DI value, `Deps` names that value but cannot infer
 which component produces it. Keep an explicit `after::<Producer>()` barrier
-so the value exists before the dependent boots; the producer does not become
-the value's lifecycle owner.
+so the value exists before the dependent boots.
 
-`boot_priority` and `run_priority` order components that are otherwise
-independent: services that use one another without requiring one another.
-A priority never moves a component past a dependency or an `order` edge.
+`boot_priority` and `run_priority` choose among components whose dependency
+and `ComponentOrder` constraints are already satisfied. Lower values go first.
+`FIRST`, `EARLY`, `NORMAL`, `LATE` and `LAST` are convenience values;
+`NORMAL` is the default. Boot priority orders preparation; run priority orders
+submission of runnable futures.
 
-The registry builds one topological plan from dependencies, targets and
-priorities and uses it for boot, validation and reload; finalization
-traverses it in reverse. Cycles are errors. A `Bootable` may register
-additional components during boot; the plan is rebuilt after each boot so
-that newly declared dependencies are honoured before later components run.
+The registry derives lifecycle and runnable-submission plans from the same
+dependencies and targets, using each phase's priorities. Boot, validation and
+reload use lifecycle order; finalization traverses it in reverse. Cycles are
+errors. The plan is rebuilt when boot registers additional components.
 
 | Capability | Hook | Phase |
 | --- | --- | --- |
 | `Bootable<S, Deps>` | `as_bootable` | finite preparation with resolved dependencies |
 | `Component::validate` | built in | synchronous readiness check after boot |
 | `Runnable<S, Deps>` | `as_runnable` | long-running work with resolved dependencies |
+| Named runnable instances | `runnables` | multiple operational instances from one component |
 | `Reloadable<S>` | `as_reloadable` | application of a change to a live component |
 | `Finalizable<S>` | `as_finalizable` | release of named resources, reverse order |
 | `Configurable` | `as_configurable` | typed configuration; feature `config` |
 | `Environmental` | `as_environmental` | program environments; feature `config` |
 
 Phases run in the order register, configure, boot, validate, spawn, run,
-drain, finalize. Boot prepares and finalize releases; they are inverses.
-Listeners, loops and timers belong exclusively to `run`. `finalize` is not a
-stop hook: a runnable completes its own work inside `run` when its context is
-cancelled.
+drain, finalize. Listeners, loops and timers belong to `run`; cancellation
+initiates their drain. `finalize` releases prepared resources afterward.
 
 The registry stores components as `Arc<dyn AnyComponent<S>>`, a type-erased
 view with dependency resolution folded in. Application code implements
 `Component`; code that inspects the registry receives `AnyComponent`.
+
+### Named instances
+
+One component remains one typed DI registration and configuration owner. It
+can declare several operational instances of the same `Runnable` type:
+
+~~~rust
+fn runnables(self: Arc<Self>) -> Vec<RunnableInstance<AppState>> {
+    self.listeners.iter().map(|listener| {
+        RunnableInstance::new(listener.name.clone(), listener.clone())
+    }).collect()
+}
+~~~
+
+Names are owned and unique across runnable instances in the process. Each
+instance has its own start policy, generation, cancellation and management
+entry. Its typed dependencies are resolved before admission; its own
+`execution_spec` selects execution placement. Component `Deps` and `order` define
+ordering between owners; instance enumeration preserves the factory's order.
+
+Factories retain unchanged runnable allocations; enumerating them starts no
+work. After configuration changes, `ServiceManager::reconcile()` admits new
+automatic instances and cancels removed ones, retaining their ownership until
+drain completes. Replacing a live allocation under the same name is rejected:
+stop it first, or keep its handle and apply the new settings through it.
+Reloading an instance applies its owner's shared configuration/reload hook.
+Snapshots distinguish `name()` from the owning `component()`.
+
+The default `runnables` implementation wraps `as_runnable` as one instance
+named after its component. The [instances example](examples/instances/main.rs)
+shows a configuration owner creating multiple jobs of one type. Run
+`cargo run --example instances`, edit its `config.json` to add or remove a job,
+then press Ctrl+C to drain all instances.
 
 ## Runtime
 
@@ -343,6 +353,13 @@ view with dependency resolution folded in. Application code implements
 generation with its own `RunContext`, a child of the process shutdown token.
 A runnable observes the same cancellation path whether the process is draining
 or the service alone was stopped.
+
+`RunContext::identity()` exposes the instance's management name and generation
+as a `RunIdentity`. Execution adapters, child contexts and tracked tasks receive
+the same identity. Restart creates a new generation; retained contexts keep the
+old one. `RunContext::new` creates an unmanaged context whose identity is `None`.
+Downstream diagnostics and metrics can use `instance()` and `generation()` as
+labels without resolving the manager.
 
 `ServiceManager` is a cloneable control handle registered as an ordinary
 value. It sends commands over a bounded channel to the runtime loop and holds
@@ -357,7 +374,7 @@ manager.reload("listener").await?;
 manager.restart("listener").await?;
 ~~~
 
-- `start` creates a generation. It does not assert protocol readiness.
+- `start` creates a generation.
 - `stop` cancels the generation and waits for it to return.
 - `restart` performs `stop` followed by `start`.
 - `reload` applies configuration, reconciles availability and advances a reload revision.
@@ -400,17 +417,13 @@ preparation, finalization runs even if validation, admission or execution
 fails, so named resources are released before the failure is returned.
 Errors during registration, configuration or boot are returned to the
 application; cleanup of partial preparation remains its responsibility.
-Continuo imposes no deadline; each runnable owns its
-graceful drain, and `Gate` supplies admission control and a caller-defined
-deadline where one is required.
+`Gate` supplies admission control and a caller-defined deadline where required.
 
 ### Execution
 
 `Runnable::execution_spec` selects executor placement and poll scheduling for
-one generation. Its default keeps ordinary Tokio spawning without an adapter.
-This is separate from `run_priority`, which orders service starts.
-Placement applies only to the `run` future. Configuration, boot, validation,
-reload and provider finalization keep their existing lifecycle executor.
+one generation. The default uses ambient Tokio execution. Configuration, boot,
+validation, reload and finalization use the lifecycle executor.
 
 Applications install an `ExecutionDriver` before runnable submission:
 
@@ -432,15 +445,19 @@ let execution = ExecutionSpec::default().with_executor(
 
 Placement is `Inherit`, a typed `Shared` domain, or a `Dedicated` executor with
 declared thread topology. Scheduling is inherited, priority-based, or weighted.
-Continuo defines these requirements; the installed driver implements them and
-rejects unsupported combinations. It supplies no custom scheduler or runtime.
+The installed driver implements these policies and rejects unsupported
+combinations.
 Application-specific policies can convert into `ExecutionSpec` with `From`.
+
+`ExecutionDomain::of::<Marker>()` identifies a shared domain by type.
+`ExecutionDomain::named::<Marker>(name)` adds an owned configuration name
+within that type. Instances selecting the same domain share an execution owner.
 
 The runtime prepares all initial automatic generations before spawning any.
 Each start or restart samples a new specification; reload does not move running
 work. `RunContext` retains the prepared adapter and cancellation scope, and
-`child()` preserves the execution policy. Custom poll scheduling does not
-automatically extend to arbitrary `tokio::spawn` calls.
+`child()` preserves the execution policy. Services pass the prepared adapter
+to child work that needs the same custom scheduling.
 
 Shutdown drains runnable futures and driver-owned executions first. Provider
 finalization follows while shared executors remain alive for pooled I/O cleanup.
@@ -448,6 +465,33 @@ Finally, `finalize_execution` releases executor owners. `run`, `run_prepared`
 and `serve` drive that sequence; manual compositions call the final step after
 `Registry::finalize_all`, including when provider cleanup reports failures.
 A targeted service stop or restart does not finalize shared executors.
+
+### Tracked tasks
+
+Use `RunContext::spawn_tracked` for child work owned by a runnable execution:
+
+~~~rust
+let task = context.spawn_tracked(|child| async move {
+    child.cancelled().await;
+    // Complete owned cleanup before returning.
+    Ok(())
+})?;
+~~~
+
+The child uses the generation's prepared execution adapter and its own
+cancellation token. The adapter is reused, including its scheduling policy.
+`PreparedExecution::execute` owns the root; `execute_child` submits concurrent
+children. Generation-owned adapters retain their reactor through child drain.
+
+When the runnable returns, fails or unwinds, admission closes, children receive
+cancellation, and completion waits for their futures to be destroyed. Stop and
+restart acknowledge that same completion boundary. Fleet slots drain their own
+children independently; the generation retains all outstanding work.
+
+Tracking uses Tokio's `TaskTracker`, created on first submission. The returned
+`JoinHandle<Result<()>>` carries task results and panics; dropping the handle
+keeps its work tracked. Retained contexts reject submissions after cancellation
+or completion. Direct `tokio::spawn` calls remain caller-owned.
 
 ## Errors
 
@@ -491,15 +535,15 @@ required method to an existing implementation.
 Requires the `config` feature. Configuration is provided by
 [Congif](https://github.com/iadev09/congif): a typed `Config` per owner, one
 declared source, validation and immutable snapshots. Continuo re-exports
-`Configurable` and defines no second contract.
+`Configurable`.
 
 A component declares its configuration and exposes it through
 `as_configurable`. `Runtime::configure` reads and validates every declared
 owner before boot; `Runtime::prepare` performs configure followed by
 `boot_all`. A config owner introduced during boot without having been declared
-before configuration is rejected. Components without configuration are valid.
+before configuration is rejected.
 
-Two hooks apply configuration changes. They are distinct:
+Configuration changes use two hooks:
 
 - `Reloadable::reload` is a lifecycle command issued by the manager,
   `reload_one` or `reload_all`. The component applies the prepared snapshot;
@@ -512,9 +556,6 @@ Two hooks apply configuration changes. They are distinct:
 - `ConfigObserver::config_changed` is a typed notification carrying the new
   `Config`. With `config-watch` it is invoked for a changed source.
 
-Both may produce the same effect, and a component may implement both. One is
-a command; the other is an observation.
-
 With `config-watch` and `Runtime::watch_configurations`:
 
 1. One native watcher covers every source of every observing owner.
@@ -523,9 +564,8 @@ With `config-watch` and `Runtime::watch_configurations`:
 4. A rejected batch publishes nothing; previous snapshots remain in effect.
 5. A successful batch publishes, then `config_changed` runs for each owner.
 
-The runtime loop consumes these notifications directly, without an additional
-task, channel or polling interval. `ConfigurationChanged::of::<Owner>()` on
-the event bus requests the same path explicitly.
+The runtime loop consumes these notifications. Emit
+`ConfigurationChanged::of::<Owner>()` on the event bus to request the same path.
 
 A component whose programs start with their own environments, such as a PHP
 application or a task process, implements `Environmental`. Congif maintains
@@ -547,16 +587,14 @@ let mut events = state.events().subscribe::<CertificateReloaded>();
 state.events().emit(CertificateReloaded);
 ~~~
 
-Events are delivered only to existing subscribers. Channels are bounded and
-receivers must handle lag. The bus is neither storage nor a cross-process
-queue.
+Events are delivered to existing subscribers through bounded channels.
+Receivers must handle lag.
 
 `subscribe_filtered::<E>(predicate)` uses the same bounded receiver contract,
 but evaluates the predicate synchronously during publication, before queue
 admission. Rejected events cannot consume that subscription's capacity or cause
 its lag. The predicate may read a shared selection, but must be cheap,
-non-blocking and must not re-enter the bus. No forwarding task or polling loop
-is created; only subsequent matching publications are delivered. Dropped
+non-blocking and must not re-enter the bus. Dropped
 receivers are removed on the next publication or filtered registration.
 `subscribe_filtered_with_capacity::<E>(capacity, predicate)` lets a consumer
 declare its own backlog bound without resizing other channels. Capacity is a
@@ -587,7 +625,7 @@ Without a dispatcher those policies are rejected rather than executed as
 `DispatchPolicy`: pool capacity, lease TTL and renewal interval. `Each` needs
 no policy; a lease-based adapter rejects `One`/`Pool` without one. The runtime
 passes the value in `DispatchRequest` and each generation keeps its own
-immutable snapshot. The type is transport-neutral data, not an Orbit dependency.
+immutable snapshot. The policy is transport-neutral.
 Task managers may retain their own task-level policy and controller.
 
 `ServiceSnapshot::status()` describes the generation controller, not slot
@@ -628,13 +666,10 @@ async fn main() -> continuo::Result<()> {
 }
 ~~~
 
-`Application` is the example's composition: it holds the selected
-environment and a `Runtime`, and its `run` builds the state and calls
-`Runtime::serve`. The only fallible input, the command line, is resolved
-where it is read. `ReloadService` requires the `ServiceManager` and declares it in
-`Deps`; the HTTP and signal services use the counter when it is present and
-state a start preference through `run_priority`. The printed address serves
-the counter and its controls;
+`Application` holds the selected environment and a `Runtime`; its `run` builds
+the state and calls `Runtime::serve`. `ReloadService` declares `ServiceManager`
+in `Deps`. The HTTP and signal services set their start order through
+`run_priority`. The printed address serves the counter and its controls;
 `/services` lists lifecycle state, generations and reload revisions. Editing
 `config/counter.json` or `config/http.json` triggers validation and reload;
 the HTTP service binds a replacement listener before releasing the current
@@ -669,7 +704,6 @@ continuo = { version = "0.9", features = ["config-watch"] }
 | `events` | `ProcessEventBus`, `HasEvents` |
 | `support` | `Gate`, `Permit`, `GuardGroup`, `Guard` |
 | `fleet` | `Scope`, `Dispatch`, `Dispatcher`, `as_scoped`, `as_dispatched` |
-| `full` | all of the above |
 
 The registry, components, runtime and manager are available with no features
 enabled. Core dependencies are `async-trait`, Tokio, `tokio-util` and

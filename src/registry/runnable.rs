@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -10,7 +11,8 @@ use super::Result;
 /// loops, listeners, periodic tickers. It does not appear in `register()` or
 /// `Bootable::boot()`.
 ///
-/// `D` is the component's `Deps`. The runtime resolves it before each admitted
+/// `D` is the runnable's typed dependency set (the component's `Deps` for the
+/// default single instance). The runtime resolves it before each admitted
 /// generation, after checking scope and activation policy. Dormant services
 /// do not require runtime dependencies until started. Each execution receives
 /// shared handles; fleet dispatch clones those handles across its slots.
@@ -20,7 +22,7 @@ use super::Result;
 /// runtime uses the same path for a targeted stop or restart and for
 /// whole-process shutdown.
 #[async_trait]
-pub trait Runnable<S, D = ()>: Send + Sync + 'static {
+pub trait Runnable<S, D = ()>: Any + Send + Sync {
     /// Executor placement and poll scheduling for the next generation.
     ///
     /// The default preserves ambient Tokio execution. Override only when an
@@ -49,7 +51,7 @@ pub trait Runnable<S, D = ()>: Send + Sync + 'static {
         crate::ServiceStartPolicy::Automatic
     }
 
-    /// Run one runtime-owned generation of this component.
+    /// Run one runtime-owned generation of this instance.
     ///
     /// An implementation that returns `Err` logs its own contextual details;
     /// the runtime attaches the component name and the lifecycle phase, and

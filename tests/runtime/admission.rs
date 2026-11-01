@@ -47,13 +47,12 @@ impl Consumer {
 impl Component<State> for Consumer {
     type Deps = (Arc<Dependency>,);
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "consumer"
     }
 
-    fn as_runnable(
-        self: Arc<Self>
-    ) -> Option<Arc<dyn Runnable<State, Self::Deps>>> {
+    #[cfg(feature = "fleet")]
+    fn as_scoped(&self) -> Option<&dyn crate::fleet::Scoped> {
         Some(self)
     }
 
@@ -61,8 +60,9 @@ impl Component<State> for Consumer {
         Some(self)
     }
 
-    #[cfg(feature = "fleet")]
-    fn as_scoped(&self) -> Option<&dyn crate::fleet::Scoped> {
+    fn as_runnable(
+        self: Arc<Self>
+    ) -> Option<Arc<dyn Runnable<State, Self::Deps>>> {
         Some(self)
     }
 }
@@ -126,7 +126,9 @@ async fn dormant_dependency_is_required_only_at_activation() {
 
     consumer.policy.store(1, Ordering::SeqCst);
     let error = runtime.start_generation("consumer", false).unwrap_err();
-    assert!(matches!(error, Error::Dependency { name: "consumer", .. }));
+    assert!(
+        matches!(error, Error::Dependency { name, .. } if name.as_ref() == "consumer")
+    );
     let snapshot = runtime.snapshots().pop().unwrap();
     assert_eq!(snapshot.generation(), 0);
     assert_eq!(snapshot.status(), ServiceStatus::Stopped);
@@ -160,7 +162,7 @@ struct First(AtomicUsize);
 
 impl Component<State> for First {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "first"
     }
     fn run_priority(&self) -> Option<u8> {
@@ -228,7 +230,7 @@ async fn initial_fleet_admission_validates_once_and_restart_revalidates() {
     struct FleetWork(AtomicUsize);
     impl Component<State> for FleetWork {
         type Deps = ();
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "fleet-work"
         }
         fn as_runnable(self: Arc<Self>) -> Option<Arc<dyn Runnable<State>>> {
@@ -324,7 +326,7 @@ async fn prepared_resources_finalize_after_admission_failure() {
     struct Prepared(AtomicUsize);
     impl Component<RegisteredState> for Prepared {
         type Deps = (Arc<Dependency>,);
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "prepared"
         }
         fn as_runnable(

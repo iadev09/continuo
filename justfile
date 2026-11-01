@@ -8,18 +8,18 @@ check:
 check-core:
     cargo check --no-default-features
 
-check-full:
-    cargo check --no-default-features --features full
+check-all:
+    cargo check --all-features
 
 check-examples:
     cargo check --examples
-    cargo check --no-default-features --features full --examples
+    cargo check --all-features --examples
 
-smoke: check-core check check-full check-examples
+smoke: check-core check check-all check-examples
 
 package-list:
     cargo package --allow-dirty --list
 
 tree:
     cargo tree --no-default-features --depth 1
-    cargo tree --features full --depth 1
+    cargo tree --all-features --depth 1

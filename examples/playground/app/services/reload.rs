@@ -25,19 +25,19 @@ impl ReloadService {
         for name in registry.lifecycle_names()? {
             let component = components
                 .iter()
-                .find(|component| component.name() == name)
+                .find(|component| component.name() == name.as_ref())
                 .ok_or_else(|| {
                     Error::msg("registered component disappeared")
                 })?;
             if component.as_reloadable().is_none() {
                 continue;
             }
-            let result = if services
+            let result = if let Some(service) = services
                 .iter()
-                .any(|service| service.name() == name)
+                .find(|service| service.component() == name.as_ref())
             {
                 manager
-                    .reload(name)
+                    .reload(service.name())
                     .await
                     .map(|_| ())
                     .map_err(|error| Error::msg(error.to_string()))
@@ -50,22 +50,26 @@ impl ReloadService {
                         component.as_configurable().and_then(|owner| {
                             state.reader().prepared_config(owner)
                         });
-                    registry.reload_hook_one(name, state).await?;
+                    registry.reload_hook_one(&name, state).await?;
                     if let Some(candidate) = candidate {
                         state.reader().confirm_applied(candidate).await?;
                     }
+                    manager
+                        .reconcile()
+                        .await
+                        .map_err(|error| Error::msg(error.to_string()))?;
                     Ok(())
                 }
                 .await
             };
             match result {
                 Ok(()) => tracing::info!(
-                    component = name,
+                    component = %name,
                     "application component reloaded"
                 ),
                 Err(error) => {
                     failed += 1;
-                    tracing::error!(component = name, %error, "application component reload rejected");
+                    tracing::error!(component = %name, %error, "application component reload rejected");
                 }
             }
         }
@@ -90,7 +94,7 @@ impl Component<AppState> for ReloadService {
     // Reload is meaningless without the manager: a hard dependency.
     type Deps = (Arc<ServiceManager>,);
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "reload"
     }
 

@@ -113,9 +113,9 @@ pub trait Dispatched: Scoped {
 /// Identity and placement of one locally managed controller generation.
 /// The service supplies its policy; the adapter must retain this snapshot for
 /// the generation, including drain. Config reload cannot mutate active leases.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct DispatchRequest {
-    pub name: &'static str,
+    pub name: Arc<str>,
     pub generation: u64,
     pub scope: Scope,
     pub dispatch: Dispatch,
@@ -164,9 +164,14 @@ impl<S: SharedState> ServiceExecution<S> {
         &self,
         context: RunContext,
     ) -> Result<()> {
+        let context = context.for_execution();
         let _execution =
             crate::service::ExecutionGuard::enter(&self.active_executions);
-        self.runnable.clone().run(self.state.clone(), context).await
+        crate::service::run_owned(
+            context.clone(),
+            self.runnable.clone().run(self.state.clone(), context),
+        )
+        .await
     }
 }
 

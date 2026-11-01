@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use super::{Error, Result};
@@ -30,13 +32,13 @@ pub trait Finalizable<S>: Send + Sync {
 /// One component failure retained by best-effort finalization.
 #[derive(Debug)]
 pub struct FinalizeFailure {
-    pub(super) component: &'static str,
+    pub(super) component: Arc<str>,
     pub(super) error: Error,
 }
 
 impl FinalizeFailure {
-    pub fn component(&self) -> &'static str {
-        self.component
+    pub fn component(&self) -> &str {
+        &self.component
     }
 
     pub fn error(&self) -> &Error {

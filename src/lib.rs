@@ -48,12 +48,13 @@ pub use registry::{
     AnyComponent, AnyRunnable, Bootable, BoxError, Component, ComponentOrder,
     Error, Finalizable, FinalizeFailure, FinalizeOutcome, MissingDependency,
     Register, Registry, ReloadFailure, ReloadOutcome, ReloadState, Reloadable,
-    Resolve, Result, Runnable, StdError, ValidationFailure, ValidationOutcome,
+    Resolve, Result, Runnable, RunnableInstance, StdError, ValidationFailure,
+    ValidationOutcome,
 };
 pub use runtime::Runtime;
 pub use service::{
-    RunContext, ServiceManager, ServiceManagerError, ServiceSnapshot,
-    ServiceStartPolicy, ServiceStatus,
+    RunContext, RunIdentity, ServiceManager, ServiceManagerError,
+    ServiceSnapshot, ServiceStartPolicy, ServiceStatus,
 };
 #[cfg(feature = "config")]
 pub use state::HasConfigReader;

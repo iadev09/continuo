@@ -7,6 +7,7 @@ mod component;
 mod erased;
 mod error;
 mod finalizable;
+mod instance;
 mod order;
 pub mod priority;
 mod register;
@@ -20,6 +21,7 @@ pub use component::Component;
 pub use erased::{AnyComponent, AnyRunnable};
 pub use error::{BoxError, Error, Result, StdError};
 pub use finalizable::{Finalizable, FinalizeFailure, FinalizeOutcome};
+pub use instance::RunnableInstance;
 pub use order::ComponentOrder;
 pub use register::Register;
 pub use reload::{ReloadFailure, ReloadOutcome, ReloadState, Reloadable};
@@ -47,9 +49,10 @@ struct RegistryEntries<S> {
 }
 
 pub(crate) struct RunnableEntry<S> {
-    pub(crate) name: &'static str,
+    pub(crate) name: Arc<str>,
     pub(crate) component: Arc<dyn AnyComponent<S>>,
     pub(crate) runnable: Arc<dyn AnyRunnable<S>>,
+    pub(crate) identity: Arc<dyn Any + Send + Sync>,
 }
 
 impl<S: 'static> Registry<S> {
@@ -410,19 +413,19 @@ impl<S: 'static> Registry<S> {
     }
 
     /// Return the list of component display names (for diagnostics only).
-    pub fn list_names(&self) -> Vec<&'static str> {
-        self.components().iter().map(|c| c.name()).collect()
+    pub fn list_names(&self) -> Vec<Arc<str>> {
+        self.components().iter().map(|c| Arc::from(c.name())).collect()
     }
 
     /// Return component display names in lifecycle order.
     ///
     /// This is useful for diagnostics and startup logging before running
     /// `boot_all()`.
-    pub fn lifecycle_names(&self) -> Result<Vec<&'static str>> {
+    pub fn lifecycle_names(&self) -> Result<Vec<Arc<str>>> {
         Ok(self
             .lifecycle_plan()?
             .iter()
-            .map(|component| component.name())
+            .map(|component| Arc::from(component.name()))
             .collect())
     }
 
@@ -443,14 +446,14 @@ impl<S: 'static> Registry<S> {
         let mut runnables = Vec::new();
         for entry in ordered {
             let component = entry.component;
-            let Some(runnable) = component.clone().runnable() else {
-                continue;
-            };
-            runnables.push(RunnableEntry {
-                name: component.name(),
-                component,
-                runnable,
-            });
+            for instance in component.clone().runnables() {
+                runnables.push(RunnableEntry {
+                    name: instance.name,
+                    component: component.clone(),
+                    runnable: instance.runnable,
+                    identity: instance.identity,
+                });
+            }
         }
 
         Ok(runnables)
@@ -472,7 +475,7 @@ impl<S: 'static> Registry<S> {
             match component.validate(state) {
                 Ok(()) => outcome.validated_count += 1,
                 Err(error) => outcome.failures.push(ValidationFailure {
-                    component: name,
+                    component: Arc::from(name),
                     error: error.into_validate(name),
                 }),
             }
@@ -548,7 +551,7 @@ impl<S: 'static> Registry<S> {
             match finalizable.finalize(state).await {
                 Ok(()) => outcome.finalized_count += 1,
                 Err(error) => outcome.failures.push(FinalizeFailure {
-                    component: name,
+                    component: Arc::from(name),
                     error: error.into_finalize(name),
                 }),
             }
@@ -603,18 +606,12 @@ impl<S> Registry<S>
 where
     S: ReloadState + 'static,
 {
-    async fn reconcile_reloaded(
-        &self,
-        component: &Arc<dyn AnyComponent<S>>,
-    ) -> Result<()> {
+    async fn reconcile_reloaded(&self) -> Result<()> {
         // Registries can be used without a runtime. Scope-excluded providers
         // are configured but have no runnable entry in this process.
-        if component.clone().runnable().is_none() {
-            return Ok(());
-        }
         if let Some(manager) = self.resolve::<crate::ServiceManager>() {
-            match manager.reconcile(component.name()).await {
-                Ok(_) | Err(crate::ServiceManagerError::NotFound(_)) => {}
+            match manager.reconcile().await {
+                Ok(_) => {}
                 Err(error) => return Err(Error::msg(error.to_string())),
             }
         }
@@ -674,7 +671,7 @@ where
         if let (Some(reader), Some(prepared)) = (reader, prepared) {
             reader.confirm_applied(prepared).await?;
         }
-        self.reconcile_reloaded(&component).await?;
+        self.reconcile_reloaded().await?;
         Ok(())
     }
 
@@ -749,14 +746,14 @@ where
                     if let (Some(reader), Some(prepared)) = (reader, prepared) {
                         reader.confirm_applied(prepared).await?;
                     }
-                    self.reconcile_reloaded(&component).await?;
+                    self.reconcile_reloaded().await?;
                     Ok::<(), Error>(())
                 }
                 .await;
                 match result {
                     Ok(()) => outcome.reloaded_count += 1,
                     Err(error) => outcome.failures.push(ReloadFailure {
-                        component: name,
+                        component: Arc::from(name),
                         error: error.into_reload(name),
                     }),
                 }

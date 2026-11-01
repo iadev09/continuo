@@ -12,7 +12,7 @@ use async_trait::async_trait;
 
 use super::{
     Component, ComponentOrder, Finalizable, Registry, Reloadable, Resolve,
-    Result, Runnable,
+    Result, Runnable, RunnableInstance,
 };
 
 /// A registered component with its dependency type erased.
@@ -20,8 +20,8 @@ use super::{
 /// Every `Component<S>` implements this trait. The registry stores and hands
 /// out `Arc<dyn AnyComponent<S>>`; application code implements `Component`.
 #[async_trait]
-pub trait AnyComponent<S>: Any + Send + Sync + 'static {
-    fn name(&self) -> &'static str;
+pub trait AnyComponent<S>: Any + Send + Sync {
+    fn name(&self) -> &str;
     fn boot_priority(&self) -> Option<u8>;
     fn run_priority(&self) -> Option<u8>;
     fn order(&self) -> ComponentOrder;
@@ -47,9 +47,9 @@ pub trait AnyComponent<S>: Any + Send + Sync + 'static {
     fn as_reloadable(&self) -> Option<&dyn Reloadable<S>>;
     fn as_finalizable(&self) -> Option<&dyn Finalizable<S>>;
 
-    /// Expose the runnable without resolving dependencies. The runtime checks
+    /// Expose runnable instances without resolving dependencies. The runtime checks
     /// scope and activation policy before binding an admitted generation.
-    fn runnable(self: Arc<Self>) -> Option<Arc<dyn AnyRunnable<S>>>;
+    fn runnables(self: Arc<Self>) -> Vec<RunnableInstance<S>>;
 
     #[cfg(feature = "config")]
     fn as_configurable(&self) -> Option<&dyn congif::ConfigRegistration>;
@@ -63,7 +63,7 @@ pub trait AnyComponent<S>: Any + Send + Sync + 'static {
 
 #[async_trait]
 impl<S: Send + Sync + 'static, C: Component<S>> AnyComponent<S> for C {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         Component::name(self)
     }
 
@@ -117,10 +117,8 @@ impl<S: Send + Sync + 'static, C: Component<S>> AnyComponent<S> for C {
         Component::as_finalizable(self)
     }
 
-    fn runnable(self: Arc<Self>) -> Option<Arc<dyn AnyRunnable<S>>> {
-        let name = Component::name(self.as_ref());
-        let runnable = Component::as_runnable(self)?;
-        Some(Arc::new(Unbound { name, runnable }))
+    fn runnables(self: Arc<Self>) -> Vec<RunnableInstance<S>> {
+        Component::runnables(self)
     }
 
     #[cfg(feature = "config")]
@@ -178,8 +176,19 @@ pub trait AnyRunnable<S>: Send + Sync + 'static {
 }
 
 struct Unbound<S, D> {
-    name: &'static str,
+    name: Arc<str>,
     runnable: Arc<dyn Runnable<S, D>>,
+}
+
+pub(super) fn erase_runnable<S, D>(
+    name: Arc<str>,
+    runnable: Arc<dyn Runnable<S, D>>,
+) -> Arc<dyn AnyRunnable<S>>
+where
+    S: Send + Sync + 'static,
+    D: Resolve<S>,
+{
+    Arc::new(Unbound { name, runnable })
 }
 
 #[async_trait]
@@ -196,7 +205,7 @@ impl<S: Send + Sync + 'static, D: Resolve<S>> AnyRunnable<S> for Unbound<S, D> {
         registry: &Registry<S>,
     ) -> Result<Arc<dyn AnyRunnable<S>>> {
         let deps = D::resolve(registry)
-            .map_err(|error| error.into_dependency(self.name))?;
+            .map_err(|error| error.into_dependency(self.name.clone()))?;
         Ok(Arc::new(Bound { runnable: self.runnable.clone(), deps }))
     }
 

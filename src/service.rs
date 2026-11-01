@@ -1,9 +1,16 @@
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+mod identity;
+mod tracking;
+pub use identity::RunIdentity;
+pub(crate) use tracking::{TaskScope, run_owned};
 
 const COMMAND_CAPACITY: usize = 64;
 
@@ -54,6 +61,7 @@ impl fmt::Display for ServiceStartPolicy {
 pub struct RunContext {
     cancellation: CancellationToken,
     execution: crate::execution::ExecutionPlan,
+    tasks: Arc<TaskScope>,
 }
 
 impl RunContext {
@@ -63,29 +71,108 @@ impl RunContext {
     /// process shutdown token. The public constructor is useful to focused
     /// component harnesses that drive one [`crate::Runnable`] directly while
     /// preserving the same cancellation contract.
+    /// Tracked spawning captures the current Tokio runtime as its submission
+    /// owner; construct the context within that runtime when using tracking.
     pub fn new(cancellation: CancellationToken) -> Self {
-        Self { cancellation, execution: Default::default() }
+        Self::with_execution(cancellation, Default::default())
     }
 
     pub(crate) fn with_execution(
         cancellation: CancellationToken,
         execution: crate::execution::ExecutionPlan,
     ) -> Self {
-        Self { cancellation, execution }
+        Self { cancellation, execution, tasks: Arc::new(TaskScope::new(None)) }
+    }
+
+    pub(crate) fn for_generation(
+        cancellation: CancellationToken,
+        execution: crate::execution::ExecutionPlan,
+        instance: Arc<str>,
+        generation: u64,
+    ) -> Self {
+        Self {
+            cancellation,
+            execution,
+            tasks: Arc::new(TaskScope::new(Some(RunIdentity::new(
+                instance, generation,
+            )))),
+        }
+    }
+
+    /// Identity assigned by the runtime when this generation starts.
+    /// Clones, child contexts and tracked tasks retain it across reload and
+    /// restart. A context created directly with [`Self::new`] has no identity.
+    pub fn identity(&self) -> Option<&RunIdentity> {
+        self.tasks.identity()
     }
 
     /// Frozen requirements of this generation, not the next reload candidate.
     pub fn execution_spec(&self) -> crate::ExecutionSpec {
-        self.execution.spec
+        self.execution.spec.clone()
     }
 
     /// Own a child cancellation scope with this generation's execution policy.
     /// Cancelling the child does not cancel the parent or its other children.
     pub fn child(&self) -> Self {
-        Self::with_execution(
-            self.cancellation.child_token(),
-            self.execution.clone(),
-        )
+        Self {
+            cancellation: self.cancellation.child_token(),
+            execution: self.execution.clone(),
+            tasks: self.tasks.clone(),
+        }
+    }
+
+    /// Spawn an owned child task using this generation's prepared execution.
+    ///
+    /// The callback receives its own cancellation scope. The tracker is created
+    /// on first use. Dropping the returned handle leaves the task tracked;
+    /// service stop/restart and drain wait until it finishes. Task results and
+    /// panics are available through the handle, as with `tokio::spawn`.
+    ///
+    /// Admission fails after cancellation or execution completion. The runtime
+    /// signals cancellation but does not abort child tasks or impose a deadline.
+    ///
+    /// ```no_run
+    /// # async fn example(context: continuo::RunContext) -> continuo::Result<()> {
+    /// let task = context.spawn_tracked(|child| async move {
+    ///     child.cancelled().await;
+    ///     // Flush owned work before returning.
+    ///     Ok(())
+    /// })?;
+    /// # let _ = task;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn spawn_tracked<F, Fut>(
+        &self,
+        task: F,
+    ) -> crate::Result<JoinHandle<crate::Result<()>>>
+    where
+        F: FnOnce(Self) -> Fut,
+        Fut: Future<Output = crate::Result<()>> + Send + 'static,
+    {
+        if self.is_cancelled() {
+            return Err(crate::Error::msg("tracked task scope is cancelled"));
+        }
+        self.tasks.owner()?;
+        let registration = self.tasks.register()?;
+        let child = self.child();
+        let future = task(child.clone());
+        let spawned = self.tasks.spawn(future, child);
+        drop(registration);
+        Ok(spawned)
+    }
+
+    pub(crate) fn task_scope(&self) -> Arc<TaskScope> {
+        self.tasks.clone()
+    }
+
+    #[cfg(feature = "fleet")]
+    pub(crate) fn for_execution(&self) -> Self {
+        Self {
+            cancellation: self.cancellation.clone(),
+            execution: self.execution.clone(),
+            tasks: Arc::new(TaskScope::execution(&self.tasks)),
+        }
     }
 
     /// Prepared adapter for explicitly routing owned child work.
@@ -142,7 +229,8 @@ impl fmt::Display for ServiceStatus {
 /// Point-in-time view of a runnable service owned by the runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceSnapshot {
-    pub(crate) name: &'static str,
+    pub(crate) name: Arc<str>,
+    pub(crate) component: Arc<str>,
     pub(crate) status: ServiceStatus,
     /// Actual runnable futures, excluding the coordinating controller.
     pub(crate) active_executions: u64,
@@ -157,8 +245,13 @@ pub struct ServiceSnapshot {
 }
 
 impl ServiceSnapshot {
-    pub fn name(&self) -> &'static str {
-        self.name
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Lifecycle component that produced this runnable instance.
+    pub fn component(&self) -> &str {
+        &self.component
     }
 
     pub fn status(&self) -> ServiceStatus {
@@ -232,6 +325,7 @@ pub enum ServiceManagerError {
     Busy { name: String, status: ServiceStatus },
     ShuttingDown,
     OperationFailed { name: String, message: String },
+    InvalidDeclarations(String),
 }
 
 impl fmt::Display for ServiceManagerError {
@@ -264,6 +358,9 @@ impl fmt::Display for ServiceManagerError {
             Self::OperationFailed { name, message } => {
                 write!(f, "service '{name}' operation failed: {message}")
             }
+            Self::InvalidDeclarations(message) => {
+                write!(f, "runnable declarations rejected: {message}")
+            }
         }
     }
 }
@@ -280,7 +377,7 @@ pub(crate) enum ServiceCommand {
     Start { name: String, reply: SnapshotReply },
     Stop { name: String, reply: SnapshotReply },
     Reload { name: String, reply: SnapshotReply },
-    Reconcile { name: String, reply: SnapshotReply },
+    Reconcile { reply: ListReply },
 }
 
 /// Cloneable control handle for runnable services owned by [`crate::Runtime`].
@@ -322,11 +419,14 @@ impl ServiceManager {
 
     pub async fn start(
         &self,
-        name: impl Into<String>,
+        name: impl AsRef<str>,
     ) -> Result<ServiceSnapshot, ServiceManagerError> {
         let (reply, result) = oneshot::channel();
         self.commands
-            .send(ServiceCommand::Start { name: name.into(), reply })
+            .send(ServiceCommand::Start {
+                name: name.as_ref().to_owned(),
+                reply,
+            })
             .await
             .map_err(|_| ServiceManagerError::RuntimeUnavailable)?;
         result.await.map_err(|_| ServiceManagerError::RuntimeUnavailable)?
@@ -334,38 +434,46 @@ impl ServiceManager {
 
     pub async fn stop(
         &self,
-        name: impl Into<String>,
+        name: impl AsRef<str>,
     ) -> Result<ServiceSnapshot, ServiceManagerError> {
         let (reply, result) = oneshot::channel();
         self.commands
-            .send(ServiceCommand::Stop { name: name.into(), reply })
+            .send(ServiceCommand::Stop {
+                name: name.as_ref().to_owned(),
+                reply,
+            })
             .await
             .map_err(|_| ServiceManagerError::RuntimeUnavailable)?;
         result.await.map_err(|_| ServiceManagerError::RuntimeUnavailable)?
     }
 
-    /// Reload one runnable component and reconcile availability transitions.
+    /// Reload the instance's owning component, then reconcile its declarations.
+    /// All instances from that component share its configuration/reload hook.
     pub async fn reload(
         &self,
-        name: impl Into<String>,
+        name: impl AsRef<str>,
     ) -> Result<ServiceSnapshot, ServiceManagerError> {
         let (reply, result) = oneshot::channel();
         self.commands
-            .send(ServiceCommand::Reload { name: name.into(), reply })
+            .send(ServiceCommand::Reload {
+                name: name.as_ref().to_owned(),
+                reply,
+            })
             .await
             .map_err(|_| ServiceManagerError::RuntimeUnavailable)?;
         result.await.map_err(|_| ServiceManagerError::RuntimeUnavailable)?
     }
 
-    /// Reconcile a successfully applied external reload with its live generation.
+    /// Reconcile prepared runnable declarations with the runtime's live instances.
+    /// New automatic instances are admitted; removed instances drain before
+    /// disappearing. Replacing an active allocation requires stopping it first.
     /// Like other manager commands, this must not be awaited inside a runtime hook.
-    pub(crate) async fn reconcile(
-        &self,
-        name: &'static str,
-    ) -> Result<ServiceSnapshot, ServiceManagerError> {
+    pub async fn reconcile(
+        &self
+    ) -> Result<Vec<ServiceSnapshot>, ServiceManagerError> {
         let (reply, result) = oneshot::channel();
         self.commands
-            .send(ServiceCommand::Reconcile { name: name.into(), reply })
+            .send(ServiceCommand::Reconcile { reply })
             .await
             .map_err(|_| ServiceManagerError::RuntimeUnavailable)?;
         result.await.map_err(|_| ServiceManagerError::RuntimeUnavailable)?
@@ -374,9 +482,9 @@ impl ServiceManager {
     /// Stop the current generation completely before starting its successor.
     pub async fn restart(
         &self,
-        name: impl Into<String>,
+        name: impl AsRef<str>,
     ) -> Result<ServiceSnapshot, ServiceManagerError> {
-        let name = name.into();
+        let name = name.as_ref().to_owned();
         self.stop(name.clone()).await?;
         self.start(name).await
     }

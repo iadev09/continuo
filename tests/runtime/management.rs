@@ -73,7 +73,7 @@ impl ManagedCounter {
 #[async_trait]
 impl Component<TestState> for ManagedCounter {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "counter"
     }
 
@@ -137,7 +137,7 @@ impl Lifecycle {
 #[async_trait]
 impl Component<TestState> for Lifecycle {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "lifecycle"
     }
 
@@ -213,7 +213,7 @@ struct Invalid;
 
 impl Component<TestState> for Invalid {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "invalid"
     }
 
@@ -378,7 +378,7 @@ impl PolicyService {
 #[async_trait]
 impl Component<TestState> for PolicyService {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         self.name
     }
 

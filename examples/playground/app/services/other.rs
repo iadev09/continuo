@@ -31,7 +31,7 @@ impl Register<AppState> for OtherService {
 
 impl Component<AppState> for OtherService {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "DuplicateReaderService"
     }
     fn as_reloadable(&self) -> Option<&dyn Reloadable<AppState>> {

@@ -18,17 +18,28 @@ use crate::registry::{Error, Result};
 ///
 /// Applications supply marker types. A domain is not a component dependency,
 /// a service name, an OS thread id or a cross-process identity.
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub struct ExecutionDomain {
     id: TypeId,
-    name: &'static str,
+    type_name: &'static str,
+    instance: Option<Arc<str>>,
 }
 
 impl ExecutionDomain {
     /// Identify a domain by its marker type. Reusing the type selects the same
     /// process-local domain; different types remain independent.
     pub fn of<T: ?Sized + 'static>() -> Self {
-        Self { id: TypeId::of::<T>(), name: type_name::<T>() }
+        Self {
+            id: TypeId::of::<T>(),
+            type_name: type_name::<T>(),
+            instance: None,
+        }
+    }
+
+    /// Select a named domain within a marker type. The name is owned; it may
+    /// come from configuration and is never promoted to a static reference.
+    pub fn named<T: ?Sized + 'static>(name: impl Into<Arc<str>>) -> Self {
+        Self { instance: Some(name.into()), ..Self::of::<T>() }
     }
 }
 
@@ -37,7 +48,10 @@ impl fmt::Debug for ExecutionDomain {
         &self,
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        f.debug_tuple("ExecutionDomain").field(&self.name).finish()
+        f.debug_struct("ExecutionDomain")
+            .field("type", &self.type_name)
+            .field("instance", &self.instance)
+            .finish()
     }
 }
 
@@ -52,7 +66,7 @@ pub enum ExecutorKind {
 }
 
 /// Placement of one runnable generation, independent of fleet dispatch.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ExecutorSpec {
     /// Use the executor which starts the runnable.
@@ -107,7 +121,7 @@ pub enum SchedulingPolicy {
 /// );
 /// assert_ne!(spec, ExecutionSpec::default());
 /// ```
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct ExecutionSpec {
     /// Where this generation executes.
@@ -183,8 +197,11 @@ pub trait ExecutionDriver: Send + Sync + 'static {
 /// `tokio::spawn` does not acquire a custom poll priority automatically;
 /// adapters and hosted services must explicitly carry the execution policy
 /// into their child submissions. Continuo does not intercept Tokio spawning.
+/// `RunContext::spawn_tracked` submits through `execute_child` on this same
+/// adapter. A generation-owned executor can therefore separate root teardown
+/// from concurrent child submissions.
 pub trait PreparedExecution: Send + Sync + 'static {
-    /// Execute one owned generation with its frozen cancellation and execution
+    /// Execute the owned root generation with its frozen cancellation and execution
     /// context. If this future is dropped, retain ownership of any transferred
     /// work so [`ExecutionDriver::drain`] can reap it.
     fn execute(
@@ -192,6 +209,18 @@ pub trait PreparedExecution: Send + Sync + 'static {
         task: ExecutionFuture,
         context: RunContext,
     ) -> ExecutionFuture;
+
+    /// Submit a child using the root generation's prepared executor/scheduler.
+    /// The default supports adapters whose submissions share one lifetime.
+    /// Generation-owned adapters override this to retain their reactor until
+    /// root completion while allowing concurrent children on that reactor.
+    fn execute_child(
+        &self,
+        task: ExecutionFuture,
+        context: RunContext,
+    ) -> ExecutionFuture {
+        self.execute(task, context)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -211,7 +240,7 @@ impl ExecutionPlan {
         let driver = driver.ok_or_else(|| {
             Error::msg(format!("no execution driver is installed for {spec:?}"))
         })?;
-        Ok(Self { spec, executor: Some(driver.prepare(spec)?) })
+        Ok(Self { executor: Some(driver.prepare(spec.clone())?), spec })
     }
 }
 

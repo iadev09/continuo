@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use super::{Error, Result};
@@ -54,13 +56,13 @@ pub trait Reloadable<S>: Send + Sync {
 /// One component failure retained by a broadcast reload.
 #[derive(Debug)]
 pub struct ReloadFailure {
-    pub(super) component: &'static str,
+    pub(super) component: Arc<str>,
     pub(super) error: Error,
 }
 
 impl ReloadFailure {
-    pub fn component(&self) -> &'static str {
-        self.component
+    pub fn component(&self) -> &str {
+        &self.component
     }
 
     pub fn error(&self) -> &Error {

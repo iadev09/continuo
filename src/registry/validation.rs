@@ -1,15 +1,17 @@
+use std::sync::Arc;
+
 use super::Error;
 
 /// One component failure retained by a full validation pass.
 #[derive(Debug)]
 pub struct ValidationFailure {
-    pub(super) component: &'static str,
+    pub(super) component: Arc<str>,
     pub(super) error: Error,
 }
 
 impl ValidationFailure {
-    pub fn component(&self) -> &'static str {
-        self.component
+    pub fn component(&self) -> &str {
+        &self.component
     }
 
     pub fn error(&self) -> &Error {

@@ -80,7 +80,7 @@ impl HttpService {
 impl Component<AppState> for HttpService {
     type Deps = ();
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "HttpService"
     }
 

@@ -56,7 +56,7 @@ struct Constructor {
 #[async_trait]
 impl Component<PreparationState> for Constructor {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "constructor"
     }
 
@@ -87,7 +87,7 @@ struct LateDependency;
 #[async_trait]
 impl Component<PreparationState> for LateDependency {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "late-dependency"
     }
 
@@ -110,7 +110,7 @@ struct Consumer;
 #[async_trait]
 impl Component<PreparationState> for Consumer {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "consumer"
     }
 
@@ -176,7 +176,7 @@ struct Cleanup(Arc<Resource>);
 #[async_trait]
 impl Component<()> for Cleanup {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "cleanup"
     }
 
@@ -195,7 +195,7 @@ async fn finalization_needs_neither_a_runnable_nor_di() {
         registry
             .components()
             .iter()
-            .all(|entry| entry.clone().runnable().is_none())
+            .all(|entry| entry.clone().runnables().is_empty())
     );
     let outcome = registry.finalize_all(&()).await.unwrap();
     assert!(outcome.is_complete());

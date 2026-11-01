@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use super::{
     Bootable, ComponentOrder, Finalizable, Reloadable, Resolve, Result,
-    Runnable,
+    Runnable, RunnableInstance,
 };
 
 /// A lifecycle participant.
@@ -44,13 +44,13 @@ use super::{
 /// admitted. `Runnable::run` owns operational work and its graceful drain.
 /// `Finalizable::finalize` releases prepared, non-running resources in reverse
 /// order after runnables have drained; it is not a stop hook.
-pub trait Component<S>: Any + Send + Sync + 'static {
+pub trait Component<S>: Any + Send + Sync {
     /// What this component requires. See the trait documentation.
     type Deps: Resolve<S>;
 
-    /// Human-readable label for logs and diagnostics, and the management
-    /// name of its runnable.
-    fn name(&self) -> &'static str;
+    /// Stable lifecycle label for logs and diagnostics. The default single
+    /// runnable uses this as its management name; factories name each instance.
+    fn name(&self) -> &str;
 
     /// Boot order among components that are otherwise independent. Lower
     /// runs earlier; `None` means `priority::NORMAL`.
@@ -58,8 +58,9 @@ pub trait Component<S>: Any + Send + Sync + 'static {
         None
     }
 
-    /// Run start order among components that are otherwise independent.
-    /// Lower starts earlier; `None` means `priority::NORMAL`.
+    /// Runnable submission order among otherwise-ready components.
+    /// Lower is submitted earlier; `None` means `priority::NORMAL`.
+    /// This grants neither poll priority nor an operational readiness barrier.
     fn run_priority(&self) -> Option<u8> {
         None
     }
@@ -139,5 +140,20 @@ pub trait Component<S>: Any + Send + Sync + 'static {
         self: Arc<Self>
     ) -> Option<Arc<dyn Runnable<S, Self::Deps>>> {
         None
+    }
+
+    /// Enumerate this component's named operational instances after preparation.
+    /// The default exposes the optional single runnable under the component name.
+    /// Override to produce multiple instances from configuration; enumeration
+    /// must not bind listeners or start tasks. Retain unchanged instance handles.
+    fn runnables(self: Arc<Self>) -> Vec<RunnableInstance<S>>
+    where
+        S: Send + Sync + 'static,
+    {
+        let name: Arc<str> = self.name().into();
+        self.as_runnable()
+            .map(|runnable| RunnableInstance::new(name, runnable))
+            .into_iter()
+            .collect()
     }
 }

@@ -31,7 +31,7 @@ struct OptionalService {
 impl Component<State> for OptionalService {
     type Deps = ();
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "optional"
     }
 

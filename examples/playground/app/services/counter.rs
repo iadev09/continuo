@@ -94,7 +94,7 @@ impl Register<AppState> for CounterService {
 
 impl Component<AppState> for CounterService {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "counter"
     }
     fn as_bootable(&self) -> Option<&dyn Bootable<AppState>> {

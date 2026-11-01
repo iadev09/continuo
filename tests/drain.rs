@@ -24,7 +24,7 @@ impl SharedState for State {
 struct Fails(Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
 impl Component<State> for Fails {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "fails"
     }
     fn as_runnable(self: Arc<Self>) -> Option<Arc<dyn Runnable<State>>> {
@@ -61,7 +61,7 @@ impl Finalizable<State> for Pending {
 }
 impl Component<State> for Pending {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "pending"
     }
     fn as_finalizable(&self) -> Option<&dyn Finalizable<State>> {
@@ -123,7 +123,7 @@ struct LateFailure<const PANIC: bool>(
 );
 impl<const PANIC: bool> Component<State> for LateFailure<PANIC> {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         if PANIC { "panics" } else { "fails-later" }
     }
     fn as_runnable(self: Arc<Self>) -> Option<Arc<dyn Runnable<State>>> {

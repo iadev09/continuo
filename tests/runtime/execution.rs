@@ -44,7 +44,7 @@ impl<const ID: u8> Probe<ID> {
 
 impl<const ID: u8> Component<State> for Probe<ID> {
     type Deps = ();
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         if ID == 0 { "ambient" } else { "custom" }
     }
     fn as_runnable(self: Arc<Self>) -> Option<Arc<dyn Runnable<State>>> {
@@ -69,7 +69,7 @@ impl<const ID: u8> Runnable<State> for Probe<ID> {
         _: &State,
     ) -> ExecutionSpec {
         self.samples.fetch_add(1, Ordering::SeqCst);
-        *self.spec.lock().unwrap()
+        self.spec.lock().unwrap().clone()
     }
     async fn run(
         self: Arc<Self>,
@@ -106,6 +106,22 @@ struct ObservedExecution {
 }
 
 impl ExecutionDriver for Driver {
+    fn prepare(
+        &self,
+        spec: ExecutionSpec,
+    ) -> Result<Arc<dyn PreparedExecution>> {
+        self.prepared.lock().unwrap().push(spec.clone());
+        if self.reject {
+            return Err(Error::msg("unsupported execution policy"));
+        }
+        Ok(Arc::new(Adapter {
+            executed: self.executed.clone(),
+            contexts: self.contexts.clone(),
+            release: self.release.clone(),
+            task_finished: self.task_finished.clone(),
+        }))
+    }
+
     fn drain(&self) -> ExecutionFuture {
         let started = self.drain_started.clone();
         let release = self.drain_release.clone();
@@ -116,22 +132,6 @@ impl ExecutionDriver for Driver {
             }
             Ok(())
         })
-    }
-
-    fn prepare(
-        &self,
-        spec: ExecutionSpec,
-    ) -> Result<Arc<dyn PreparedExecution>> {
-        self.prepared.lock().unwrap().push(spec);
-        if self.reject {
-            return Err(Error::msg("unsupported execution policy"));
-        }
-        Ok(Arc::new(Adapter {
-            executed: self.executed.clone(),
-            contexts: self.contexts.clone(),
-            release: self.release.clone(),
-            task_finished: self.task_finished.clone(),
-        }))
     }
 }
 
@@ -247,8 +247,10 @@ async fn dormant_custom_generation_requires_driver_only_when_started() {
 async fn prepared_generation_keeps_frozen_spec_adapter_and_cancellation() {
     let registry = Registry::new();
     let selected = custom_spec();
-    let probe =
-        Arc::new(Probe::<1> { wait_for_cancel: true, ..Probe::new(selected) });
+    let probe = Arc::new(Probe::<1> {
+        wait_for_cancel: true,
+        ..Probe::new(selected.clone())
+    });
     registry.register(probe.clone()).unwrap();
     let driver = Arc::new(Driver::default());
     let mut runtime =
@@ -291,9 +293,10 @@ async fn prepared_generation_keeps_frozen_spec_adapter_and_cancellation() {
 async fn restart_reprepares_policy_without_rewriting_previous_context() {
     let registry = Registry::new();
     let first = custom_spec();
-    let second =
-        first.with_scheduling(SchedulingPolicy::Priority(PollPriority::Low));
-    let probe = Arc::new(Probe::<1>::new(first));
+    let second = first
+        .clone()
+        .with_scheduling(SchedulingPolicy::Priority(PollPriority::Low));
+    let probe = Arc::new(Probe::<1>::new(first.clone()));
     registry.register(probe.clone()).unwrap();
     let driver = Arc::new(Driver::default());
     let mut runtime =
@@ -301,10 +304,13 @@ async fn restart_reprepares_policy_without_rewriting_previous_context() {
     runtime.spawn_all(&registry, State::default()).unwrap();
     let joined = runtime.join_set.join_next_with_id().await.unwrap();
     runtime.complete_join(joined).unwrap();
-    *probe.spec.lock().unwrap() = second;
+    *probe.spec.lock().unwrap() = second.clone();
     runtime.start_generation("custom", false).unwrap();
     runtime.drain().await.unwrap();
-    assert_eq!(*driver.prepared.lock().unwrap(), vec![first, second]);
+    assert_eq!(
+        *driver.prepared.lock().unwrap(),
+        vec![first.clone(), second.clone()]
+    );
     let seen = probe.seen.lock().unwrap();
     assert_eq!(seen[0].execution_spec(), first);
     assert_eq!(seen[1].execution_spec(), second);
@@ -404,7 +410,7 @@ async fn execution_finalization_follows_failed_provider_cleanup() {
     struct Provider(Arc<Mutex<Vec<&'static str>>>);
     impl Component<RegisteredState> for Provider {
         type Deps = ();
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "resource-owner"
         }
         fn as_finalizable(

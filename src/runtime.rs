@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,6 +9,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error};
 
 use crate::execution::{ExecutionDriver, ExecutionPlan};
+mod instances;
+
+#[cfg(test)]
+#[path = "../tests/runtime/instances.rs"]
+mod instance_tests;
 #[cfg(feature = "registry")]
 use crate::registry::FinalizeOutcome;
 use crate::registry::{AnyComponent, AnyRunnable, Error, Registry, Result};
@@ -64,15 +70,16 @@ mod config_reload_tests;
 mod preparation_tests;
 
 struct ServiceExit {
-    name: &'static str,
+    name: Arc<str>,
     generation: u64,
     result: Result<()>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct TaskIdentity {
-    name: &'static str,
+    name: Arc<str>,
     generation: u64,
+    tasks: Arc<crate::service::TaskScope>,
 }
 
 struct AdmittedGeneration<S> {
@@ -83,6 +90,8 @@ struct AdmittedGeneration<S> {
 struct ServiceEntry<S> {
     component: Arc<dyn AnyComponent<S>>,
     runnable: Arc<dyn AnyRunnable<S>>,
+    identity: Arc<dyn Any + Send + Sync>,
+    retiring: bool,
     status: ServiceStatus,
     active_executions: Arc<AtomicU64>,
     #[cfg(feature = "fleet")]
@@ -101,16 +110,21 @@ struct ServiceEntry<S> {
 impl<S: 'static> ServiceEntry<S> {
     fn snapshot(
         &self,
-        name: &'static str,
+        name: &str,
         state: &S,
     ) -> ServiceSnapshot {
         ServiceSnapshot {
-            name,
+            name: Arc::from(name),
+            component: Arc::from(self.component.name()),
             status: self.status,
             active_executions: self.active_executions.load(Ordering::SeqCst),
             #[cfg(feature = "fleet")]
             dispatch: self.dispatch,
-            start_policy: self.runnable.start_policy(state),
+            start_policy: if self.retiring {
+                ServiceStartPolicy::Unavailable
+            } else {
+                self.runnable.start_policy(state)
+            },
             reloadable: self.component.as_reloadable().is_some(),
             generation: self.generation,
             last_error: self.last_error.clone(),
@@ -128,7 +142,8 @@ impl<S: 'static> ServiceEntry<S> {
 pub struct Runtime<S> {
     join_set: JoinSet<ServiceExit>,
     task_identities: HashMap<Id, TaskIdentity>,
-    services: HashMap<&'static str, ServiceEntry<S>>,
+    draining_tasks: Vec<Arc<crate::service::TaskScope>>,
+    services: HashMap<Arc<str>, ServiceEntry<S>>,
     state: Option<S>,
     registry: Option<Registry<S>>,
     manager: Arc<ServiceManager>,
@@ -152,6 +167,7 @@ impl<S> Default for Runtime<S> {
         Self {
             join_set: JoinSet::new(),
             task_identities: HashMap::new(),
+            draining_tasks: Vec::new(),
             services: HashMap::new(),
             state: None,
             registry: None,
@@ -491,8 +507,8 @@ where
             .collect();
         let mut names = HashSet::with_capacity(runnables.len());
         for entry in &runnables {
-            if !names.insert(entry.name) {
-                let name = entry.name;
+            if !names.insert(entry.name.clone()) {
+                let name = &entry.name;
                 return Err(Error::msg(format!(
                     "duplicate runnable service name '{name}'"
                 )));
@@ -506,35 +522,7 @@ where
             .map(|entry| {
                 let policy = entry.runnable.start_policy(&state);
                 let bound = if policy == ServiceStartPolicy::Automatic {
-                    #[cfg(feature = "fleet")]
-                    if let Some(placement) = entry.component.as_dispatched()
-                        && placement.dispatch().is_controller_driven()
-                    {
-                        let dispatcher =
-                            self.dispatcher.as_ref().ok_or_else(|| {
-                                Error::msg(format!(
-                                    "service '{}' requires a fleet dispatcher",
-                                    entry.name
-                                ))
-                            })?;
-                        dispatcher.validate(
-                            &crate::fleet::DispatchRequest {
-                                name: entry.name,
-                                generation: 1,
-                                scope: placement.scope(),
-                                dispatch: placement.dispatch(),
-                                policy: placement.dispatch_policy(),
-                            },
-                            &state,
-                        )?;
-                    }
-                    let runnable = entry.runnable.clone().bind(registry)?;
-                    let execution = ExecutionPlan::prepare(
-                        entry.runnable.execution_spec(&state),
-                        self.execution_driver.as_deref(),
-                    )
-                    .map_err(|error| error.into_run(entry.name))?;
-                    Some(AdmittedGeneration { runnable, execution })
+                    Some(self.admit_instance(&entry, registry, &state)?)
                 } else {
                     None
                 };
@@ -554,10 +542,12 @@ where
                 .map(|placement| placement.dispatch())
                 .unwrap_or_default();
             self.services.insert(
-                name,
+                name.clone(),
                 ServiceEntry {
                     component: entry.component,
                     runnable: entry.runnable,
+                    identity: entry.identity,
+                    retiring: false,
                     status: ServiceStatus::Stopped,
                     active_executions: Arc::new(AtomicU64::new(0)),
                     #[cfg(feature = "fleet")]
@@ -577,7 +567,7 @@ where
                 // but before runnable submission. Submit the initial generation
                 // even with an already-cancelled parent so each runnable can
                 // perform its own no-new-work/final-drain path.
-                self.start_admitted_generation(name, true, bound)?;
+                self.start_admitted_generation(&name, true, bound)?;
             }
         }
 
@@ -586,7 +576,7 @@ where
 
     fn reconcile_start_policy(
         &mut self,
-        name: &'static str,
+        name: &str,
     ) -> Result<ServiceSnapshot> {
         let state = self.state.as_ref().expect("runtime state is initialized");
         let service =
@@ -623,7 +613,7 @@ where
 
     fn start_generation(
         &mut self,
-        name: &'static str,
+        name: &str,
         allow_cancelled_parent: bool,
     ) -> Result<ServiceSnapshot> {
         self.start_admitted_generation(name, allow_cancelled_parent, None)
@@ -631,7 +621,7 @@ where
 
     fn start_admitted_generation(
         &mut self,
-        name: &'static str,
+        name: &str,
         allow_cancelled_parent: bool,
         bound: Option<AdmittedGeneration<S>>,
     ) -> Result<ServiceSnapshot> {
@@ -648,6 +638,11 @@ where
         let service = self.services.get_mut(name).ok_or_else(|| {
             Error::msg(format!("runnable service '{name}' is not registered"))
         })?;
+        if service.retiring {
+            return Err(Error::msg(format!(
+                "runnable service '{name}' is retiring"
+            )));
+        }
         // Initial automatic activation was already decided during preflight.
         // Explicit starts and restarts consult the current policy instead.
         if bound.is_none()
@@ -666,7 +661,7 @@ where
         let dispatch = match service.component.as_dispatched() {
             Some(placement) if placement.dispatch().is_controller_driven() => {
                 let request = crate::fleet::DispatchRequest {
-                    name,
+                    name: Arc::from(name),
                     generation,
                     scope: placement.scope(),
                     dispatch: placement.dispatch(),
@@ -721,46 +716,54 @@ where
         service.cancellation = Some(cancellation.clone());
         let snapshot = service.snapshot(name, &state);
 
+        let generation_name: Arc<str> = Arc::from(name);
+        let context = RunContext::for_generation(
+            cancellation,
+            execution,
+            generation_name.clone(),
+            generation,
+        );
+        let tasks = context.task_scope();
+        let identity_name = generation_name.clone();
         let abort = self.join_set.spawn(
             async move {
-                let context = RunContext::with_execution(cancellation, execution);
                 let adapter = context.execution_executor().cloned()
                     .map(|executor| (executor, context.clone()));
                 let task = async move {
                     #[cfg(feature = "fleet")]
                     if let Some((dispatcher, request)) = dispatch {
-                        dispatcher
-                            .run(
+                        crate::service::run_owned(context.clone(), dispatcher.run(
                                 request,
                                 crate::fleet::ServiceExecution::new(
                                     runnable, state, active_executions,
                                 ),
                                 context,
-                            )
-                            .await
+                            )).await
                     } else {
                         let _execution = crate::service::ExecutionGuard::enter(&active_executions);
-                        runnable.run(state, context).await
+                        crate::service::run_owned(context.clone(), runnable.run(state, context)).await
                     }
                     #[cfg(not(feature = "fleet"))]
                     {
                         let _execution = crate::service::ExecutionGuard::enter(&active_executions);
-                        runnable.run(state, context).await
+                        crate::service::run_owned(context.clone(), runnable.run(state, context)).await
                     }
                 };
                 let result = match adapter {
                     Some((executor, context)) => executor.execute(Box::pin(task), context).await,
                     None => task.await,
                 };
-                let result = result.map_err(|e| e.into_run(name));
-                ServiceExit { name, generation, result }
+                let result = result.map_err(|e| e.into_run(generation_name.clone()));
+                ServiceExit { name: generation_name, generation, result }
             }
             .instrument(
                 tracing::debug_span!("component", component = %name, generation),
             ),
         );
-        self.task_identities
-            .insert(abort.id(), TaskIdentity { name, generation });
+        self.task_identities.insert(
+            abort.id(),
+            TaskIdentity { name: identity_name, generation, tasks },
+        );
 
         Ok(snapshot)
     }
@@ -775,7 +778,7 @@ where
             .iter()
             .map(|(name, service)| service.snapshot(name, state))
             .collect::<Vec<_>>();
-        snapshots.sort_by_key(|snapshot| snapshot.name());
+        snapshots.sort_by(|left, right| left.name().cmp(right.name()));
         snapshots
     }
 
@@ -814,18 +817,21 @@ where
                 let _ = reply.send(Ok(self.snapshots()));
             }
             ServiceCommand::Start { name, reply } => {
-                let Some(static_name) =
-                    self.services.get_key_value(name.as_str()).map(|(n, _)| *n)
+                let Some(service_name) = self
+                    .services
+                    .get_key_value(name.as_str())
+                    .map(|(n, _)| n.clone())
                 else {
                     let _ =
                         reply.send(Err(ServiceManagerError::NotFound(name)));
                     return;
                 };
 
-                let status = self.services[static_name].status;
+                let service_name = service_name.as_ref();
+                let status = self.services[service_name].status;
                 let state =
                     self.state.as_ref().expect("runtime state is initialized");
-                if self.services[static_name].runnable.start_policy(state)
+                if self.services[service_name].runnable.start_policy(state)
                     == ServiceStartPolicy::Unavailable
                 {
                     let _ =
@@ -834,8 +840,8 @@ where
                 }
                 match status {
                     ServiceStatus::Running => {
-                        let _ = reply.send(Ok(self.services[static_name]
-                            .snapshot(static_name, state)));
+                        let _ = reply.send(Ok(self.services[service_name]
+                            .snapshot(service_name, state)));
                     }
                     ServiceStatus::Stopping => {
                         let _ = reply.send(Err(ServiceManagerError::Busy {
@@ -845,7 +851,7 @@ where
                     }
                     ServiceStatus::Stopped | ServiceStatus::Failed => {
                         let result =
-                            self.start_generation(static_name, false).map_err(
+                            self.start_generation(service_name, false).map_err(
                                 |error| ServiceManagerError::OperationFailed {
                                     name,
                                     message: error.to_string(),
@@ -856,17 +862,20 @@ where
                 }
             }
             ServiceCommand::Stop { name, reply } => {
-                let Some(static_name) =
-                    self.services.get_key_value(name.as_str()).map(|(n, _)| *n)
+                let Some(service_name) = self
+                    .services
+                    .get_key_value(name.as_str())
+                    .map(|(n, _)| n.clone())
                 else {
                     let _ =
                         reply.send(Err(ServiceManagerError::NotFound(name)));
                     return;
                 };
 
+                let service_name = service_name.as_ref();
                 let service = self
                     .services
-                    .get_mut(static_name)
+                    .get_mut(service_name)
                     .expect("service key just resolved");
                 service.start_after_drain = false;
                 match service.status {
@@ -884,20 +893,23 @@ where
                             .as_ref()
                             .expect("runtime state is initialized");
                         let _ = reply
-                            .send(Ok(service.snapshot(static_name, state)));
+                            .send(Ok(service.snapshot(service_name, state)));
                     }
                 }
             }
             ServiceCommand::Reload { name, reply } => {
-                let Some(static_name) =
-                    self.services.get_key_value(name.as_str()).map(|(n, _)| *n)
+                let Some(service_name) = self
+                    .services
+                    .get_key_value(name.as_str())
+                    .map(|(n, _)| n.clone())
                 else {
                     let _ =
                         reply.send(Err(ServiceManagerError::NotFound(name)));
                     return;
                 };
 
-                let status = self.services[static_name].status;
+                let service_name = service_name.as_ref();
+                let status = self.services[service_name].status;
                 if status == ServiceStatus::Stopping {
                     let _ = reply
                         .send(Err(ServiceManagerError::Busy { name, status }));
@@ -909,13 +921,13 @@ where
                         .send(Err(ServiceManagerError::RuntimeUnavailable));
                     return;
                 };
-                let component = self.services[static_name].component.clone();
+                let component = self.services[service_name].component.clone();
                 let Some(reloadable) = component.as_reloadable() else {
                     let _ = reply
                         .send(Err(ServiceManagerError::NotReloadable(name)));
                     return;
                 };
-                let next_revision = match self.services[static_name]
+                let next_revision = match self.services[service_name]
                     .reload_revision
                     .checked_add(1)
                 {
@@ -945,23 +957,25 @@ where
                     reloadable.reload(&state).await
                 };
                 let reload = reload.map_err(|error: Error| {
-                    error.into_reload(static_name).to_string()
+                    error.into_reload(service_name).to_string()
                 });
                 let service = self
                     .services
-                    .get_mut(static_name)
+                    .get_mut(service_name)
                     .expect("service key remains registered during reload");
                 service.reload_revision = next_revision;
                 let result = match reload {
                     Ok(()) => {
                         service.last_reload_error = None;
-                        self.reconcile_start_policy(static_name).map_err(
+                        self.reconcile_instances().and_then(|_| {
+                            self.services.get(service_name).map(|service| service.snapshot(service_name, &state))
+                                .ok_or_else(|| Error::msg(format!("runnable service '{service_name}' was removed")))
+                        }).map_err(
                             |error| {
                                 let message = error.to_string();
-                                self.services
-                                    .get_mut(static_name)
-                                    .unwrap()
-                                    .last_reload_error = Some(message.clone());
+                                if let Some(service) = self.services.get_mut(service_name) {
+                                    service.last_reload_error = Some(message.clone());
+                                }
                                 ServiceManagerError::OperationFailed {
                                     name,
                                     message,
@@ -979,18 +993,10 @@ where
                 };
                 let _ = reply.send(result);
             }
-            ServiceCommand::Reconcile { name, reply } => {
-                let result = match self.services.get_key_value(name.as_str()) {
-                    Some((&static_name, _)) => {
-                        self.reconcile_start_policy(static_name).map_err(
-                            |error| ServiceManagerError::OperationFailed {
-                                name,
-                                message: error.to_string(),
-                            },
-                        )
-                    }
-                    None => Err(ServiceManagerError::NotFound(name)),
-                };
+            ServiceCommand::Reconcile { reply } => {
+                let result = self.reconcile_instances().map_err(|error| {
+                    ServiceManagerError::InvalidDeclarations(error.to_string())
+                });
                 let _ = reply.send(result);
             }
         }
@@ -1001,13 +1007,13 @@ where
         error: ServiceManagerError,
     ) {
         match command {
-            ServiceCommand::List { reply } => {
+            ServiceCommand::List { reply }
+            | ServiceCommand::Reconcile { reply } => {
                 let _ = reply.send(Err(error));
             }
             ServiceCommand::Start { reply, .. }
             | ServiceCommand::Stop { reply, .. }
-            | ServiceCommand::Reload { reply, .. }
-            | ServiceCommand::Reconcile { reply, .. } => {
+            | ServiceCommand::Reload { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
         }
@@ -1038,7 +1044,7 @@ where
         exit: ServiceExit,
     ) -> Result<()> {
         let state = self.state.as_ref().expect("runtime state is initialized");
-        let Some(service) = self.services.get_mut(exit.name) else {
+        let Some(service) = self.services.get_mut(exit.name.as_ref()) else {
             return Err(Error::msg(format!(
                 "completed runnable service '{}' is not registered",
                 exit.name
@@ -1052,16 +1058,17 @@ where
         }
 
         service.cancellation = None;
-        match exit.result {
+        let retiring = service.retiring;
+        let result = match exit.result {
             Ok(()) => {
                 service.status = ServiceStatus::Stopped;
                 service.last_error = None;
-                let snapshot = service.snapshot(exit.name, state);
+                let snapshot = service.snapshot(&exit.name, state);
                 for waiter in service.stop_waiters.drain(..) {
                     let _ = waiter.send(Ok(snapshot.clone()));
                 }
                 debug!(
-                    component = exit.name,
+                    component = %exit.name,
                     generation = exit.generation,
                     "runnable stopped"
                 );
@@ -1071,18 +1078,19 @@ where
                     && !self.shutting_down
                     && !state.is_shutting_down();
                 if restart
-                    && let Err(error) = self.start_generation(exit.name, false)
+                    && let Err(error) = self.start_generation(&exit.name, false)
                 {
                     // Deferred admission is still a reload operation. Report
                     // failure on this service, not as a fatal runnable exit.
                     let message = error.to_string();
-                    let service = self.services.get_mut(exit.name).unwrap();
+                    let service =
+                        self.services.get_mut(exit.name.as_ref()).unwrap();
                     service.status = ServiceStatus::Failed;
                     service.last_error = Some(message.clone());
                     service.last_reload_error = Some(message);
                     service.applied_start_policy =
                         ServiceStartPolicy::Unavailable;
-                    error!(component = exit.name, %error, "reloaded service activation failed");
+                    error!(component = %exit.name, %error, "reloaded service activation failed");
                 }
                 Ok(())
             }
@@ -1093,7 +1101,7 @@ where
                 for waiter in service.stop_waiters.drain(..) {
                     let _ = waiter.send(Err(
                         ServiceManagerError::OperationFailed {
-                            name: exit.name.to_owned(),
+                            name: exit.name.to_string(),
                             message: message.clone(),
                         },
                     ));
@@ -1107,7 +1115,11 @@ where
                     fatal => Err(fatal),
                 }
             }
+        };
+        if retiring {
+            self.services.remove(exit.name.as_ref());
         }
+        result
     }
 
     fn complete_join(
@@ -1122,19 +1134,31 @@ where
             Err(join_error) => {
                 if let Some(identity) =
                     self.task_identities.remove(&join_error.id())
-                    && let Some(service) = self.services.get_mut(identity.name)
-                    && service.generation == identity.generation
                 {
-                    let message = join_error.to_string();
-                    service.status = ServiceStatus::Failed;
-                    service.last_error = Some(message.clone());
-                    for waiter in service.stop_waiters.drain(..) {
-                        let _ = waiter.send(Err(
-                            ServiceManagerError::OperationFailed {
-                                name: identity.name.to_owned(),
-                                message: message.clone(),
-                            },
-                        ));
+                    identity.tasks.close();
+                    self.draining_tasks.push(identity.tasks);
+                    if let Some(service) =
+                        self.services.get_mut(identity.name.as_ref())
+                        && service.generation == identity.generation
+                    {
+                        let message = join_error.to_string();
+                        service.status = ServiceStatus::Failed;
+                        if let Some(cancellation) = service.cancellation.take()
+                        {
+                            cancellation.cancel();
+                        }
+                        service.last_error = Some(message.clone());
+                        for waiter in service.stop_waiters.drain(..) {
+                            let _ = waiter.send(Err(
+                                ServiceManagerError::OperationFailed {
+                                    name: identity.name.to_string(),
+                                    message: message.clone(),
+                                },
+                            ));
+                        }
+                        if service.retiring {
+                            self.services.remove(identity.name.as_ref());
+                        }
                     }
                 }
                 Err(join_error.into())
@@ -1222,15 +1246,29 @@ where
         };
         for component in components {
             let name = component.name();
+            let managed_name = self
+                .services
+                .iter()
+                .filter(|(_, service)| {
+                    !service.retiring
+                        && service.status != ServiceStatus::Stopping
+                        && Arc::ptr_eq(&service.component, &component)
+                })
+                .min_by(|(left, _), (right, _)| left.cmp(right))
+                .map(|(key, _)| key.clone());
+            let managed_reload =
+                component.as_reloadable().is_some() && managed_name.is_some();
             let result = if component.as_reloadable().is_some()
-                && self.services.get(name).is_some_and(|service| {
-                    Arc::ptr_eq(&service.component, &component)
-                }) {
+                && let Some(instance_name) = managed_name
+            {
                 let (reply, received) = oneshot::channel();
                 // Already inside the runtime loop: call the command handler,
                 // never enqueue a manager command and await ourselves.
                 self.handle_prepared_command(
-                    ServiceCommand::Reload { name: name.into(), reply },
+                    ServiceCommand::Reload {
+                        name: instance_name.to_string(),
+                        reply,
+                    },
                     true,
                 )
                 .await;
@@ -1257,6 +1295,9 @@ where
             if let Err(error) = result {
                 error!(component = name, %error, "configuration reload rejected");
                 continue;
+            }
+            if !managed_reload && let Err(error) = self.reconcile_instances() {
+                error!(component = name, %error, "runnable declarations rejected after configuration reload");
             }
             // A reloaded configuration may declare programs differently.
             if let (Some(state), Some(environmental)) =
@@ -1289,10 +1330,18 @@ where
         while let Some(joined) = self.join_set.join_next_with_id().await {
             match joined {
                 Ok((id, _)) => {
-                    self.task_identities.remove(&id);
+                    if let Some(identity) = self.task_identities.remove(&id) {
+                        identity.tasks.close();
+                        self.draining_tasks.push(identity.tasks);
+                    }
                 }
                 Err(error) => {
-                    self.task_identities.remove(&error.id());
+                    if let Some(identity) =
+                        self.task_identities.remove(&error.id())
+                    {
+                        identity.tasks.close();
+                        self.draining_tasks.push(identity.tasks);
+                    }
                 }
             }
         }
@@ -1300,6 +1349,9 @@ where
             && let Err(error) = driver.drain().await
         {
             error!(%error, "execution driver failed during forced drain");
+        }
+        for tasks in self.draining_tasks.drain(..) {
+            tasks.wait().await;
         }
         debug!("runtime aborted and drained remaining runnable tasks");
     }
@@ -1325,6 +1377,9 @@ where
             error!(%error, "execution driver failed during drain");
             first_error.get_or_insert(error);
         }
+        for tasks in self.draining_tasks.drain(..) {
+            tasks.wait().await;
+        }
         debug!("runtime drained remaining runnable tasks");
         first_error.map_or(Ok(()), Err)
     }
@@ -1334,7 +1389,7 @@ where
     /// I/O resources can still depend on a shared executor during finalization.
     /// No later runnable generation may be admitted.
     pub async fn finalize_execution(&mut self) -> Result<()> {
-        if !self.join_set.is_empty() {
+        if !self.join_set.is_empty() || !self.draining_tasks.is_empty() {
             return Err(Error::msg(
                 "drain runnable tasks before finalizing execution",
             ));
@@ -1358,6 +1413,10 @@ mod admission_tests;
 #[cfg(test)]
 #[path = "../tests/runtime/execution.rs"]
 mod execution_tests;
+
+#[cfg(test)]
+#[path = "../tests/runtime/tracking.rs"]
+mod tracking_tests;
 
 #[cfg(test)]
 #[path = "../tests/runtime/reload_activation.rs"]

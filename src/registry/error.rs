@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 // =====================================================================
 // Error model
 // =====================================================================
@@ -30,30 +32,30 @@ pub enum Error {
     /// `validate_all` reported failures; nothing was started.
     Invalid(super::ValidationOutcome),
     Boot {
-        name: &'static str,
+        name: Arc<str>,
         source: BoxError,
     },
     Validate {
-        name: &'static str,
+        name: Arc<str>,
         source: BoxError,
     },
     Reload {
-        name: &'static str,
+        name: Arc<str>,
         source: BoxError,
     },
     Finalize {
-        name: &'static str,
+        name: Arc<str>,
         source: BoxError,
     },
     /// A dependency named by the component's `Deps` could not be resolved.
     Dependency {
-        name: &'static str,
+        name: Arc<str>,
         source: BoxError,
     },
     /// Fatal runnable failure (default). The runtime tears the worker
     /// down so the supervisor can respawn cleanly.
     Run {
-        name: &'static str,
+        name: Arc<str>,
         source: BoxError,
     },
     /// Recoverable runnable failure. The runtime logs and keeps the
@@ -61,7 +63,7 @@ pub enum Error {
     /// listeners, optional integrations) where a transient or
     /// configuration-driven failure shouldn't kill traffic.
     Recoverable {
-        name: &'static str,
+        name: Arc<str>,
         source: BoxError,
     },
     Other(BoxError),
@@ -218,62 +220,70 @@ impl Error {
     /// attach lifecycle context to anonymous user errors.
     pub(super) fn into_boot(
         self,
-        name: &'static str,
+        name: impl Into<Arc<str>>,
     ) -> Self {
         match self {
-            Error::Other(source) => Error::Boot { name, source },
+            Error::Other(source) => Error::Boot { name: name.into(), source },
             other => other,
         }
     }
     pub(super) fn into_validate(
         self,
-        name: &'static str,
+        name: impl Into<Arc<str>>,
     ) -> Self {
         match self {
-            Error::Other(source) => Error::Validate { name, source },
+            Error::Other(source) => {
+                Error::Validate { name: name.into(), source }
+            }
             other => other,
         }
     }
     /// Attach component identity to an anonymous reload error.
     pub(crate) fn into_reload(
         self,
-        name: &'static str,
+        name: impl Into<Arc<str>>,
     ) -> Self {
         match self {
-            Error::Other(source) => Error::Reload { name, source },
+            Error::Other(source) => Error::Reload { name: name.into(), source },
             other => other,
         }
     }
     /// Attach the dependent component's identity to a resolution error.
     pub(super) fn into_dependency(
         self,
-        name: &'static str,
+        name: impl Into<Arc<str>>,
     ) -> Self {
         match self {
-            Error::Other(source) => Error::Dependency { name, source },
+            Error::Other(source) => {
+                Error::Dependency { name: name.into(), source }
+            }
             other => other,
         }
     }
     pub(super) fn into_finalize(
         self,
-        name: &'static str,
+        name: impl Into<Arc<str>>,
     ) -> Self {
         match self {
-            Error::Other(source) => Error::Finalize { name, source },
+            Error::Other(source) => {
+                Error::Finalize { name: name.into(), source }
+            }
             other => other,
         }
     }
     pub(crate) fn into_run(
         self,
-        name: &'static str,
+        name: impl Into<Arc<str>>,
     ) -> Self {
         match self {
-            Error::Other(source) => Error::Run { name, source },
+            Error::Other(source) => Error::Run { name: name.into(), source },
             // Runnables that opt into recoverable failure construct
             // `Recoverable` with an empty `name`; `run_all` fills in the
             // component name here so log lines stay attributed.
-            Error::Recoverable { name: "", source } => {
-                Error::Recoverable { name, source }
+            Error::Recoverable { name: existing, source }
+                if existing.is_empty() =>
+            {
+                Error::Recoverable { name: name.into(), source }
             }
             other => other,
         }
@@ -295,6 +305,9 @@ impl Error {
             }
         }
         impl std::error::Error for MsgErr {}
-        Error::Recoverable { name: "", source: Box::new(MsgErr(s.into())) }
+        Error::Recoverable {
+            name: Arc::from(""),
+            source: Box::new(MsgErr(s.into())),
+        }
     }
 }
