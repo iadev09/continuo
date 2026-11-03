@@ -149,6 +149,11 @@ impl<S: Send + Sync + 'static, C: Component<S>> AnyComponent<S> for C {
 /// dependencies. Fleet dispatch clones that bound execution, not the registry.
 #[async_trait]
 pub trait AnyRunnable<S>: Send + Sync + 'static {
+    /// Instance-owned targeted reload, independent of its producing component.
+    fn as_reloadable(&self) -> Option<&dyn Reloadable<S>> {
+        None
+    }
+
     /// Execution requirements for the next admitted generation.
     fn execution_spec(
         &self,
@@ -193,6 +198,10 @@ where
 
 #[async_trait]
 impl<S: Send + Sync + 'static, D: Resolve<S>> AnyRunnable<S> for Unbound<S, D> {
+    fn as_reloadable(&self) -> Option<&dyn Reloadable<S>> {
+        self.runnable.as_reloadable()
+    }
+
     fn execution_spec(
         &self,
         state: &S,
@@ -235,6 +244,10 @@ struct Bound<S, D> {
 
 #[async_trait]
 impl<S: Send + Sync + 'static, D: Resolve<S>> AnyRunnable<S> for Bound<S, D> {
+    fn as_reloadable(&self) -> Option<&dyn Reloadable<S>> {
+        self.runnable.as_reloadable()
+    }
+
     fn execution_spec(
         &self,
         state: &S,

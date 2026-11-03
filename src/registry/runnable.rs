@@ -23,6 +23,16 @@ use super::Result;
 /// whole-process shutdown.
 #[async_trait]
 pub trait Runnable<S, D = ()>: Any + Send + Sync {
+    /// Optional reload owned by this operational instance.
+    ///
+    /// A targeted manager reload calls this capability instead of the factory's
+    /// component hook. The instance owns preparation and application of its
+    /// inputs. Component-wide reloads and configuration notifications retain
+    /// the component's lifecycle/configuration contract.
+    fn as_reloadable(&self) -> Option<&dyn super::Reloadable<S>> {
+        None
+    }
+
     /// Executor placement and poll scheduling for the next generation.
     ///
     /// The default preserves ambient Tokio execution. Override only when an

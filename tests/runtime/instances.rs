@@ -5,6 +5,7 @@ use crate::{
     ExecutorSpec, PreparedExecution,
 };
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Mutex, RwLock, Weak};
 use tokio::sync::Notify;
 
@@ -23,10 +24,17 @@ struct Work {
     release: Option<Arc<Notify>>,
     contexts: Mutex<Vec<RunContext>>,
     execution: ExecutionSpec,
+    own_reload: bool,
+    reloads: AtomicUsize,
+    reject_reload: AtomicBool,
 }
 
 #[async_trait]
 impl Runnable<State> for Work {
+    fn as_reloadable(&self) -> Option<&dyn crate::Reloadable<State>> {
+        self.own_reload.then_some(self)
+    }
+
     fn execution_spec(
         &self,
         _: &State,
@@ -47,6 +55,20 @@ impl Runnable<State> for Work {
         if let Some(release) = &self.release {
             release.notified().await;
         }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl crate::Reloadable<State> for Work {
+    async fn reload(
+        &self,
+        _: &State,
+    ) -> Result<()> {
+        if self.reject_reload.load(Ordering::Relaxed) {
+            return Err(Error::msg("instance preparation rejected"));
+        }
+        self.reloads.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -115,13 +137,16 @@ async fn each_instance_selects_its_own_execution_spec() {
 }
 
 #[derive(Default)]
-struct Factory(RwLock<Vec<RunnableInstance<State>>>);
+struct Factory {
+    instances: RwLock<Vec<RunnableInstance<State>>>,
+    reloads: AtomicUsize,
+}
 impl Factory {
     fn set(
         &self,
         instances: Vec<RunnableInstance<State>>,
     ) {
-        *self.0.write().unwrap() = instances;
+        *self.instances.write().unwrap() = instances;
     }
 }
 impl Component<State> for Factory {
@@ -130,7 +155,21 @@ impl Component<State> for Factory {
         "factory"
     }
     fn runnables(self: Arc<Self>) -> Vec<RunnableInstance<State>> {
-        self.0.read().unwrap().clone()
+        self.instances.read().unwrap().clone()
+    }
+    fn as_reloadable(&self) -> Option<&dyn crate::Reloadable<State>> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl crate::Reloadable<State> for Factory {
+    async fn reload(
+        &self,
+        _: &State,
+    ) -> Result<()> {
+        self.reloads.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -139,6 +178,61 @@ fn setup() -> (Registry<State>, Arc<Factory>, State, Runtime<State>) {
     let factory = Arc::new(Factory::default());
     registry.register(factory.clone()).unwrap();
     (registry, factory, State::default(), Runtime::default())
+}
+
+#[tokio::test]
+async fn targeted_instance_reload_retains_factory_fallback_and_isolates_failure()
+ {
+    let (registry, factory, state, mut runtime) = setup();
+    let first = Arc::new(Work { own_reload: true, ..Default::default() });
+    let second = Arc::new(Work::default());
+    factory.set(vec![
+        RunnableInstance::new("first", first.clone()),
+        RunnableInstance::new("second", second.clone()),
+    ]);
+    runtime.spawn_all(&registry, state.clone()).unwrap();
+    first.entered.notified().await;
+    second.entered.notified().await;
+
+    // A source notification remains a component-wide operation, even when
+    // its selected management entry also has an instance reload capability.
+    let (reply, result) = oneshot::channel();
+    runtime
+        .handle_prepared_command(
+            ServiceCommand::Reload { name: "first".into(), reply },
+            true,
+        )
+        .await;
+    result.await.unwrap().unwrap();
+    assert_eq!(factory.reloads.load(Ordering::Relaxed), 1);
+    assert_eq!(first.reloads.load(Ordering::Relaxed), 0);
+
+    let manager = runtime.manager();
+    let observing = state.clone();
+    let running = tokio::spawn(async move {
+        runtime.wait_until_shutdown(&observing).await.unwrap();
+        runtime.drain().await.unwrap();
+    });
+    let reloaded = manager.reload("first").await.unwrap();
+    assert!(reloaded.is_reloadable());
+    assert_eq!(reloaded.generation(), 1);
+    assert_eq!(first.reloads.load(Ordering::Relaxed), 1);
+    assert_eq!(factory.reloads.load(Ordering::Relaxed), 1);
+    manager.reload("second").await.unwrap();
+    assert_eq!(factory.reloads.load(Ordering::Relaxed), 2);
+    assert_eq!(second.reloads.load(Ordering::Relaxed), 0);
+
+    first.reject_reload.store(true, Ordering::Relaxed);
+    assert!(matches!(
+        manager.reload("first").await,
+        Err(ServiceManagerError::OperationFailed { .. })
+    ));
+    assert_eq!(factory.reloads.load(Ordering::Relaxed), 2);
+    assert_eq!(first.reloads.load(Ordering::Relaxed), 1);
+    assert!(!first.contexts.lock().unwrap()[0].is_cancelled());
+    assert!(!second.contexts.lock().unwrap()[0].is_cancelled());
+    state.0.cancel();
+    running.await.unwrap();
 }
 
 #[tokio::test]

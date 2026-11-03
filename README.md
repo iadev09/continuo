@@ -338,7 +338,10 @@ work. After configuration changes, `ServiceManager::reconcile()` admits new
 automatic instances and cancels removed ones, retaining their ownership until
 drain completes. Replacing a live allocation under the same name is rejected:
 stop it first, or keep its handle and apply the new settings through it.
-Reloading an instance applies its owner's shared configuration/reload hook.
+`Runnable::as_reloadable` optionally gives an instance its own targeted reload.
+That hook owns preparing and applying the instance's inputs. Without it,
+reloading an instance applies its owner's shared configuration/reload hook.
+Component-wide reload and source notifications still use the component's hook.
 Snapshots distinguish `name()` from the owning `component()`.
 
 The default `runnables` implementation wraps `as_runnable` as one instance

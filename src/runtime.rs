@@ -125,7 +125,8 @@ impl<S: 'static> ServiceEntry<S> {
             } else {
                 self.runnable.start_policy(state)
             },
-            reloadable: self.component.as_reloadable().is_some(),
+            reloadable: self.runnable.as_reloadable().is_some()
+                || self.component.as_reloadable().is_some(),
             generation: self.generation,
             last_error: self.last_error.clone(),
             reload_revision: self.reload_revision,
@@ -922,7 +923,15 @@ where
                     return;
                 };
                 let component = self.services[service_name].component.clone();
-                let Some(reloadable) = component.as_reloadable() else {
+                let runnable = self.services[service_name].runnable.clone();
+                let instance_reload = if config_prepared {
+                    None
+                } else {
+                    runnable.as_reloadable()
+                };
+                let Some(reloadable) =
+                    instance_reload.or_else(|| component.as_reloadable())
+                else {
                     let _ = reply
                         .send(Err(ServiceManagerError::NotReloadable(name)));
                     return;
@@ -942,18 +951,21 @@ where
                         return;
                     }
                 };
-                #[cfg(feature = "config")]
-                let reload = apply_configured_reload(
-                    self.config_reader.map(|reader| reader(&state)),
-                    component.as_ref(),
-                    reloadable,
-                    &state,
-                    config_prepared,
-                )
-                .await;
-                #[cfg(not(feature = "config"))]
-                let reload = {
-                    let _ = config_prepared;
+                let reload = if instance_reload.is_some() {
+                    reloadable.reload(&state).await
+                } else {
+                    #[cfg(feature = "config")]
+                    {
+                        apply_configured_reload(
+                            self.config_reader.map(|reader| reader(&state)),
+                            component.as_ref(),
+                            reloadable,
+                            &state,
+                            config_prepared,
+                        )
+                        .await
+                    }
+                    #[cfg(not(feature = "config"))]
                     reloadable.reload(&state).await
                 };
                 let reload = reload.map_err(|error: Error| {

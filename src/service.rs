@@ -447,8 +447,9 @@ impl ServiceManager {
         result.await.map_err(|_| ServiceManagerError::RuntimeUnavailable)?
     }
 
-    /// Reload the instance's owning component, then reconcile its declarations.
-    /// All instances from that component share its configuration/reload hook.
+    /// Reload the addressed instance, then reconcile runnable declarations.
+    /// Uses `Runnable::as_reloadable` when supplied; otherwise preserves the
+    /// owning component's configuration/reload hook.
     pub async fn reload(
         &self,
         name: impl AsRef<str>,

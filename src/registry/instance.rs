@@ -10,6 +10,8 @@ use super::{AnyRunnable, Resolve, Runnable};
 /// should retain the same runnable allocation while its declaration is unchanged.
 /// Execution policy comes from that runnable's `execution_spec` hook; the
 /// instance name does not select an executor.
+/// An instance may expose its own reload through `Runnable::as_reloadable`;
+/// otherwise targeted reload uses the producing component's shared hook.
 pub struct RunnableInstance<S> {
     pub(crate) name: Arc<str>,
     pub(crate) identity: Arc<dyn Any + Send + Sync>,
