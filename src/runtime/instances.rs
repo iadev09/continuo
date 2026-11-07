@@ -25,20 +25,7 @@ impl<S: SharedState> Runtime<S> {
         #[cfg(feature = "fleet")]
         let declarations: Vec<_> = declarations
             .into_iter()
-            .filter(|entry| {
-                let scope = entry
-                    .component
-                    .as_scoped()
-                    .map(crate::fleet::Scoped::scope)
-                    .or_else(|| {
-                        entry
-                            .component
-                            .as_dispatched()
-                            .map(|placement| placement.scope())
-                    })
-                    .unwrap_or_default();
-                scope.includes(state.process_scope())
-            })
+            .filter(|entry| entry.scope().includes(state.process_scope()))
             .collect();
 
         let mut names = HashSet::new();
@@ -113,6 +100,14 @@ impl<S: SharedState> Runtime<S> {
                         policy == ServiceStartPolicy::Automatic;
                 }
                 current.retiring = false;
+                #[cfg(feature = "fleet")]
+                {
+                    current.dispatch = entry
+                        .dispatched()
+                        .map(|placement| placement.dispatch())
+                        .unwrap_or_default();
+                    current.placement = entry.placement;
+                }
                 current.component = entry.component;
                 current.runnable = entry.runnable;
                 current.identity = entry.identity;
@@ -123,10 +118,11 @@ impl<S: SharedState> Runtime<S> {
                 ServiceEntry {
                     #[cfg(feature = "fleet")]
                     dispatch: entry
-                        .component
-                        .as_dispatched()
+                        .dispatched()
                         .map(|placement| placement.dispatch())
                         .unwrap_or_default(),
+                    #[cfg(feature = "fleet")]
+                    placement: entry.placement,
                     component: entry.component,
                     runnable: entry.runnable,
                     identity: entry.identity,
@@ -162,7 +158,7 @@ impl<S: SharedState> Runtime<S> {
         state: &S,
     ) -> Result<AdmittedGeneration<S>> {
         #[cfg(feature = "fleet")]
-        if let Some(placement) = entry.component.as_dispatched()
+        if let Some(placement) = entry.dispatched()
             && placement.dispatch().is_controller_driven()
         {
             let dispatcher = self.dispatcher.as_ref().ok_or_else(|| {

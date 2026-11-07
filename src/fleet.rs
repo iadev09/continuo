@@ -53,7 +53,7 @@ pub trait Scoped {
 pub mod dispatch;
 pub use dispatch::{
     Dispatch, DispatchPolicy, DispatchRequest, Dispatched, Dispatcher,
-    ServiceExecution,
+    InstancePlacement, ServiceExecution,
 };
 
 #[cfg(test)]

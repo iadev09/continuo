@@ -304,6 +304,113 @@ async fn initial_fleet_admission_validates_once_and_restart_revalidates() {
     assert_eq!(runtime.snapshots()[0].generation(), 1);
 }
 
+/// One component's instances run under their own placements, and one that
+/// declares none takes its component's.
+#[cfg(feature = "fleet")]
+#[tokio::test]
+async fn an_instance_runs_under_its_own_placement() {
+    use crate::RunnableInstance;
+    use crate::fleet::{
+        Dispatch, DispatchPolicy, DispatchRequest, Dispatcher,
+        InstancePlacement, Scope, ServiceExecution,
+    };
+    use std::sync::Mutex;
+
+    struct Once(AtomicUsize);
+    #[async_trait]
+    impl Runnable<State> for Once {
+        async fn run(
+            self: Arc<Self>,
+            _: (),
+            _: State,
+            _: RunContext,
+        ) -> Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    struct Factory(Arc<Once>);
+    impl Component<State> for Factory {
+        type Deps = ();
+        fn name(&self) -> &str {
+            "factory"
+        }
+        fn runnables(self: Arc<Self>) -> Vec<RunnableInstance<State>> {
+            let policy = DispatchPolicy {
+                capacity: std::num::NonZeroU16::MIN,
+                lease_ttl: std::time::Duration::from_secs(20),
+                renewal_interval: std::time::Duration::from_secs(5),
+            };
+            let once: Arc<dyn Runnable<State>> = self.0.clone();
+            vec![
+                RunnableInstance::new("plain", once.clone()),
+                RunnableInstance::new("leased", once.clone()).placed(
+                    InstancePlacement {
+                        scope: Scope::Worker,
+                        dispatch: Dispatch::One,
+                        policy: Some(policy),
+                    },
+                ),
+                RunnableInstance::new("elsewhere", once).placed(
+                    InstancePlacement {
+                        scope: Scope::Master,
+                        dispatch: Dispatch::Each,
+                        policy: None,
+                    },
+                ),
+            ]
+        }
+    }
+    #[derive(Default)]
+    struct Adapter(Mutex<Vec<DispatchRequest>>);
+    #[async_trait]
+    impl Dispatcher<State> for Adapter {
+        fn validate(
+            &self,
+            _: &DispatchRequest,
+            _: &State,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn run(
+            &self,
+            request: DispatchRequest,
+            execution: ServiceExecution<State>,
+            context: RunContext,
+        ) -> Result<()> {
+            self.0.lock().unwrap().push(request);
+            execution.run(context).await
+        }
+    }
+
+    let registry = Registry::new();
+    let once = Arc::new(Once(AtomicUsize::new(0)));
+    registry.register(Arc::new(Factory(once.clone()))).unwrap();
+    let adapter = Arc::new(Adapter::default());
+    let mut runtime =
+        Runtime::default().with_dispatcher(adapter.clone()).unwrap();
+    let state = State { scope: Scope::Worker, ..State::default() };
+    runtime.spawn_all(&registry, state).unwrap();
+    for _ in 0..2 {
+        let joined = runtime.join_set.join_next_with_id().await.unwrap();
+        runtime.complete_join(joined).unwrap();
+    }
+
+    let mut services: Vec<_> = runtime
+        .snapshots()
+        .iter()
+        .map(|service| service.name().to_owned())
+        .collect();
+    services.sort();
+    assert_eq!(services, ["leased", "plain"]);
+    assert_eq!(once.0.load(Ordering::SeqCst), 2);
+    let requests = adapter.0.lock().unwrap();
+    assert_eq!(requests.len(), 1, "only the leased instance is dispatched");
+    assert_eq!(&*requests[0].name, "leased");
+    assert_eq!(requests[0].dispatch, Dispatch::One);
+    assert!(requests[0].policy.is_some());
+}
+
 #[cfg(feature = "registry")]
 #[tokio::test]
 async fn prepared_resources_finalize_after_admission_failure() {

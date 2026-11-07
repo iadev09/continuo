@@ -110,6 +110,32 @@ pub trait Dispatched: Scoped {
     }
 }
 
+/// One runnable instance's own placement, for a component whose instances do
+/// not all run the same way. Without it an instance takes its component's.
+#[derive(Clone, Debug)]
+pub struct InstancePlacement {
+    pub scope: Scope,
+    pub dispatch: Dispatch,
+    /// Required by `One` and `Pool`, as for a component's own policy.
+    pub policy: Option<DispatchPolicy>,
+}
+
+impl Scoped for InstancePlacement {
+    fn scope(&self) -> Scope {
+        self.scope
+    }
+}
+
+impl Dispatched for InstancePlacement {
+    fn dispatch(&self) -> Dispatch {
+        self.dispatch
+    }
+
+    fn dispatch_policy(&self) -> Option<DispatchPolicy> {
+        self.policy
+    }
+}
+
 /// Identity and placement of one locally managed controller generation.
 /// The service supplies its policy; the adapter must retain this snapshot for
 /// the generation, including drain. Config reload cannot mutate active leases.

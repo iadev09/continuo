@@ -88,6 +88,8 @@ struct AdmittedGeneration<S> {
 }
 
 struct ServiceEntry<S> {
+    #[cfg(feature = "fleet")]
+    placement: Option<crate::fleet::InstancePlacement>,
     component: Arc<dyn AnyComponent<S>>,
     runnable: Arc<dyn AnyRunnable<S>>,
     identity: Arc<dyn Any + Send + Sync>,
@@ -491,20 +493,7 @@ where
         #[cfg(feature = "fleet")]
         let runnables: Vec<_> = runnables
             .into_iter()
-            .filter(|entry| {
-                let scope = entry
-                    .component
-                    .as_scoped()
-                    .map(crate::fleet::Scoped::scope)
-                    .or_else(|| {
-                        entry
-                            .component
-                            .as_dispatched()
-                            .map(|placement| placement.scope())
-                    })
-                    .unwrap_or_default();
-                scope.includes(state.process_scope())
-            })
+            .filter(|entry| entry.scope().includes(state.process_scope()))
             .collect();
         let mut names = HashSet::with_capacity(runnables.len());
         for entry in &runnables {
@@ -534,17 +523,18 @@ where
         self.registry = Some(registry.shared());
         self.state = Some(state);
         for (entry, bound, policy) in runnables {
-            let name = entry.name;
-            let automatic = bound.is_some();
             #[cfg(feature = "fleet")]
             let dispatch = entry
-                .component
-                .as_dispatched()
+                .dispatched()
                 .map(|placement| placement.dispatch())
                 .unwrap_or_default();
+            let name = entry.name;
+            let automatic = bound.is_some();
             self.services.insert(
                 name.clone(),
                 ServiceEntry {
+                    #[cfg(feature = "fleet")]
+                    placement: entry.placement,
                     component: entry.component,
                     runnable: entry.runnable,
                     identity: entry.identity,
@@ -659,7 +649,10 @@ where
                 Error::msg(format!("service '{name}' generation overflow"))
             })?;
         #[cfg(feature = "fleet")]
-        let dispatch = match service.component.as_dispatched() {
+        let dispatch = match crate::registry::effective_dispatch(
+            service.placement.as_ref(),
+            service.component.as_ref(),
+        ) {
             Some(placement) if placement.dispatch().is_controller_driven() => {
                 let request = crate::fleet::DispatchRequest {
                     name: Arc::from(name),

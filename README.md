@@ -333,6 +333,10 @@ entry. Its typed dependencies are resolved before admission; its own
 `execution_spec` selects execution placement. Component `Deps` and `order` define
 ordering between owners; instance enumeration preserves the factory's order.
 
+With the `fleet` feature, an instance whose role or selection differs from its
+siblings declares that with `RunnableInstance::placed(InstancePlacement { .. })`.
+Without it, an instance takes its component's `Scoped` and `Dispatched`.
+
 Factories retain unchanged runnable allocations; enumerating them starts no
 work. After configuration changes, `ServiceManager::reconcile()` admits new
 automatic instances and cancels removed ones, retaining their ownership until

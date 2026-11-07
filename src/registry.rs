@@ -53,6 +53,49 @@ pub(crate) struct RunnableEntry<S> {
     pub(crate) component: Arc<dyn AnyComponent<S>>,
     pub(crate) runnable: Arc<dyn AnyRunnable<S>>,
     pub(crate) identity: Arc<dyn Any + Send + Sync>,
+    #[cfg(feature = "fleet")]
+    pub(crate) placement: Option<crate::fleet::InstancePlacement>,
+}
+
+#[cfg(feature = "fleet")]
+impl<S: 'static> RunnableEntry<S> {
+    pub(crate) fn scope(&self) -> crate::fleet::Scope {
+        effective_scope(self.placement.as_ref(), self.component.as_ref())
+    }
+
+    pub(crate) fn dispatched(&self) -> Option<&dyn crate::fleet::Dispatched> {
+        effective_dispatch(self.placement.as_ref(), self.component.as_ref())
+    }
+}
+
+/// An instance's own scope, else its component's. An explicit `as_scoped` takes
+/// precedence over `as_dispatched`.
+#[cfg(feature = "fleet")]
+pub(crate) fn effective_scope<S: 'static>(
+    own: Option<&crate::fleet::InstancePlacement>,
+    component: &dyn AnyComponent<S>,
+) -> crate::fleet::Scope {
+    use crate::fleet::Scoped;
+    match own {
+        Some(placement) => placement.scope(),
+        None => component
+            .as_scoped()
+            .map(Scoped::scope)
+            .or_else(|| component.as_dispatched().map(|p| p.scope()))
+            .unwrap_or_default(),
+    }
+}
+
+/// An instance's own dispatch declaration, else its component's.
+#[cfg(feature = "fleet")]
+pub(crate) fn effective_dispatch<'a, S: 'static>(
+    own: Option<&'a crate::fleet::InstancePlacement>,
+    component: &'a dyn AnyComponent<S>,
+) -> Option<&'a dyn crate::fleet::Dispatched> {
+    match own {
+        Some(placement) => Some(placement),
+        None => component.as_dispatched(),
+    }
 }
 
 impl<S: 'static> Registry<S> {
@@ -452,6 +495,8 @@ impl<S: 'static> Registry<S> {
                     component: component.clone(),
                     runnable: instance.runnable,
                     identity: instance.identity,
+                    #[cfg(feature = "fleet")]
+                    placement: instance.placement,
                 });
             }
         }

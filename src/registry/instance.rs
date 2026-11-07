@@ -16,6 +16,8 @@ pub struct RunnableInstance<S> {
     pub(crate) name: Arc<str>,
     pub(crate) identity: Arc<dyn Any + Send + Sync>,
     pub(crate) runnable: Arc<dyn AnyRunnable<S>>,
+    #[cfg(feature = "fleet")]
+    pub(crate) placement: Option<crate::fleet::InstancePlacement>,
 }
 
 impl<S> Clone for RunnableInstance<S> {
@@ -24,6 +26,8 @@ impl<S> Clone for RunnableInstance<S> {
             name: self.name.clone(),
             identity: self.identity.clone(),
             runnable: self.runnable.clone(),
+            #[cfg(feature = "fleet")]
+            placement: self.placement.clone(),
         }
     }
 }
@@ -41,7 +45,19 @@ impl<S: Send + Sync + 'static> RunnableInstance<S> {
             runnable: super::erased::erase_runnable(name.clone(), runnable),
             name,
             identity,
+            #[cfg(feature = "fleet")]
+            placement: None,
         }
+    }
+
+    /// Run this instance under its own placement instead of its component's.
+    #[cfg(feature = "fleet")]
+    pub fn placed(
+        mut self,
+        placement: crate::fleet::InstancePlacement,
+    ) -> Self {
+        self.placement = Some(placement);
+        self
     }
 
     pub fn name(&self) -> &str {
