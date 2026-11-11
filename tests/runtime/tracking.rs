@@ -183,6 +183,7 @@ struct Driver {
 impl crate::ExecutionDriver for Driver {
     fn prepare(
         &self,
+        _: &crate::ExecutionOwner,
         _: crate::ExecutionSpec,
     ) -> Result<Arc<dyn crate::PreparedExecution>> {
         self.prepared.fetch_add(1, Ordering::SeqCst);

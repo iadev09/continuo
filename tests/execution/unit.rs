@@ -3,6 +3,10 @@ use super::*;
 struct FirstDomain;
 struct SecondDomain;
 
+fn owner() -> ExecutionOwner {
+    ExecutionOwner::of::<FirstDomain>("instance")
+}
+
 #[test]
 fn named_domains_own_runtime_names_and_remain_type_scoped() {
     let name: Arc<str> = String::from("configured-instance").into();
@@ -53,7 +57,7 @@ fn application_policy_converts_without_domain_names_in_continuo() {
         ExecutorSpec::Shared(ExecutionDomain::of::<FirstDomain>())
     );
     assert_eq!(spec.scheduling, SchedulingPolicy::Priority(PollPriority::Low));
-    assert!(ExecutionPlan::prepare(spec.clone(), None).is_err());
+    assert!(ExecutionPlan::prepare(&owner(), spec.clone(), None).is_err());
 }
 
 #[test]
@@ -86,6 +90,6 @@ fn scheduling_and_placement_each_require_explicit_support() {
             NonZeroUsize::new(2).unwrap(),
         )),
     ] {
-        assert!(ExecutionPlan::prepare(spec.clone(), None).is_err());
+        assert!(ExecutionPlan::prepare(&owner(), spec.clone(), None).is_err());
     }
 }

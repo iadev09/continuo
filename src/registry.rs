@@ -50,6 +50,7 @@ struct RegistryEntries<S> {
 
 pub(crate) struct RunnableEntry<S> {
     pub(crate) name: Arc<str>,
+    pub(crate) owner: crate::ExecutionOwner,
     pub(crate) component: Arc<dyn AnyComponent<S>>,
     pub(crate) runnable: Arc<dyn AnyRunnable<S>>,
     pub(crate) identity: Arc<dyn Any + Send + Sync>,
@@ -491,6 +492,10 @@ impl<S: 'static> Registry<S> {
             let component = entry.component;
             for instance in component.clone().runnables() {
                 runnables.push(RunnableEntry {
+                    owner: crate::ExecutionOwner::new(
+                        entry.type_id,
+                        instance.name.clone(),
+                    ),
                     name: instance.name,
                     component: component.clone(),
                     runnable: instance.runnable,

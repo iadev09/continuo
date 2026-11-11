@@ -93,6 +93,7 @@ struct ServiceEntry<S> {
     component: Arc<dyn AnyComponent<S>>,
     runnable: Arc<dyn AnyRunnable<S>>,
     identity: Arc<dyn Any + Send + Sync>,
+    owner: crate::ExecutionOwner,
     retiring: bool,
     status: ServiceStatus,
     active_executions: Arc<AtomicU64>,
@@ -538,6 +539,7 @@ where
                     component: entry.component,
                     runnable: entry.runnable,
                     identity: entry.identity,
+                    owner: entry.owner,
                     retiring: false,
                     status: ServiceStatus::Stopped,
                     active_executions: Arc::new(AtomicU64::new(0)),
@@ -682,6 +684,7 @@ where
                     })?,
                 )?;
                 let execution = ExecutionPlan::prepare(
+                    &service.owner,
                     service.runnable.execution_spec(&state),
                     self.execution_driver.as_deref(),
                 )

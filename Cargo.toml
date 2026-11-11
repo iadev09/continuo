@@ -1,6 +1,6 @@
 [package]
 name = "continuo"
-version = "0.11.2"
+version = "0.12.0"
 edition = "2024"
 # Let-chains, used ungated in runtime.rs, gate.rs and events.rs.
 rust-version = "1.88"

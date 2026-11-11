@@ -1,8 +1,8 @@
 use super::*;
 use crate::{Component, Runnable, RunnableInstance};
 use crate::{
-    ExecutionDomain, ExecutionDriver, ExecutionFuture, ExecutionSpec,
-    ExecutorSpec, PreparedExecution,
+    ExecutionDomain, ExecutionDriver, ExecutionFuture, ExecutionOwner,
+    ExecutionSpec, ExecutorKind, ExecutorSpec, PreparedExecution,
 };
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -74,14 +74,25 @@ impl crate::Reloadable<State> for Work {
 }
 
 #[derive(Default)]
-struct Driver(Mutex<Vec<ExecutionSpec>>);
+struct Driver(Mutex<Vec<(ExecutionOwner, ExecutionSpec)>>);
+
+impl Driver {
+    fn specs(&self) -> Vec<ExecutionSpec> {
+        self.0.lock().unwrap().iter().map(|(_, spec)| spec.clone()).collect()
+    }
+
+    fn owners(&self) -> Vec<ExecutionOwner> {
+        self.0.lock().unwrap().iter().map(|(owner, _)| owner.clone()).collect()
+    }
+}
 
 impl ExecutionDriver for Driver {
     fn prepare(
         &self,
+        owner: &ExecutionOwner,
         spec: ExecutionSpec,
     ) -> Result<Arc<dyn PreparedExecution>> {
-        self.0.lock().unwrap().push(spec);
+        self.0.lock().unwrap().push((owner.clone(), spec));
         Ok(Arc::new(Adapter))
     }
 }
@@ -123,10 +134,7 @@ async fn each_instance_selects_its_own_execution_spec() {
     runtime.spawn_all(&registry, state).unwrap();
     first.entered.notified().await;
     second.entered.notified().await;
-    assert_eq!(
-        *driver.0.lock().unwrap(),
-        vec![first_spec.clone(), second_spec.clone()]
-    );
+    assert_eq!(driver.specs(), vec![first_spec.clone(), second_spec.clone()]);
     assert_eq!(first.contexts.lock().unwrap()[0].execution_spec(), first_spec);
     assert_eq!(
         second.contexts.lock().unwrap()[0].execution_spec(),
@@ -134,6 +142,44 @@ async fn each_instance_selects_its_own_execution_spec() {
     );
     runtime.begin_shutdown();
     runtime.drain().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_instance_is_prepared_with_the_same_owner_across_restart() {
+    let (registry, factory, state, runtime) = setup();
+    let dedicated = ExecutionSpec::default()
+        .with_executor(ExecutorSpec::Dedicated(ExecutorKind::CurrentThread));
+    let first =
+        Arc::new(Work { execution: dedicated.clone(), ..Default::default() });
+    let second =
+        Arc::new(Work { execution: dedicated.clone(), ..Default::default() });
+    factory.set(vec![
+        RunnableInstance::new("first", first.clone()),
+        RunnableInstance::new("second", second.clone()),
+    ]);
+    let driver = Arc::new(Driver::default());
+    let mut runtime = runtime.with_execution_driver(driver.clone()).unwrap();
+    runtime.spawn_all(&registry, state.clone()).unwrap();
+    first.entered.notified().await;
+    second.entered.notified().await;
+    let manager = runtime.manager();
+    let observing = state.clone();
+    let running = tokio::spawn(async move {
+        runtime.wait_until_shutdown(&observing).await.unwrap();
+        runtime.drain().await.unwrap();
+    });
+    let restarted = manager.restart("first").await.unwrap();
+    first.entered.notified().await;
+    assert_eq!(restarted.generation(), 2);
+
+    let owners = driver.owners();
+    assert_eq!(owners.len(), 3);
+    assert_eq!(owners[0], ExecutionOwner::of::<Factory>("first"));
+    assert_eq!(owners[1], ExecutionOwner::of::<Factory>("second"));
+    assert_eq!(owners[2], owners[0]);
+    assert_ne!(owners[0], owners[1]);
+    state.0.cancel();
+    running.await.unwrap();
 }
 
 #[derive(Default)]

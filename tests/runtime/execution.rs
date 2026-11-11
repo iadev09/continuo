@@ -7,8 +7,8 @@ use tokio::sync::Notify;
 use super::*;
 use crate::{
     Component, ExecutionDomain, ExecutionDriver, ExecutionFuture,
-    ExecutionSpec, ExecutorSpec, PollPriority, PreparedExecution, Runnable,
-    SchedulingPolicy,
+    ExecutionOwner, ExecutionSpec, ExecutorSpec, PollPriority,
+    PreparedExecution, Runnable, SchedulingPolicy,
 };
 
 #[derive(Clone, Default)]
@@ -108,6 +108,7 @@ struct ObservedExecution {
 impl ExecutionDriver for Driver {
     fn prepare(
         &self,
+        _: &ExecutionOwner,
         spec: ExecutionSpec,
     ) -> Result<Arc<dyn PreparedExecution>> {
         self.prepared.lock().unwrap().push(spec.clone());
@@ -433,6 +434,7 @@ async fn execution_finalization_follows_failed_provider_cleanup() {
     impl ExecutionDriver for OrderedDriver {
         fn prepare(
             &self,
+            _: &ExecutionOwner,
             _: ExecutionSpec,
         ) -> Result<Arc<dyn PreparedExecution>> {
             unreachable!("there is no custom runnable")

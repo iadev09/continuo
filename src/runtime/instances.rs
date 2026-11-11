@@ -111,6 +111,7 @@ impl<S: SharedState> Runtime<S> {
                 current.component = entry.component;
                 current.runnable = entry.runnable;
                 current.identity = entry.identity;
+                current.owner = entry.owner;
                 continue;
             }
             self.services.insert(
@@ -126,6 +127,7 @@ impl<S: SharedState> Runtime<S> {
                     component: entry.component,
                     runnable: entry.runnable,
                     identity: entry.identity,
+                    owner: entry.owner,
                     retiring: false,
                     status: ServiceStatus::Stopped,
                     active_executions: Arc::new(AtomicU64::new(0)),
@@ -180,6 +182,7 @@ impl<S: SharedState> Runtime<S> {
         }
         let runnable = entry.runnable.clone().bind(registry)?;
         let execution = ExecutionPlan::prepare(
+            &entry.owner,
             entry.runnable.execution_spec(state),
             self.execution_driver.as_deref(),
         )

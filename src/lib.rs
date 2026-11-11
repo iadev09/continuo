@@ -34,8 +34,8 @@ pub use congif::{ConfigObserver, Configurable};
 #[cfg(feature = "events")]
 pub use events::{Event, ProcessEventBus, ReloadRequired, ShutdownInitiated};
 pub use execution::{
-    ExecutionDomain, ExecutionDriver, ExecutionFuture, ExecutionSpec,
-    ExecutorKind, ExecutorSpec, PollPriority, PreparedExecution,
+    ExecutionDomain, ExecutionDriver, ExecutionFuture, ExecutionOwner,
+    ExecutionSpec, ExecutorKind, ExecutorSpec, PollPriority, PreparedExecution,
     SchedulingPolicy,
 };
 #[cfg(feature = "fleet")]

@@ -429,7 +429,7 @@ application; cleanup of partial preparation remains its responsibility.
 ### Execution
 
 `Runnable::execution_spec` selects executor placement and poll scheduling for
-one generation. The default uses ambient Tokio execution. Configuration, boot,
+each generation. The default uses ambient Tokio execution. Configuration, boot,
 validation, reload and finalization use the lifecycle executor.
 
 Applications install an `ExecutionDriver` before runnable submission:
@@ -456,6 +456,11 @@ The installed driver implements these policies and rejects unsupported
 combinations.
 Application-specific policies can convert into `ExecutionSpec` with `From`.
 
+`ExecutionDriver::prepare` receives the runnable's `ExecutionOwner`: its
+component type and instance name, equal at every start and restart of that
+instance. A `Dedicated` executor belongs to that owner, not to one generation.
+The driver keeps it across generations until `finalize`.
+
 `ExecutionDomain::of::<Marker>()` identifies a shared domain by type.
 `ExecutionDomain::named::<Marker>(name)` adds an owned configuration name
 within that type. Instances selecting the same domain share an execution owner.
@@ -467,11 +472,11 @@ work. `RunContext` retains the prepared adapter and cancellation scope, and
 to child work that needs the same custom scheduling.
 
 Shutdown drains runnable futures and driver-owned executions first. Provider
-finalization follows while shared executors remain alive for pooled I/O cleanup.
-Finally, `finalize_execution` releases executor owners. `run`, `run_prepared`
-and `serve` drive that sequence; manual compositions call the final step after
-`Registry::finalize_all`, including when provider cleanup reports failures.
-A targeted service stop or restart does not finalize shared executors.
+finalization follows while shared and dedicated executors remain alive for
+pooled I/O cleanup. Finally, `finalize_execution` releases them. `run`,
+`run_prepared` and `serve` drive that sequence; manual compositions call the
+final step after `Registry::finalize_all`, including when provider cleanup
+reports failures. A targeted service stop or restart does not finalize them.
 
 ### Tracked tasks
 
@@ -488,7 +493,8 @@ let task = context.spawn_tracked(|child| async move {
 The child uses the generation's prepared execution adapter and its own
 cancellation token. The adapter is reused, including its scheduling policy.
 `PreparedExecution::execute` owns the root; `execute_child` submits concurrent
-children. Generation-owned adapters retain their reactor through child drain.
+children. An adapter whose reactor ends with the root retains it through child
+drain.
 
 When the runnable returns, fails or unwinds, admission closes, children receive
 cancellation, and completion waits for their futures to be destroyed. Stop and
@@ -700,7 +706,7 @@ examples/playground/
 ## Features
 
 ~~~toml
-continuo = { version = "0.11", features = ["config-watch"] }
+continuo = { version = "0.12", features = ["config-watch"] }
 ~~~
 
 | Feature | Enables |

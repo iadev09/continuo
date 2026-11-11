@@ -1,4 +1,4 @@
-//! Optional executor placement and poll scheduling for runnable generations.
+//! Optional executor placement and poll scheduling for runnable instances.
 //!
 //! The default uses the ambient Tokio runtime without an execution adapter.
 //! Custom specifications require an application-installed [`ExecutionDriver`].
@@ -43,6 +43,50 @@ impl ExecutionDomain {
     }
 }
 
+/// The runnable instance an execution is prepared for.
+///
+/// Built from the component's registered type and the instance's management
+/// name, so one instance yields an equal owner at every start and restart.
+/// It is not an OS thread id or a cross-process identity.
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct ExecutionOwner {
+    component: TypeId,
+    instance: Arc<str>,
+}
+
+impl ExecutionOwner {
+    /// Identify the instance `instance` of component type `C`. The runtime
+    /// builds owners itself; this constructor serves harnesses that drive an
+    /// [`ExecutionDriver`] directly.
+    pub fn of<C: ?Sized + 'static>(instance: impl Into<Arc<str>>) -> Self {
+        Self::new(TypeId::of::<C>(), instance.into())
+    }
+
+    pub(crate) fn new(
+        component: TypeId,
+        instance: Arc<str>,
+    ) -> Self {
+        Self { component, instance }
+    }
+
+    /// Runnable instance's management name.
+    pub fn instance(&self) -> &str {
+        &self.instance
+    }
+}
+
+impl fmt::Debug for ExecutionOwner {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        f.debug_struct("ExecutionOwner")
+            .field("instance", &self.instance)
+            .field("component", &self.component)
+            .finish()
+    }
+}
+
 impl fmt::Debug for ExecutionDomain {
     fn fmt(
         &self,
@@ -65,7 +109,7 @@ pub enum ExecutorKind {
     MultiThread { threads: NonZeroUsize },
 }
 
-/// Placement of one runnable generation, independent of fleet dispatch.
+/// Placement of one runnable instance, independent of fleet dispatch.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ExecutorSpec {
@@ -74,8 +118,9 @@ pub enum ExecutorSpec {
     Inherit,
     /// Share an application-defined execution domain with other runnables.
     Shared(ExecutionDomain),
-    /// Give this generation an execution owner with the declared topology.
-    /// Resources that outlive the generation need a shared owner instead.
+    /// Give the runnable an executor of its own with the declared topology.
+    /// The driver keeps it for that [`ExecutionOwner`] across generations,
+    /// start and restart, until [`ExecutionDriver::finalize`].
     Dedicated(ExecutorKind),
 }
 
@@ -162,22 +207,26 @@ pub type ExecutionFuture =
 pub trait ExecutionDriver: Send + Sync + 'static {
     /// Validate the complete specification and return a generation adapter.
     /// An error rejects admission; it must not fall back to ambient execution.
+    /// `owner` is equal for every generation of the same runnable instance;
+    /// a `Dedicated` executor is kept for it until [`Self::finalize`].
     fn prepare(
         &self,
+        owner: &ExecutionOwner,
         spec: ExecutionSpec,
     ) -> Result<Arc<dyn PreparedExecution>>;
 
     /// Reap transferred executions after managed runnable futures have drained.
     /// This also covers work whose submitting future was explicitly aborted.
-    /// Shared executors stay alive here: providers have not finalized yet.
+    /// Shared and dedicated executors stay alive here: providers have not
+    /// finalized yet.
     /// The returned future must await owned work without inventing a deadline.
     fn drain(&self) -> ExecutionFuture {
         Box::pin(async { Ok(()) })
     }
 
-    /// Release shared executor owners after runnable drain and provider
-    /// finalization. Their I/O drivers must remain alive while providers
-    /// close resources created by admitted work.
+    /// Release shared and dedicated executors after runnable drain and
+    /// provider finalization. Their I/O drivers must remain alive while
+    /// providers close resources created by admitted work.
     /// A targeted service stop or restart does not call this hook.
     fn finalize(&self) -> ExecutionFuture {
         Box::pin(async { Ok(()) })
@@ -191,15 +240,16 @@ pub trait ExecutionDriver: Send + Sync + 'static {
 /// and drain; it must not report completion while transferred work survives.
 /// Errors and panics on a different executor must be returned to this future.
 /// An adapter owns runtimes it creates and only borrows externally supplied
-/// runtimes. Shared owners must outlive every admitted generation using them.
+/// runtimes. Shared and dedicated executors must outlive every admitted
+/// generation using them.
 ///
 /// The context exposes this same adapter to child-work owners. Ordinary
 /// `tokio::spawn` does not acquire a custom poll priority automatically;
 /// adapters and hosted services must explicitly carry the execution policy
 /// into their child submissions. Continuo does not intercept Tokio spawning.
 /// `RunContext::spawn_tracked` submits through `execute_child` on this same
-/// adapter. A generation-owned executor can therefore separate root teardown
-/// from concurrent child submissions.
+/// adapter, so an adapter can separate root teardown from concurrent child
+/// submissions.
 pub trait PreparedExecution: Send + Sync + 'static {
     /// Execute the owned root generation with its frozen cancellation and execution
     /// context. If this future is dropped, retain ownership of any transferred
@@ -212,8 +262,8 @@ pub trait PreparedExecution: Send + Sync + 'static {
 
     /// Submit a child using the root generation's prepared executor/scheduler.
     /// The default supports adapters whose submissions share one lifetime.
-    /// Generation-owned adapters override this to retain their reactor until
-    /// root completion while allowing concurrent children on that reactor.
+    /// Adapters whose reactor ends with the root override this to retain it
+    /// until root completion while allowing concurrent children on it.
     fn execute_child(
         &self,
         task: ExecutionFuture,
@@ -231,6 +281,7 @@ pub(crate) struct ExecutionPlan {
 
 impl ExecutionPlan {
     pub(crate) fn prepare(
+        owner: &ExecutionOwner,
         spec: ExecutionSpec,
         driver: Option<&dyn ExecutionDriver>,
     ) -> Result<Self> {
@@ -240,7 +291,7 @@ impl ExecutionPlan {
         let driver = driver.ok_or_else(|| {
             Error::msg(format!("no execution driver is installed for {spec:?}"))
         })?;
-        Ok(Self { executor: Some(driver.prepare(spec.clone())?), spec })
+        Ok(Self { executor: Some(driver.prepare(owner, spec.clone())?), spec })
     }
 }
 
