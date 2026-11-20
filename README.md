@@ -10,6 +10,8 @@
 
 # Continuo
 
+**No conductor. Only the stage.**
+
 Typed runtime dependency injection and lifecycle management for multi-service
 Rust applications.
 
